@@ -34,6 +34,10 @@ def rank0(func):
 
 
 class Solver(LoggerBase):
+    # =========================================================================
+    # Initialization
+    # =========================================================================
+
     def __init__(self, problem, dump_parameters=True):
         ''' Solver Initializer.
 
@@ -55,6 +59,8 @@ class Solver(LoggerBase):
         self._t_checkpt = 0.
         self._writeout = 0
         self.ndim = problem.ndim
+
+        # Solution fields
         self.bc_dict = problem.bc_dict
         self.u_lst = problem.u_lst
         self.u0_lst = problem.u0_lst
@@ -63,130 +69,123 @@ class Solver(LoggerBase):
         self._u_tmp_lst = [Function(problem.Vi) for i in range(self.ndim)]
         self.p = problem.p
         self.u = problem.u
+        self.bnds = problem.bnds
 
+        # ALE deformation-gradient references
         self.F, self.J = problem.F, problem.J
         self.F0, self.J0 = problem.F0, problem.J0
 
+        # Feature flags
         self.ale = problem.ale
         self._using_ale = problem._using_ale
         self.wk = problem.wk
         self._using_wk = problem._using_wk
         self._using_mapdd = problem._using_mapdd
-        self._applying_dc_on_update = False
-        self._applying_pen_on_update = False
-        
+
+        # Variational forms (assembled in init_assembly)
         self.forms = problem.forms
 
-        if 'DC_in_update' in self.options['fem'] and self.options['fem']['DC_in_update']:
-            self._applying_dc_on_update = True
-        if 'PEN_in_update' in self.options['fem'] and self.options['fem']['PEN_in_update']:
-            self._applying_pen_on_update = True
-        
-        self._using_fnv_semi_implicit = False
-        if 'fnv' in self.forms['u'].keys() and self.forms['u']['fnv_type'] == 'semi-implicit':
-            self._using_fnv_semi_implicit = True
-
-        if 'state_velocity' in self.options['fluid']:
-            self.state_velocity = self.options['fluid']['state_velocity']
-        else:
-            # update velocity by default
-            self.state_velocity = 'update'
-
-        self.du = [Function(problem.Vi, name='du_i') for i in range(self.ndim)]
-        self.du_vec = Function(problem.V, name='du')
-
+        # IPCS uses a separate correction pressure phi; CT reuses p
         if self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS':
             self.phi = Function(problem.Q, name='phi')
         else:
             self.phi = self.p
 
+        # Component <-> vector assigners
         self.vec_assigner = FunctionAssigner(problem.V, [problem.Vi]*self.ndim)
         self.comp_assigner = FunctionAssigner([problem.Vi]*self.ndim, problem.V)
 
-        
+        # Correction velocity increments
+        self.du = [Function(problem.Vi, name='du_i') for i in range(self.ndim)]
+        self.du_vec = Function(problem.V, name='du')
 
-        self._diverged = False
-        # a transpiration/slip optimizer should set this to True
-        self._optimizing = False
-        self._optimize_robin = False
-        self._optimize_windkessel = False
-        self._initialized = False
-
-        self.bnds = problem.bnds
-
-        self.mat = {}
-        self.vec = {}
-
-        if self._using_ale:
-            self.k = problem.k
-            self.d = problem.d
-            self.d0 = problem.d0
-
-            self.upd = problem.upd
-            self.upd_lst = problem.upd_lst
-
-            self.d_bc = Function(problem.D)
-            self.v_bc = Function(problem.V)
-            self.d_lst_bc = [Function(problem.Di) for i in range(self.ndim)]
-            self.v_lst_bc = [Function(problem.Vi) for i in range(self.ndim)]
-
-            if self.ale['type'] == 'external':
-                self.S = problem.S
-                self.d_s = problem.d_s
-                self.v_s = problem.v_s
-
-            self.mat.update({
-                'd': {
-                    'diff': None,
-                    'div': None}
-                })
-            self.vec.update({
-                'd': {'rhs_const': None}
-                })
-
-        self.mat.update({
-            'u': {
-                'mass': None, 'conv': None, 'rhs': None,
-                'pdiv': None, 'gradp': None,
-                'fnv': None,
-                'lhs_navslip': {i: [] for i in range(self.ndim)},
-                'rhs_navslip': {i: [] for i in range(self.ndim)},
-                'lhs_trans': {i: [] for i in range(self.ndim)},
-                'rhs_trans': {i: [] for i in range(self.ndim)},
-                'p_trans': {i: None for i in range(self.ndim)},
-            },
-            # mass_robin: mass matrices on boundary patches with factor
-            # rho/dt
-            # mass_bound: unscaled mass matrices on boundary patches
-            'p': {
-                'rhs_u': None, 'laplacian': None, 'mass_robin': None,
-                'mass_bound': [], 'u_norm_bound': []}
-            })
-        self.vec.update({
-            'u': {'rhs_const': None},
-            'p': {'rhs_const': None}
-            })
-
-        if self._using_wk:
-            self.pi_functions = {}
-            wk_ids = list(self.bc_dict['p']['windkessel']['params'])
-            for k in wk_ids:
-                self.pi_functions[k] = []
-            
-            if self.wk['implicit']:
-                self.vec['p'].update({
-                        'windkessel_rhs': [],
-                        'windkessel_lhs_lrc_diag': None,
-                        })
-
-                self.mat['p'].update({
-                    'windkessel_lhs_lrc': None
-                })
+        self._init_state_flags()
+        self._init_ale_fields(problem)
+        self._init_mat_vec_storage()
 
         if dump_parameters:
             self.dump_parameters()
 
         problem.close_logs()
+
+    def _init_state_flags(self):
+        ''' Initialize boolean state and option flags. '''
+        self._diverged = False
+        self._optimizing = False       # set to True by an external optimizer
+        self._optimize_robin = False
+        self._optimize_windkessel = False
+        self._initialized = False
+
+        self._applying_dc_on_update = bool(
+            self.options['fem'].get('DC_in_update', False))
+        self._applying_pen_on_update = bool(
+            self.options['fem'].get('PEN_in_update', False))
+
+        self._using_fnv_semi_implicit = (
+            'fnv' in self.forms['u'] and
+            self.forms['u'].get('fnv_type') == 'semi-implicit')
+
+        # Which velocity field represents the "state" for ROUKF
+        self.state_velocity = self.options['fluid'].get('state_velocity',
+                                                        'update')
+
+    def _init_ale_fields(self, problem):
+        ''' Link ALE-specific fields from the problem object. '''
+        if not self._using_ale:
+            return
+
+        self.k = problem.k
+        self.d = problem.d
+        self.d0 = problem.d0
+        self.upd = problem.upd
+        self.upd_lst = problem.upd_lst
+
+        self.d_bc = Function(problem.D)
+        self.v_bc = Function(problem.V)
+        self.d_lst_bc = [Function(problem.Di) for _ in range(self.ndim)]
+        self.v_lst_bc = [Function(problem.Vi) for _ in range(self.ndim)]
+
+        if self.ale['type'] == 'external':
+            self.S = problem.S
+            self.d_s = problem.d_s
+            self.v_s = problem.v_s
+
+    def _init_mat_vec_storage(self):
+        ''' Initialize dicts for assembled matrices and vectors. '''
+        self.mat = {}
+        self.vec = {}
+
+        if self._using_ale:
+            self.mat['d'] = {'diff': None, 'div': None}
+            self.vec['d'] = {'rhs_const': None}
+
+        self.mat['u'] = {
+            'mass': None, 'conv': None, 'rhs': None,
+            'pdiv': None, 'gradp': None, 'fnv': None,
+            'lhs_navslip': {i: [] for i in range(self.ndim)},
+            'rhs_navslip': {i: [] for i in range(self.ndim)},
+            'lhs_trans': {i: [] for i in range(self.ndim)},
+            'rhs_trans': {i: [] for i in range(self.ndim)},
+            'p_trans': {i: None for i in range(self.ndim)},
+        }
+        # mass_robin: boundary mass matrices scaled by rho/dt
+        # mass_bound: unscaled boundary mass matrices (transpiration)
+        self.mat['p'] = {
+            'rhs_u': None, 'laplacian': None,
+            'mass_robin': None, 'mass_bound': [], 'u_norm_bound': [],
+        }
+        self.vec['u'] = {'rhs_const': None}
+        self.vec['p'] = {'rhs_const': None}
+
+        if self._using_wk:
+            self.pi_functions = {k: [] for k in
+                                 self.bc_dict['p']['windkessel']['params']}
+            if self.wk['implicit']:
+                self.vec['p'].update({
+                    'windkessel_rhs': [],
+                    'windkessel_lhs_lrc_diag': None,
+                })
+                self.mat['p'].update({'windkessel_lhs_lrc': None})
 
     @rank0
     def dump_parameters(self):
@@ -323,6 +322,10 @@ class Solver(LoggerBase):
             assert np.allclose(t0 + self.options['timemarching']['dt'], t_u)
             self.logger.info('Loading u0 at time {}'.format(t0))
 
+    # =========================================================================
+    # Time loop
+    # =========================================================================
+
     def solve(self):
         ''' Solve fractional step scheme '''
         timer = Timer('Z TimeStepping')
@@ -411,7 +414,7 @@ class Solver(LoggerBase):
         # post processing
         self.solve_pressure()
 
-        if self.options['io']['write_velocity'] == 'tentative':
+        if self.write_velocity == 'tentative':
             self.write_timestep(i)
 
         if self._using_wk and self.wk['implicit']:
@@ -440,7 +443,7 @@ class Solver(LoggerBase):
                               ['observation_operator'] == 'postprocessing')):
             self.observation(observations)
 
-        if self.options['io']['write_velocity'] == 'update':
+        if self.write_velocity == 'update':
             self.write_timestep(i, update=True)
 
     def restart_timestep(self, state, parameters):
@@ -481,6 +484,10 @@ class Solver(LoggerBase):
             self.update_windkessel_LRC()
 
         self.t = t0
+
+    # =========================================================================
+    # ROUKF estimation interface
+    # =========================================================================
 
     def init_observations(self):
         ''' Initialize observations for ROUKF.
@@ -962,6 +969,10 @@ class Solver(LoggerBase):
             self.vec_assigner.assign(state[1], self.u0_lst)
             state[2].assign(self.p)
 
+    # =========================================================================
+    # Assembly and solver setup
+    # =========================================================================
+
     def init_assembly(self):
         ''' Initialize, assemble static matrices. '''
         timer = Timer('Z init assembly')
@@ -1295,6 +1306,10 @@ class Solver(LoggerBase):
         })
         # TODO remove nullspace if no dirichlet BC!
 
+    # =========================================================================
+    # Displacement step  (ALE only)
+    # =========================================================================
+
     def assemble_displacement(self):
         ''' Assemble changing matrices for displacement. '''
         if not getattr(self, '_assembled_d', False):
@@ -1335,6 +1350,10 @@ class Solver(LoggerBase):
         self.residuals_ksp['d'].append(self.solver_d.residuals)
 
         timer.stop()
+
+    # =========================================================================
+    # Tentative velocity step
+    # =========================================================================
 
     def assemble_tentative_velocity(self, i=None):
         ''' Assemble changing matrices for tentative velocity solve. '''
@@ -1601,6 +1620,10 @@ class Solver(LoggerBase):
             # assign(self.u, self.u_lst)
             self.vec_assigner.assign(self.u, self.u_lst)
 
+    # =========================================================================
+    # Pressure projection step
+    # =========================================================================
+
     def build_rhs_pressure(self):
         ''' Build RHS vector for pressure projection solve. '''
         if (self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS'
@@ -1713,6 +1736,10 @@ class Solver(LoggerBase):
         self.residuals_ksp['p'].append(self.solver_p.residuals)
 
         timer.stop()
+
+    # =========================================================================
+    # Velocity update step
+    # =========================================================================
 
     def build_rhs_velocity_update(self, i):
         ''' Build RHS vector for tentative velocity solve, for the i'th
@@ -1846,6 +1873,10 @@ class Solver(LoggerBase):
                 for bc, dict_ in self.bc_dict['u']['dbc_functions'].items():
                     func, i = dict_['function'], dict_['i']
                     func.assign(self.v_lst_bc[i])
+
+    # =========================================================================
+    # Windkessel
+    # =========================================================================
 
     def solve_windkessel(self, restart=False, flow = True):
         ''' Solve windkessel
@@ -1996,6 +2027,10 @@ class Solver(LoggerBase):
             # required for FSI coupling
             self.transfer_velocity(self.v_s, self.v_bc)
 
+    # =========================================================================
+    # Monitoring and I/O
+    # =========================================================================
+
     def monitor(self, it, t=0):
         ''' Solution monitor, output interface.
 
@@ -2097,6 +2132,13 @@ class Solver(LoggerBase):
 
         u_in.set_allow_extrapolation(True)
         u_out.vector()[:] = self.T_u * u_in.vector()
+
+    @property
+    def write_velocity(self):
+        ''' Which velocity field to save to disk: ``'tentative'`` (u*) or
+        ``'update'`` (u).  Controlled by ``io.write_velocity`` in the input
+        YAML; defaults to ``'update'``. '''
+        return self.options['io'].get('write_velocity', 'update')
 
     def write_timestep(self, i, update=False):
         ''' Combined checkpoint and XDMF write out.

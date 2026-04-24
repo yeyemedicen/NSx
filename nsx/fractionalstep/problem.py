@@ -1,10 +1,7 @@
 ''' Fractional-Step Navier-Stokes problem module
 
-Author: David Nolte (dajuno@riseup.net)
-Date:   2020-02-27
-
-Contributor: Reidmen (r.a.arostica.barrera@rug.nl)
-Date:        2021-10-25
+Author: Jeremias Garay
+Date: 
 '''
 #from re import L
 #from tkinter import E
@@ -14,25 +11,57 @@ from pathlib import Path
 from scipy.interpolate import interp1d
 import csv
 from numpy import load
-from dolfin import MPI, Constant, VectorFunctionSpace, FunctionSpace, \
-    FiniteElement, VectorElement, Function, TrialFunction, TestFunction, \
-    as_vector, inner, sym, grad, dx, dot, div, FacetNormal, Measure, \
-    Expression, project, DirichletBC, TensorFunctionSpace, assemble
-import dolfin
-from dolfin import Identity, inv, det, CellVolume, sqrt
+from mpi4py import MPI
+import dolfinx
+import dolfinx.fem as fem
+from dolfinx.fem import (
+    Function, functionspace, dirichletbc,
+    locate_dofs_topological, locate_dofs_geometrical,
+    form as fem_form, assemble_scalar,
+)
+import basix
+import basix.ufl as bufl
+import ufl
+from ufl import (
+    TrialFunction, TestFunction,
+    as_vector, inner, sym, grad, dx, dot, div,
+    FacetNormal, Measure, Identity, inv, det, sqrt, CellVolume,
+)
+import numpy as np
+from petsc4py import PETSc
 from common import inout, utils
+
+
+def _dof_count(V):
+    ''' Global DOF count for a FunctionSpace. '''
+    return V.dofmap.index_map.size_global * V.dofmap.index_map_bs
+
+
+def _project(expr, V):
+    ''' L2-project a UFL expression into FunctionSpace V. '''
+    from dolfinx.fem.petsc import LinearProblem
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    problem = LinearProblem(
+        fem_form(inner(u, v) * dx),
+        fem_form(inner(expr, v) * dx),
+        bcs=[])
+    return problem.solve()
 
 
 def rank0(func):
     ''' Rank 0 decorator: decorated function "does nothing" if rank > 0 '''
     def inner(*args, **kwargs):
-        if MPI.rank(MPI.comm_world) == 0:
+        if MPI.COMM_WORLD.rank == 0:
             func(*args, **kwargs)
     return inner
 
 
 class Problem(LoggerBase):
     ''' NavierStokes Problem base class '''
+
+    # =========================================================================
+    # Initialization
+    # =========================================================================
 
     def __init__(self, inputfile=None):
         ''' Initialize FractionalStep problem.
@@ -58,7 +87,7 @@ class Problem(LoggerBase):
 
         self.logger.info('Initializing')
         self.logger.info('Number of parallel tasks: {}'.format(
-            MPI.size(MPI.comm_world)))
+            MPI.COMM_WORLD.size))
         self.logger.info('Write out path: {}'.format(
             self.options['io']['write_path']))
 
@@ -92,9 +121,9 @@ class Problem(LoggerBase):
         self.variational_form()
 
     def check_version(self):
-        ''' Check if compatible dolfin version is installed '''
-        if dolfin.__version__ < '2019':
-            raise Exception('FEniCS version 2019 or higher required!')
+        ''' Check if compatible dolfinx version is installed '''
+        if dolfinx.__version__ < '0.7':
+            raise Exception('DOLFINx version 0.7 or higher required!')
 
     @staticmethod
     def default_ale():
@@ -135,16 +164,24 @@ class Problem(LoggerBase):
 
     def setup_logger(self):
         ''' Create logging File Handler '''
-        MPI.barrier(MPI.comm_world)
+        MPI.COMM_WORLD.Barrier()
         path = Path(self.options['io']['write_path']).joinpath('run.log')
-        if MPI.rank(MPI.comm_world) == 0:
+        if MPI.COMM_WORLD.rank == 0:
             utils.trymkdir(str(path.parent))
             try:
                 path.unlink()
             except FileNotFoundError:
                 pass
-        MPI.barrier(MPI.comm_world)
+        MPI.COMM_WORLD.Barrier()
         self.set_log_filehandler(str(path))
+
+    def _C(self, val):
+        ''' Shorthand: fem.self._C(self.mesh, val) '''
+        return fem.self._C(self.mesh, np.array(val, dtype=PETSc.ScalarType))
+
+    # =========================================================================
+    # Mesh, function spaces, and operators
+    # =========================================================================
 
     def set_constants(self):
         ''' Set Constants from options file as instance attributes '''
@@ -154,23 +191,24 @@ class Problem(LoggerBase):
                                      'section, e.g.,\n fluid:\n\tdensity: 1.\n'
                                      '\tdynamic_viscosity: 0.001')
 
-            self.mu = Constant(self.options['dynamic_viscosity'])
-            self.rho = Constant(self.options['density'])
+            self.mu = self._C(self.options['dynamic_viscosity'])
+            self.rho = self._C(self.options['density'])
 
         else:
 
-            self.mu = Constant(self.options['fluid']['dynamic_viscosity'])
-            self.rho = Constant(self.options['fluid']['density'])
+            self.mu = self._C(self.options['fluid']['dynamic_viscosity'])
+            self.rho = self._C(self.options['fluid']['density'])
 
         dt = self.options['timemarching']['dt']
-        self.k = Constant(1./dt)
+        self.k = self._C(1./dt)
 
     def init_mesh(self):
         ''' Read in mesh, subdomains and boundary information. '''
         self.logger.info('Reading mesh {}'.format(self.options['mesh']))
-        self.mesh, self.subdomains, self.bnds = \
+        self.mesh, self.subdomains, self.facet_tags = \
             inout.read_mesh(self.options['mesh'])
-        self.ndim = self.mesh.topology().dim()
+        self.bnds = self.facet_tags   # preserve legacy name used downstream
+        self.ndim = self.mesh.topology.dim
         
         if self.ale['type'] == 'external':
             self.mesh_ext, _, _ = \
@@ -217,27 +255,29 @@ class Problem(LoggerBase):
         u_space = self.options['fem']['velocity_space'].lower()
         p_space = self.options['fem']['pressure_space'].lower()
 
+        cell = self.mesh.basix_cell()
+
         if self._using_ale:
             if hasattr(self, 'mesh_ext'):
                 s_space = self.ale['io']['fem_type'].lower()
                 self.logger.info('Creating external displacement space: {}'.
                     format(s_space.capitalize()))
                 deg = int(s_space[1])
-                self.S = VectorFunctionSpace(self.mesh_ext, 'CG', deg)
+                self.S = functionspace(self.mesh_ext,
+                                       ("Lagrange", deg, (self.ndim,)))
                 self.d_s = Function(self.S)
                 self.v_s = Function(self.S)
-                
+
             self.logger.info('Creating displacement space: {}'.format(
                 d_space.capitalize()))
             if d_space in ('p1', 'p2'):
                 deg = int(d_space[1])
-                self.D = VectorFunctionSpace(self.mesh, 'CG', deg)
-                self.Di = FunctionSpace(self.mesh, 'CG', deg)
-                # self.DG used for analyze the mapping J
-                self.DG = FunctionSpace(self.mesh, 'DG', 0)
+                self.D  = functionspace(self.mesh, ("Lagrange", deg, (self.ndim,)))
+                self.Di = functionspace(self.mesh, ("Lagrange", deg))
+                self.DG = functionspace(self.mesh, ("DG", 0))
 
                 self.logger.info('Number of displacement (per comp.) DOFs: {}'.format(
-                    self.Di.dim()))
+                    _dof_count(self.Di)))
 
                 self.d = Function(self.D, name='d')
                 self.d_lst = [Function(self.Di, name='d{}'.format(i))
@@ -245,40 +285,41 @@ class Problem(LoggerBase):
                 self.d0 = Function(self.D, name='d0')
                 self.d0_lst = [Function(self.Di, name='d{}'.format(i))
                                 for i in range(self.ndim)]
-                
+
                 self.F, self.J = self.F_(self.d), self.J_(self.d)
                 self.F0, self.J0 = self.F_(self.d0), self.J_(self.d0)
         else:
-            # D = VectorFunctionSpace(self.mesh, 'CG', 1)
-            self.F, self.J = Identity(self.ndim), Constant(1.)
-            self.F0, self.J0 = Identity(self.ndim), Constant(1.)
+            self.F, self.J = Identity(self.ndim), self._C(1.)
+            self.F0, self.J0 = Identity(self.ndim), self._C(1.)
 
         self.logger.info('Creating velocity space: {}'.format(
             u_space.capitalize()))
         if u_space in ('p1', 'p2'):
             deg = int(u_space[1])
-            self.V = VectorFunctionSpace(self.mesh, 'CG', deg)
-            self.Vi = FunctionSpace(self.mesh, 'CG', deg)
+            self.V  = functionspace(self.mesh, ("Lagrange", deg, (self.ndim,)))
+            self.Vi = functionspace(self.mesh, ("Lagrange", deg))
         elif u_space in ('p1b', 'p1+'):
             deg = int(u_space[1])
-            P1 = FiniteElement('CG', self.mesh.ufl_cell(), deg)
-            B = FiniteElement('Bubble', self.mesh.ufl_cell(), 1 + self.ndim)
-            self.V = FunctionSpace(self.mesh, VectorElement(P1 + B))
-            self.Vi = FunctionSpace(self.mesh, P1 + B)
+            P1_s = bufl.element("Lagrange", cell, deg)
+            B_s  = bufl.element("Bubble",   cell, deg + self.ndim)
+            P1_v = bufl.element("Lagrange", cell, deg, shape=(self.ndim,))
+            B_v  = bufl.element("Bubble",   cell, deg + self.ndim, shape=(self.ndim,))
+            self.Vi = functionspace(self.mesh, bufl.enriched_element([P1_s, B_s]))
+            self.V  = functionspace(self.mesh, bufl.enriched_element([P1_v, B_v]))
 
         self.logger.info('Creating pressure space: {}'.format(
             p_space.upper()))
         if p_space == 'p1':
-            self.Q = FunctionSpace(self.mesh, 'CG', int(p_space[1]))
+            self.Q = functionspace(self.mesh, ("Lagrange", 1))
         elif p_space in ('p0', 'dg0'):
-            self.Q = FunctionSpace(self.mesh, 'DG', 0)
+            self.Q = functionspace(self.mesh, ("DG", 0))
         elif p_space in ('p1-', 'dg1'):
-            self.Q = FunctionSpace(self.mesh, 'DG', 1)
+            self.Q = functionspace(self.mesh, ("DG", 1))
 
         self.logger.info('Number of velocity (per component) DOFs: {}'.format(
-            self.Vi.dim()))
+            _dof_count(self.Vi)))
         self.logger.info('Number of pressure DOFs:                 {}'.format(
-            self.Q.dim()))
+            _dof_count(self.Q)))
 
         self.u = Function(self.V, name='u')
         self.u_lst = [Function(self.Vi, name='u{}'.format(i))
@@ -294,7 +335,11 @@ class Problem(LoggerBase):
                         for i in range(self.ndim)]
         self.u0_mapdd_lst = [Function(self.Vi, name='u{}'.format(i))
                         for i in range(self.ndim)]
-        
+
+    # =========================================================================
+    # Variational forms
+    # =========================================================================
+
     def variational_form(self):
         ''' Set up variational forms of the problem and save in dictionary for
         later use (reassembly of parts).
@@ -342,13 +387,13 @@ class Problem(LoggerBase):
         # here we assume all of them are the same!
         def_dict = self.ale['deformations']
         #d_vec = as_vector(self.d_lst)
-        a_rhs = inner(Constant(self.ndim*[0.]), e)*dx
+        a_rhs = inner(self._C(self.ndim*[0.]), e)*dx
 
         if lift_dict['type'] == None:
             raise Exception("Incompatible lifting configuration.")
         elif lift_dict['type'] == 'harmonic':
             a_diff = inner(grad(d), grad(e))*dx
-            a_div = Constant(0.)*inner(d, e)*dx
+            a_div = self._C(0.)*inner(d, e)*dx
         elif lift_dict['type'] in ('elastic', 'elastic_element'):
             lambda_, mu_ = self.params_lifting()
             a_diff = lambda_*inner(sym(grad(d)), sym(grad(e)))*dx
@@ -368,12 +413,12 @@ class Problem(LoggerBase):
         lifting = self.ale['lifting']
         params = lifting['parameters']
         if lifting['type'] == 'elastic':
-            lambda_ = Constant(1.)
-            mu_ = Constant(params['mu'])
+            lambda_ = self._C(1.)
+            mu_ = self._C(params['mu'])
         elif lifting['type'] == 'elastic_element':
             vol = CellVolume(self.mesh)
-            lambda_ = Constant(1.)/vol
-            mu_ = Constant(params['mu'])/vol
+            lambda_ = self._C(1.)/vol
+            mu_ = self._C(params['mu'])/vol
         return lambda_, mu_
 
     def form_velocity_tentative(self):
@@ -406,7 +451,7 @@ class Problem(LoggerBase):
 
         def conv(u, u_conv):
             if self.options['fluid'].get('stokes', False):
-                a_conv = Constant(0)*u*vi*dx
+                a_conv = self._C(0)*u*vi*dx
                 return a_conv
             # rho*dot(u_conv, grad(u))*vi*dx
             a_conv = (rho*J*dot(dot(grad(u), inv(F)), u_conv - w_conv)*vi*dx
@@ -515,20 +560,20 @@ class Problem(LoggerBase):
 
         if self._using_mapdd:
             ds = self.ds
-            #n = FacetNormal(self.Q.mesh())
+            #n = FacetNormal(self.mesh)
             #N = J*inv(F).T*n
             #t_p = dot(grad(p), inv(F)) - dot(dot(grad(p), inv(F)),N)*N
             #t_q = dot(grad(q), inv(F)) - dot(dot(grad(q), inv(F)),N)*N
             
             for bid, prm in self.bc_dict['p']['mapdd']['params'].items():
-                #const = Constant(prm['eps_gradp'])
+                #const = self._C(prm['eps_gradp'])
                 #self.forms['p']['laplacian'] += const*inner(t_p, t_q)*ds(bid)
                 self.forms['p']['laplacian'] += (1/prm['l'])*p*q*ds(bid)
                 
 
         if self._using_wk:
             ds = self.ds
-            n = FacetNormal(self.Q.mesh())
+            n = FacetNormal(self.mesh)
             N = J*inv(F).T*n
             t_p = dot(grad(p), inv(F)) - dot(dot(grad(p), inv(F)),N)*N
             t_q = dot(grad(q), inv(F)) - dot(dot(grad(q), inv(F)),N)*N
@@ -560,6 +605,10 @@ class Problem(LoggerBase):
         a_gradp_lst = [-J*dot(inv(F), grad(p))[i]*vi*dx for i in range(self.ndim)]
 
         self.forms['u'].update({'gradp': a_gradp_lst})
+
+    # =========================================================================
+    # Stabilization
+    # =========================================================================
 
     def stabilization(self, u_conv=None):
         ''' Call stabilization methods as specified in options dict.
@@ -612,7 +661,7 @@ class Problem(LoggerBase):
         '''
 
         term_dict = self.options['fem']['stabilization']['forced_normal']
-        gamma = Constant(term_dict['gamma'])
+        gamma = self._C(term_dict['gamma'])
         bind_lst = (term_dict['boundaries'])
 
         self.logger.info('Adding normal forced velocity at '
@@ -626,7 +675,7 @@ class Problem(LoggerBase):
         # Using the reference system ds = dS J |inv(F).T N|
         elem = sqrt(dot(J*inv(F).T*n, J*inv(F).T*n))
 
-        ds = Measure('ds', domain=self.mesh, subdomain_data=self.bnds)
+        ds = ufl.Measure('ds', domain=self.mesh, subdomain_data=self.facet_tags)
 
 
         if self._using_mapdd:
@@ -716,7 +765,7 @@ class Problem(LoggerBase):
         ind = self.options['fem']['stabilization']['backflow_boundaries']
         self.logger.info('adding backflow stabilization on boundaries {}'.
                          format(ind))
-        ds = Measure('ds', domain=self.mesh, subdomain_data=self.bnds)
+        ds = ufl.Measure('ds', domain=self.mesh, subdomain_data=self.facet_tags)
 
         # a_bfs = sum([-0.5*rho*abs_n(dot(u_conv, n))*ui*vi*ds(i) for i in ind])
         if self._using_ale:
@@ -761,7 +810,7 @@ class Problem(LoggerBase):
             res_str = 'consistent (w/o pressure)'
             residual_time = k*rho*ui
             # residual_gradp = [self.p.dx(i) for i in range(self.ndim)]
-            if self.V.ufl_element().degree() > 1:
+            if self.V.ufl_element.degree > 1:
                 residual_convdiff += -mu*div(grad(ui))
             a_supg_time = tau*dot(u_conv, grad(vi))*residual_time*dx
         else:
@@ -773,6 +822,10 @@ class Problem(LoggerBase):
         a_supg_convdiff = tau*dot(u_conv, grad(vi))*residual_convdiff*dx
 
         return {'supg_convdiff': a_supg_convdiff, 'supg_time': a_supg_time}
+
+    # =========================================================================
+    # Boundary conditions
+    # =========================================================================
 
     def boundary_conditions(self):
         ''' Create boundary conditions '''
@@ -809,6 +862,10 @@ class BoundaryConditions(LoggerBase):
         }
     '''
 
+    # =========================================================================
+    # Initialization
+    # =========================================================================
+
     def __init__(self, problem):
         ''' Initialize.
 
@@ -830,8 +887,9 @@ class BoundaryConditions(LoggerBase):
         self.rho = problem.rho
         self.mu = problem.mu
         self.mesh = problem.mesh
-        self.bnds = problem.bnds
-        self.ndim = self.V.mesh().topology().dim()
+        self.facet_tags = problem.facet_tags
+        self.bnds = problem.bnds   # alias kept for compatibility
+        self.ndim = self.mesh.topology.dim
         self.ds = problem.ds
 
         self.u_lst = problem.u_lst
@@ -920,6 +978,14 @@ class BoundaryConditions(LoggerBase):
             # same_dbc_boundaries is problem dependent! 
             self.bc_dict['u'].update({'same_dbc_boundaries': True})
 
+    def _C(self, val):
+        ''' Shorthand: fem.Constant(self.mesh, val) '''
+        return fem.Constant(self.mesh, np.array(val, dtype=PETSc.ScalarType))
+
+    # =========================================================================
+    # BC processing
+    # =========================================================================
+
     def process_bcs(self):
         ''' Call functions to process boundary conditions corresponding to
         their type.
@@ -967,6 +1033,10 @@ class BoundaryConditions(LoggerBase):
         if self.options['fem']['fix_pressure'] == 1:
             self._pressure_dirichlet_point_bc()
 
+    # =========================================================================
+    # Displacement BCs
+    # =========================================================================
+
     def _dirichlet_displacement(self, bc):
         ''' Create displacement Dirichlet boundary condition at the interface
         from options adding them into :code:`self.bc_dict['d']['dirichlet']`.
@@ -979,10 +1049,13 @@ class BoundaryConditions(LoggerBase):
                 self.logger.info('External displacement bc at bid: {}'
                                 .format(bc['id']))
                 func = Function(self.D)
-                dbc = DirichletBC(self.D, func, self.bnds, bc['id'])
+                facets = self.facet_tags.find(bc['id'])
+                dofs = locate_dofs_topological(self.D, self.mesh.topology.dim - 1, facets)
+                dbc = dirichletbc(func, dofs)
                 # storing dbc in the first component
                 self.bc_dict['d']['dirichlet'][0].append(dbc)
-                self.bc_dict['d']['dbc_functions'][dbc] = {
+                bc_key = (bc['id'], 0)
+                self.bc_dict['d']['dbc_functions'][bc_key] = {
                     'function': func, 'id': bc['id']}
             else:
                 raise KeyError('bc dict needs key value')
@@ -1003,34 +1076,40 @@ class BoundaryConditions(LoggerBase):
                     continue
                 
                 elif isinstance(val, (int, float)):
-                    val = Constant(val)
+                    val = self._C(val)
 
                 elif isinstance(val, str):
+                    # TODO: replace string Expression with fem.Function + interpolate
                     deg = bc['degree'] if 'degree' in bc else 3
                     params = bc['parameters'] if 'parameters' in bc else dict()
-                    expr = Expression(val, degree=deg, **params)
-                    if 't' in params:
-                        self.logger.debug('time-dependent DBC found! bid: {bid}'
-                                          .format(bid=bc['id']))
-                    val = expr 
+                    expr = Function(self.Di)
+                    self.logger.warning(
+                        'String-based Expression for displacement BC '
+                        '(bid={}) not yet ported — BC skipped.'.format(bc['id']))
+                    continue
 
-                elif utils.is_Expression(val):
+                elif isinstance(val, fem.Function):
                     expr = val
 
-                elif utils.is_Constant(val):
+                elif isinstance(val, fem.Constant):
                     pass
 
-                if self.D.num_sub_spaces() > 0:
-                    D = self.D.sub(i)
+                facets = self.facet_tags.find(bc['id'])
+                if self.D.num_sub_elements > 0:
+                    D_sub, _ = self.D.sub(i).collapse()
+                    dofs = locate_dofs_topological(
+                        (self.D.sub(i), D_sub), self.mesh.topology.dim - 1, facets)
+                    dbc = dirichletbc(val, dofs, self.D.sub(i))
                 else:
-                    D = self.D
+                    dofs = locate_dofs_topological(
+                        self.D, self.mesh.topology.dim - 1, facets)
+                    dbc = dirichletbc(val, dofs, self.D)
 
-                dbc = DirichletBC(D, val, self.bnds, bc['id'])
-            
                 self.bc_dict['d']['dirichlet'][i].append(dbc)
-                
+
                 if expr:
-                    self.bc_dict['d']['dbc_expressions'][dbc] = {
+                    bc_key = (bc['id'], i)
+                    self.bc_dict['d']['dbc_expressions'][bc_key] = {
                         'expression': expr, 'id': bc['id']}
 
     def _neumann_displacement(self, bc):
@@ -1042,19 +1121,27 @@ class BoundaryConditions(LoggerBase):
         deg = bc['degree'] if 'degree' in bc else 3
         params = bc['parameters'] if 'parameters' in bc else dict()
         e = TestFunction(self.D)
-        n = FacetNormal(self.D.mesh())
+        n = FacetNormal(self.mesh)
 
         # TODO: time-dependent neumann condition 
         if self.ale['type'] in ('manual', 'external'):
             if not ('value' in bc):
                 raise KeyError('bc dict needs key value')
 
-            expr = Expression(bc['value'], degree=deg, **params)
+            # TODO: string Expression not yet ported; interpolate into fem.Function
+            expr = Function(self.D)
+            self.logger.warning(
+                'String-based Neumann displacement Expression not yet ported; '
+                'using zero displacement.')
             a_bc = inner(expr, e)*self.ds(bc['id'])
             self.bc_dict['d']['neumann'].append(a_bc)
         else:
             raise Exception('Only \'manual\' and \'external\' '
-                            'types available as bc for lifting')    
+                            'types available as bc for lifting')
+
+    # =========================================================================
+    # Velocity BCs
+    # =========================================================================
 
     def _dirichlet_velocity(self, bc):
         ''' Create velocity Dirichlet boundary condition from options and add
@@ -1069,18 +1156,24 @@ class BoundaryConditions(LoggerBase):
         elif not ('value' in bc):
             if self.ale['type'] == 'external':
                 # self.vel_bc = Function(self.V)
+                facets = self.facet_tags.find(bc['id'])
                 for i in range(self.ndim):
-                    
-                    if self.Vi.num_sub_spaces() > 0:
-                        V = self.Vi.sub(i)
+                    expr = Function(self.Vi)
+
+                    if self.Vi.num_sub_elements > 0:
+                        Vi_sub, _ = self.Vi.sub(i).collapse()
+                        dofs = locate_dofs_topological(
+                            (self.Vi.sub(i), Vi_sub),
+                            self.mesh.topology.dim - 1, facets)
+                        dbc = dirichletbc(expr, dofs, self.Vi.sub(i))
                     else:
-                        V = self.Vi
+                        dofs = locate_dofs_topological(
+                            self.Vi, self.mesh.topology.dim - 1, facets)
+                        dbc = dirichletbc(expr, dofs, self.Vi)
 
-                    expr = Function(V)  
-
-                    dbc = DirichletBC(V, expr, self.bnds, bc['id'])
                     self.bc_dict['u']['dirichlet'][i].append(dbc)
-                    self.bc_dict['u']['dbc_functions'][dbc] = {
+                    bc_key = (bc['id'], i)
+                    self.bc_dict['u']['dbc_functions'][bc_key] = {
                         'function': expr, 'id': bc['id'], 'i': i}
 
             elif self.ale['type'] in ('default', 'manual'):
@@ -1116,39 +1209,43 @@ class BoundaryConditions(LoggerBase):
                     continue
 
                 elif isinstance(val, (int, float)):
-                    val = Constant(val)
+                    val = self._C(val)
 
                 elif isinstance(val, str):
-                    deg = bc['degree'] if 'degree' in bc else 3
-                    params = bc['parameters'] if 'parameters' in bc else dict()
-                    expr = Expression(val, degree=deg, **params)
-                    # if 't' in params:
-                    #     self.logger.debug('time-dependent DBC found! bid: {bid}, '
-                    #                       'i-comp: {i}'.format(bid=bc['id'], i=i))
-                    #     self.bc_dict['u']['time_bcs'].append(
-                    #         {'expression': val, 'id': bc['id'], 'i': i})
+                    # TODO: replace string Expression with fem.Function + interpolate
+                    self.logger.warning(
+                        'String-based Expression for velocity BC '
+                        '(bid={}, i={}) not yet ported — BC skipped.'.format(bc['id'], i))
+                    continue
 
-                    val = expr
-
-                elif utils.is_Expression(val):
+                elif isinstance(val, fem.Function):
                     expr = val
 
-                elif utils.is_Constant(val):
-                    # do nothing
+                elif isinstance(val, fem.Constant):
                     pass
 
-                if self.Vi.num_sub_spaces() > 0:
-                    V = self.Vi.sub(i)
+                facets = self.facet_tags.find(bc['id'])
+                if self.Vi.num_sub_elements > 0:
+                    Vi_sub, _ = self.Vi.sub(i).collapse()
+                    dofs = locate_dofs_topological(
+                        (self.Vi.sub(i), Vi_sub),
+                        self.mesh.topology.dim - 1, facets)
+                    dbc = dirichletbc(val, dofs, self.Vi.sub(i))
                 else:
-                    V = self.Vi
+                    dofs = locate_dofs_topological(
+                        self.Vi, self.mesh.topology.dim - 1, facets)
+                    dbc = dirichletbc(val, dofs, self.Vi)
 
-
-                dbc = DirichletBC(V, val, self.bnds, bc['id'])
                 self.bc_dict['u']['dirichlet'][i].append(dbc)
 
                 if expr:
-                    self.bc_dict['u']['dbc_expressions'][dbc] = {
+                    bc_key = (bc['id'], i)
+                    self.bc_dict['u']['dbc_expressions'][bc_key] = {
                         'expression': expr, 'id': bc['id']}
+
+    # =========================================================================
+    # Pressure BCs
+    # =========================================================================
 
     def _dirichlet_pressure(self, bc):
         ''' Create pressure Dirichlet boundary condition from options and add
@@ -1160,8 +1257,10 @@ class BoundaryConditions(LoggerBase):
         if not ('id' in bc and 'value' in bc):
             raise KeyError('bc dict needs keys id & value')
 
+        facets = self.facet_tags.find(bc['id'])
+        dofs = locate_dofs_topological(self.Q, self.mesh.topology.dim - 1, facets)
         self.bc_dict['p']['dirichlet'].append(
-            DirichletBC(self.Q, bc['value'], self.bnds, bc['id'])
+            dirichletbc(self._C(float(bc['value'])), dofs, self.Q)
         )
 
     def _neumann_velocity(self, bc):
@@ -1171,8 +1270,8 @@ class BoundaryConditions(LoggerBase):
             bc (dict):  dict describing one boundary condition
         '''
         vi = TestFunction(self.Vi)
-        n = FacetNormal(self.Vi.mesh())
-        val = Constant(bc['value'])
+        n = FacetNormal(self.mesh)
+        val = self._C(bc['value'])
         val_ = val*self.J*inv(self.F).T*n
         for i in range(self.ndim):
             # a_bc = val*n[i]*vi*self.ds(bc['id'])
@@ -1186,6 +1285,10 @@ class BoundaryConditions(LoggerBase):
             bc (dict):  dict describing one boundary condition
         '''
         pass
+
+    # =========================================================================
+    # Inflow BCs
+    # =========================================================================
 
     def _inflow_profile(self, bc):
         ''' Create Inflow Profile BC
@@ -1204,13 +1307,15 @@ class BoundaryConditions(LoggerBase):
 
         # Reading the profile
         reading_csv = False
-        n = FacetNormal(self.V.mesh())
+        n = FacetNormal(self.mesh)
         uprofile = Function(self.V)
-        inout.read_HDF5_data(self.mesh.mpi_comm(), bc['profile'], uprofile, 'u')
+        inout.read_HDF5_data(self.mesh.comm, bc['profile'], uprofile, 'u')
 
         elem = J*dot(inv(F).T*n, inv(F).T*n)
-        area = assemble(elem*self.ds(bc['id']))
-        Norm_fact = abs(assemble(dot(uprofile,n)*self.ds(bc['id']))/area)
+        area = self.mesh.comm.allreduce(
+    assemble_scalar(fem_form(elem*self.ds(bc['id']))), op=MPI.SUM)
+        Norm_fact = abs(self.mesh.comm.allreduce(
+    assemble_scalar(fem_form(dot(uprofile,n)*self.ds(bc['id']))), op=MPI.SUM)/area)
         ui = TrialFunction(self.Vi)
         vi = TestFunction(self.Vi)
         
@@ -1219,7 +1324,8 @@ class BoundaryConditions(LoggerBase):
         if '.csv' in bc['waveform']:
             reading_csv = True
             self.logger.info('taking inflow form csv file...')
-            flow_init = assemble(dot(uprofile,n)*self.ds(bc['id']))
+            flow_init = self.mesh.comm.allreduce(
+    assemble_scalar(fem_form(dot(uprofile,n)*self.ds(bc['id']))), op=MPI.SUM)
             flip = -1 if flow_init >0 else 1
             Norm_fact = flow_init*flip            
             time_data = []
@@ -1231,13 +1337,20 @@ class BoundaryConditions(LoggerBase):
                     flow_data.append(float(row[1]))
             
             inflow_func = interp1d(time_data,flow_data, kind='cubic', fill_value='extrapolate')
-            waveform = Constant(inflow_func(0.0))
+            waveform = self._C(inflow_func(0.0))
         else:
             elem = J*dot(inv(F).T*n, inv(F).T*n) 
-            area = assemble(elem*self.ds(bc['id']))
-            Norm_fact = abs(assemble(dot(uprofile,n)*self.ds(bc['id']))/area)
+            area = self.mesh.comm.allreduce(
+    assemble_scalar(fem_form(elem*self.ds(bc['id']))), op=MPI.SUM)
+            Norm_fact = abs(self.mesh.comm.allreduce(
+    assemble_scalar(fem_form(dot(uprofile,n)*self.ds(bc['id']))), op=MPI.SUM)/area)
             params = bc['parameters']
-            waveform = Expression(bc['waveform'], degree=3, **params)
+            # TODO: string-based waveform Expression not yet ported;
+            # use a fem.Constant updated by solver via waveform_func each step
+            waveform = self._C(0.0)
+            self.logger.warning(
+                'String-based waveform Expression not yet ported; '
+                'waveform initialised to zero.')
 
 
         self.bc_dict['u']['dbc_expressions']['inflow'] = {'expression': waveform, 'id': bc['id']}
@@ -1262,7 +1375,7 @@ class BoundaryConditions(LoggerBase):
         F, J = self.F, self.J
 
         # Reading the profile
-        n = FacetNormal(self.V.mesh())
+        n = FacetNormal(self.mesh)
         uprofile = {0: Function(self.Vi), 1: Function(self.Vi), 2: Function(self.Vi)}
 
         ui = TrialFunction(self.Vi)
@@ -1272,9 +1385,9 @@ class BoundaryConditions(LoggerBase):
 
         u_data = load(bc['velocity_data'], allow_pickle = True)
         # loading initial time data
-        uprofile[0].vector()[:] = u_data['ux'].item()[0][:,0]
-        uprofile[1].vector()[:] = u_data['uy'].item()[0][:,0]
-        uprofile[2].vector()[:] = u_data['uz'].item()[0][:,0]
+        uprofile[0].x.array[:] = u_data['ux'].item()[0][:,0]
+        uprofile[1].x.array[:] = u_data['uy'].item()[0][:,0]
+        uprofile[2].x.array[:] = u_data['uz'].item()[0][:,0]
 
         self.bc_dict['u']['dbc_expressions']['inflow'] = {'pinns_data': u_data, 'id': bc['id'], 'uprofile': uprofile}
 
@@ -1284,6 +1397,10 @@ class BoundaryConditions(LoggerBase):
 
         # The left hand side can be written only once for all the components
         self.bc_dict['u']['inflow_lhs'] = gamma*ui*vi*self.ds(bc['id'])
+
+    # =========================================================================
+    # MAPDD / Windkessel
+    # =========================================================================
 
     def _mapdd(self,bc):
         '''
@@ -1295,7 +1412,7 @@ class BoundaryConditions(LoggerBase):
     
         ui = TrialFunction(self.Vi)
         vi = TestFunction(self.Vi)
-        n = FacetNormal(self.Vi.mesh())
+        n = FacetNormal(self.mesh)
 
         l = bc['parameters']['l']
         rho = self.rho
@@ -1304,9 +1421,9 @@ class BoundaryConditions(LoggerBase):
         bid = bc['id']
 
         self.bc_dict['p']['mapdd']['params'][bid] = {
-            'fmass': Constant(rho*k),
-            'fdiff': Constant(mu),
-            'l': Constant(l),
+            'fmass': self._C(rho*k),
+            'fdiff': self._C(mu),
+            'l': self._C(l),
         }
 
         self.bc_dict['u'].update({'mapdd_lhs': [] } )
@@ -1336,7 +1453,7 @@ class BoundaryConditions(LoggerBase):
 
         ds = self.ds
         F, J = self.F, self.J
-        n = FacetNormal(self.Vi.mesh())
+        n = FacetNormal(self.mesh)
 
         dt = self.options['timemarching']['dt']
         bid = bc['id']
@@ -1351,7 +1468,8 @@ class BoundaryConditions(LoggerBase):
 
         # Setting initial values
         elem = J*dot(inv(F).T*n, inv(F).T*n)
-        area = assemble(elem*ds(bid))
+        area = self.mesh.comm.allreduce(
+    assemble_scalar(fem_form(elem*ds(bid))), op=MPI.SUM)
         self.logger.info(f'area (problem): {area}')
         Q = float(0)
         delta_r = alpha/gamma
@@ -1362,36 +1480,41 @@ class BoundaryConditions(LoggerBase):
         pi = P0
         
         self.bc_dict['p']['windkessel']['params'][bid] = {
-            'eps': Constant(eps),
-            'R_p': Constant(R_p),
-            'R_d': Constant(R_d),
-            'C': Constant(C),
-            'pi0': Constant(pi0),
-            'pi': Constant(pi),
-            'Q': Constant(Q), # initial flow to zero
-            'Pl': Constant(P0),
-            'delta_l': Constant(delta_l),
-            'delta_r': Constant(delta_r),
-            'area': Constant(area),
-            'alpha': Constant(alpha),
-            'beta': Constant(beta),
-            'gamma': Constant(gamma)
+            'eps': self._C(eps),
+            'R_p': self._C(R_p),
+            'R_d': self._C(R_d),
+            'C': self._C(C),
+            'pi0': self._C(pi0),
+            'pi': self._C(pi),
+            'Q': self._C(Q), # initial flow to zero
+            'Pl': self._C(P0),
+            'delta_l': self._C(delta_l),
+            'delta_r': self._C(delta_r),
+            'area': self._C(area),
+            'alpha': self._C(alpha),
+            'beta': self._C(beta),
+            'gamma': self._C(gamma)
         }
 
         prm = self.bc_dict['p']['windkessel']['params'][bid]
 
         if self.wk['explicit']:
-            deg = bc['degree'] if 'degree' in bc else 1
-            expr = Expression('Pl', degree=deg, Pl=prm['Pl'])
-
-            dbc = DirichletBC(self.Q, expr, self.bnds, bid)
+            # Use prm['Pl'] directly as a fem.Constant; solver updates .value each step
+            facets = self.facet_tags.find(bid)
+            dofs = locate_dofs_topological(self.Q, self.mesh.topology.dim - 1, facets)
+            dbc = dirichletbc(prm['Pl'], dofs, self.Q)
             self.bc_dict['p']['windkessel']['dirichlet'].append(dbc)
-            self.bc_dict['p']['windkessel']['dbc_params'][dbc] = {
-                    'expr': expr, 'bid': bid}
+            bc_key = bid
+            self.bc_dict['p']['windkessel']['dbc_params'][bc_key] = {
+                    'Pl_const': prm['Pl'], 'bid': bid}
         elif self.wk['implicit']:
             # initialize with correct value
-            prm['pi'].assign(Constant(pi0))
+            prm['pi'].value = pi0
             prm['rhs_p'] = prm['Q'] + prm['delta_r']*prm['pi']
+
+    # =========================================================================
+    # Robin BCs (Navier-slip and transpiration)
+    # =========================================================================
 
     def _navierslip_velocity(self, bc):
         r''' Create weak forms of Navier-slip boundary condition, for each
@@ -1419,8 +1542,8 @@ class BoundaryConditions(LoggerBase):
         '''
         ui = TrialFunction(self.Vi)
         vi = TestFunction(self.Vi)
-        n = FacetNormal(self.Vi.mesh())
-        val = Constant(bc['value'])
+        n = FacetNormal(self.mesh)
+        val = self._C(bc['value'])
 
         self.bc_dict['u']['navierslip']['coef'].append(val)
         self.bc_dict['u']['navierslip']['id'].append(bc['id'])
@@ -1431,7 +1554,7 @@ class BoundaryConditions(LoggerBase):
         # self.logger.warn('DEBUG NAVIERSLIP FOR 2D PIPE')
         # a_implicit = -ui*vi*self.ds(bc['id'])
         # # ui*n[1]*vi*n[0] == 0
-        # a_explicit = {1: Constant(0)*ui*n[1]*vi*n[0]*self.ds(bc['id'])}
+        # a_explicit = {1: self._C(0)*ui*n[1]*vi*n[0]*self.ds(bc['id'])}
         # if bc['method'] == 'explicit':
         #     a_explicit.update({0: a_implicit})
         #     a_implicit = None
@@ -1440,9 +1563,9 @@ class BoundaryConditions(LoggerBase):
         #     {'semi-implicit': a_implicit, 'explicit': a_explicit}
         # )
 
-        # a_implicit = -Constant(0)*ui*vi*self.ds(bc['id'])
+        # a_implicit = -self._C(0)*ui*vi*self.ds(bc['id'])
         # # ui*n[1]*vi*n[0] == 0
-        # a_explicit = {0: Constant(0)*ui*n[1]*vi*n[0]*self.ds(bc['id'])}
+        # a_explicit = {0: self._C(0)*ui*n[1]*vi*n[0]*self.ds(bc['id'])}
         # if bc['method'] == 'explicit':
         #     a_explicit.update({1: a_implicit})
         #     a_implicit = None
@@ -1496,8 +1619,8 @@ class BoundaryConditions(LoggerBase):
         ui = TrialFunction(self.Vi)
         vi = TestFunction(self.Vi)
         p = TrialFunction(self.Q)
-        n = FacetNormal(self.Vi.mesh())
-        val = Constant(bc['value'])
+        n = FacetNormal(self.mesh)
+        val = self._C(bc['value'])
         self.bc_dict['u']['transpiration']['coef'].append(val)
         self.bc_dict['u']['transpiration']['id'].append(bc['id'])
         method = (self.options['timemarching']['fractionalstep']
@@ -1562,7 +1685,7 @@ class BoundaryConditions(LoggerBase):
         val = self.bc_dict['u']['transpiration']['coef'][coef_index]
         assert isinstance(val, Constant)
         self.bc_dict['p']['transpiration']['coef'].append(val)
-        n = FacetNormal(self.V.mesh())
+        n = FacetNormal(self.mesh)
 
         method = (self.options['timemarching']['fractionalstep']
                   ['transpiration_bc_projection'])
@@ -1578,8 +1701,10 @@ class BoundaryConditions(LoggerBase):
             #     -1./1000*0.035*dot(dot(grad(u), n), n)*q*self.ds(bc['id'])
             # a_proj_trans = dot(u, n)*q*self.ds
             p_trans = Function(self.Q, name='p_trans')
-            bc = DirichletBC(self.Q, p_trans, self.bnds, bc['id'])
-            self.bc_dict['p']['dirichlet'].append(bc)
+            facets = self.facet_tags.find(bc['id'])
+            dofs = locate_dofs_topological(self.Q, self.mesh.topology.dim - 1, facets)
+            bc_p = dirichletbc(p_trans, dofs)
+            self.bc_dict['p']['dirichlet'].append(bc_p)
             # boundary function is stored for convenience; DirichletBC detects
             # changes in function p_trans, does not need to be recreated.
             self.bc_dict['p']['transpiration']['dirichlet_functions'].append(
@@ -1604,6 +1729,10 @@ class BoundaryConditions(LoggerBase):
         else:
             raise Exception('Transpiration pressure method "{}" unknown'.
                             format(method))
+
+    # =========================================================================
+    # Preset BCs
+    # =========================================================================
 
     def _preset_selector(self, bc):
         ''' Prepare preset boundary condition.
@@ -1668,7 +1797,7 @@ class BoundaryConditions(LoggerBase):
             self.logger.warn('Inlet BCs are imposed strongly. Ignoring '
                              'Nitsche setting.')
 
-        if not isinstance(bc['value'], Expression):
+        if not isinstance(bc['value'], fem.Function):
             flow_direction = bc['flow_direction'] if 'flow_direction' in bc \
                 else 0
             assert flow_direction in range(self.ndim), (
@@ -1700,13 +1829,24 @@ class BoundaryConditions(LoggerBase):
                 inflow_str = ('U/(R*R)*(R*R - pow(x[{0}] - x0, 2) - '
                               'pow(x[{1}] - x0, 2))'.format(*indices))
 
-            inflow_lst = ['0.0']*self.ndim
-            inflow_lst[flow_direction] = inflow_str
-            inflow = [Expression(inflow_i,
-                                 U=bc['value']['U'],
-                                 x0=x0,
-                                 R=r0,
-                                 degree=2) for inflow_i in inflow_lst]
+            U_val = float(bc['value']['U'])
+            x0_val = float(x0)
+            r0_val = float(r0)
+            idx = indices  # radial axis indices
+
+            inflow = []
+            for comp in range(self.ndim):
+                f = Function(self.Vi)
+                if comp == flow_direction:
+                    if self.ndim == 2:
+                        f.interpolate(lambda x, _U=U_val, _x0=x0_val, _r=r0_val, _ax=idx[0]:
+                            _U * (1.0 - (x[_ax] - _x0)**2 / _r**2))
+                    else:
+                        f.interpolate(lambda x, _U=U_val, _x0=x0_val, _r=r0_val, _a=idx[0], _b=idx[1]:
+                            _U / _r**2 * (_r**2 - (x[_a] - _x0)**2 - (x[_b] - _x0)**2))
+                else:
+                    f.interpolate(lambda x: np.zeros(x.shape[1]))
+                inflow.append(f)
             bc['value'] = inflow
 
         self._dirichlet_velocity(bc)
@@ -1722,7 +1862,7 @@ class BoundaryConditions(LoggerBase):
             self.logger.warn('Inlet BCs are imposed strongly. Ignoring '
                              'Nitsche setting.')
 
-        if not isinstance(bc['value'], Expression):
+        if not isinstance(bc['value'], fem.Function):
             # shallow copy for ReynoldsContinuation
             flow_direction = bc['flow_direction'] if 'flow_direction' in bc \
                 else 0
@@ -1756,17 +1896,32 @@ class BoundaryConditions(LoggerBase):
                               'pow(x[{1}] - x0, 2))*sin(a*DOLFIN_PI*t)'
                               .format(*indices))
 
-            inflow_lst = ['0.0']*self.ndim
-            inflow_lst[flow_direction] = inflow_str
+            U_val  = float(bc['value']['U'])
+            x0_val = float(x0)
+            r0_val = float(r0)
+            a_val  = float(bc['value']['a'])
+            idx    = indices
+            # time_factor is updated by the solver each step
+            time_factor = self._C(0.0)
 
-            inflow = [Expression(inflow_i,
-                                 U=bc['value']['U'],
-                                 x0=x0,
-                                 R=r0,
-                                 a=bc['value']['a'],
-                                 t=0.0,
-                                 degree=2) for inflow_i in inflow_lst]
-            bc['value'] = inflow
+            inflow = []
+            for comp in range(self.ndim):
+                f = Function(self.Vi)
+                if comp == flow_direction:
+                    if self.ndim == 2:
+                        f.interpolate(lambda x, _U=U_val, _x0=x0_val, _r=r0_val, _ax=idx[0]:
+                            _U * (1.0 - (x[_ax] - _x0)**2 / _r**2))
+                    else:
+                        f.interpolate(lambda x, _U=U_val, _x0=x0_val, _r=r0_val, _a=idx[0], _b=idx[1]:
+                            _U / _r**2 * (_r**2 - (x[_a] - _x0)**2 - (x[_b] - _x0)**2))
+                else:
+                    f.interpolate(lambda x: np.zeros(x.shape[1]))
+                inflow.append(f)
+
+            # store time_factor + a so solver can update: time_factor.value = sin(a*pi*t)
+            bc['time_factor'] = time_factor
+            bc['a'] = a_val
+            bc['value'] = [time_factor * f for f in inflow]
 
         # self.bc_dict['u']['time_bcs'].append(
         #     {'expression': bc['value'][flow_direction], 'id': bc['id'], 'i':
@@ -1833,14 +1988,12 @@ class BoundaryConditions(LoggerBase):
         Args:
             bc (dict):  dict describing one boundary condition
         '''
-        if not isinstance(bc['value'],
-                          (int, float, dolfin.function.expression.Expression,
-                           dolfin.function.constant.Constant)):
+        if not isinstance(bc['value'], (int, float, fem.Function, fem.Constant)):
             raise Exception('value of navierslip BC needs to be of type (int,'
-                            ' float, Constant, Expression)')
+                            ' float, Constant, Function)')
 
         if isinstance(bc['value'], (int, float)):
-            bc['value'] = Constant(bc['value'])
+            bc['value'] = self._C(bc['value'])
 
         self._navierslip_velocity(bc)
         # pressure do nothing
@@ -1852,12 +2005,12 @@ class BoundaryConditions(LoggerBase):
         Args:
             bc (dict):  dict describing one boundary condition
         '''
-        if not isinstance(bc['value'], (int, float, Expression, Constant)):
+        if not isinstance(bc['value'], (int, float, fem.Function, fem.Constant)):
             raise Exception('value of transpiration BC needs to be of type '
-                            '(int, float, Constant, Expression)')
+                            '(int, float, Constant, Function)')
 
         if isinstance(bc['value'], (int, float)):
-            bc['value'] = Constant(bc['value'])
+            bc['value'] = self._C(bc['value'])
 
         self._transpiration_velocity(bc)
         self._transpiration_pressure(bc)
@@ -1867,15 +2020,24 @@ class BoundaryConditions(LoggerBase):
         Set zero automatically.
         '''
         pt = self.options['fem']['fix_pressure_point']
-        if len(pt) != self.Q.mesh().topology().dim():
+        if len(pt) != self.mesh.topology.dim:
             raise Exception('Dimension of pressure BC point coordinates != '
                             'mesh dimension.')
 
-        point_str = 'near(x[0], {}) and near(x[1], {})'.format(pt[0], pt[1])
-        if len(pt) == 3:
-            point_str += ' and near(x[2], {})'.format(pt[2])
+        pt_arr = np.array(pt, dtype=float)
+        tol = 1e-10
+        if len(pt) == 2:
+            def _at_point(x):
+                return np.isclose(x[0], pt_arr[0], atol=tol) & \
+                       np.isclose(x[1], pt_arr[1], atol=tol)
+        else:
+            def _at_point(x):
+                return np.isclose(x[0], pt_arr[0], atol=tol) & \
+                       np.isclose(x[1], pt_arr[1], atol=tol) & \
+                       np.isclose(x[2], pt_arr[2], atol=tol)
 
-        bc = DirichletBC(self.Q, 0., point_str, method='pointwise')
+        dofs = locate_dofs_geometrical(self.Q, _at_point)
+        bc = dirichletbc(self._C(0.0), dofs, self.Q)
         self.logger.info('Setting pressure point BC')
 
         self.bc_dict['p']['dirichlet'].append(bc)
@@ -1908,6 +2070,8 @@ class ProblemCoupled(Problem):
         *   velocity:       p1, p2, p1b/p1+ (bubble enriched)
         *   pressure:       p1, p0/dg0, p1-/dg1
         '''
+        cell = self.mesh.basix_cell()
+
         if hasattr(self, 'mesh_ext'):
             s_space = self.ale['io']['fem_type'].lower()
 
@@ -1915,10 +2079,10 @@ class ProblemCoupled(Problem):
                             .format(s_space.capitalize()))
 
             deg = int(s_space[1])
-            self.S = VectorFunctionSpace(self.mesh_ext, 'CG', deg)
+            self.S = functionspace(self.mesh_ext, ("Lagrange", deg, (self.ndim,)))
             self.d_s = Function(self.S)
             self.v_s = Function(self.S)
-            
+
         d_space = self.ale['fem']['displacement_space'].lower()
         u_space = self.options['fem']['velocity_space'].lower()
         p_space = self.options['fem']['pressure_space'].lower()
@@ -1928,43 +2092,42 @@ class ProblemCoupled(Problem):
                 d_space.capitalize()))
             if d_space in ('p1', 'p2'):
                 deg = int(d_space[1])
-                self.D = VectorFunctionSpace(self.mesh, 'CG', deg)
-                # self.DG used for analyze the mapping J
-                self.DG = FunctionSpace(self.mesh, 'DG', deg - 1)
+                self.D  = functionspace(self.mesh, ("Lagrange", deg, (self.ndim,)))
+                self.DG = functionspace(self.mesh, ("DG", max(deg - 1, 0)))
 
-            self.logger.info('Number of displacement DOFs: {}'.format(self.D.dim()))
+            self.logger.info('Number of displacement DOFs: {}'.format(
+                _dof_count(self.D)))
             self.d = Function(self.D, name='d')
             self.d0 = Function(self.D, name='d')
 
-            # Define common ALE operators
             self.F, self.J = self.F_(self.d), self.J_(self.d)
             self.F0, self.J0 = self.F_(self.d0), self.J_(self.d0)
         else:
-            self.F, self.J = Identity(self.ndim), Constant(1.)
-            self.F0, self.J0 = Identity(self.ndim), Constant(1.)
+            self.F, self.J = Identity(self.ndim), self._C(1.)
+            self.F0, self.J0 = Identity(self.ndim), self._C(1.)
 
         self.logger.info('Creating velocity space: {}'.format(
             u_space.capitalize()))
         if u_space in ('p1', 'p2'):
             deg = int(u_space[1])
-            self.V = VectorFunctionSpace(self.mesh, 'CG', deg)
+            self.V = functionspace(self.mesh, ("Lagrange", deg, (self.ndim,)))
         elif u_space in ('p1b', 'p1+'):
             deg = int(u_space[1])
-            P1 = FiniteElement('CG', self.mesh.ufl_cell(), deg)
-            B = FiniteElement('Bubble', self.mesh.ufl_cell(), 1 + self.ndim)
-            self.V = FunctionSpace(self.mesh, VectorElement(P1 + B))
+            P1_v = bufl.element("Lagrange", cell, deg, shape=(self.ndim,))
+            B_v  = bufl.element("Bubble",   cell, deg + self.ndim, shape=(self.ndim,))
+            self.V = functionspace(self.mesh, bufl.enriched_element([P1_v, B_v]))
 
         self.logger.info('Creating pressure space: {}'.format(
             p_space.upper()))
         if p_space == 'p1':
-            self.Q = FunctionSpace(self.mesh, 'CG', int(p_space[1]))
+            self.Q = functionspace(self.mesh, ("Lagrange", 1))
         elif p_space in ('p0', 'dg0'):
-            self.Q = FunctionSpace(self.mesh, 'DG', 0)
+            self.Q = functionspace(self.mesh, ("DG", 0))
         elif p_space in ('p1-', 'dg1'):
-            self.Q = FunctionSpace(self.mesh, 'DG', 1)
+            self.Q = functionspace(self.mesh, ("DG", 1))
 
-        self.logger.info('Number of velocity DOFs: {}'.format(self.V.dim()))
-        self.logger.info('Number of pressure DOFs: {}'.format(self.Q.dim()))
+        self.logger.info('Number of velocity DOFs: {}'.format(_dof_count(self.V)))
+        self.logger.info('Number of pressure DOFs: {}'.format(_dof_count(self.Q)))
 
         self.u = Function(self.V, name='u')
         self.u0 = Function(self.V, name='u0')
@@ -2120,13 +2283,13 @@ class ProblemCoupled(Problem):
 
 
         if self._using_mapdd:
-            #n = FacetNormal(self.Q.mesh())
+            #n = FacetNormal(self.mesh)
             #N = J*inv(F).T*n
             #t_p = dot(grad(p), inv(F)) - dot(dot(grad(p), inv(F)),N)*N
             #t_q = dot(grad(q), inv(F)) - dot(dot(grad(q), inv(F)),N)*N
             
             for bid, prm in self.bc_dict['p']['mapdd']['params'].items():
-                #const = Constant(prm['eps_gradp'])
+                #const = self._C(prm['eps_gradp'])
                 #self.forms['p']['laplacian'] += const*inner(t_p, t_q)*ds(bid)
                 self.forms['p']['laplacian'] += (1/prm['l'])*p*q*self.ds(bid)
             
@@ -2147,7 +2310,7 @@ class ProblemCoupled(Problem):
         '''
 
         term_dict = self.options['fem']['stabilization']['forced_normal']
-        gamma = Constant(term_dict['gamma'])
+        gamma = self._C(term_dict['gamma'])
         bind_lst = (term_dict['boundaries'])
         self.logger.info('Adding normal forced velocity at '
                          'boundary id {}'.format(bind_lst))
@@ -2182,7 +2345,7 @@ class ProblemCoupled(Problem):
         ind = self.options['fem']['stabilization']['backflow_boundaries']
         self.logger.info('adding backflow stabilization on boundaries {}'.
                          format(ind))
-        ds = Measure('ds', domain=self.mesh, subdomain_data=self.bnds)
+        ds = ufl.Measure('ds', domain=self.mesh, subdomain_data=self.facet_tags)
         k, rho = self.k, self.rho
         F, J = self.F, self.J
 
@@ -2229,7 +2392,7 @@ class ProblemCoupled(Problem):
             res_str = 'consistent (w/o pressure)'
             residual_time = k*rho*u
             # residual_gradp = [self.p.dx(i) for i in range(self.ndim)]
-            if self.V.ufl_element().degree() > 1:
+            if self.V.ufl_element.degree > 1:
                 residual_convdiff += -mu*div(grad(u))
             a_supg_time = tau*rho*dot(grad(v)*u_conv, residual_time)*dx
         else:
@@ -2290,9 +2453,9 @@ class BoundaryConditionsCoupled(BoundaryConditions):
         self.rho = problem.rho
         self.mu = problem.mu
         self.bnds = problem.bnds
-        self.ndim = self.V.mesh().topology().dim()
+        self.ndim = self.mesh.topology.dim
         self.mesh = problem.mesh
-        self.ds = Measure('ds', domain=self.V.mesh(), subdomain_data=self.bnds)
+        self.ds = ufl.Measure('ds', domain=self.mesh, subdomain_data=self.facet_tags)
 
         self._using_wk = False
         self._using_mapdd = False
@@ -2429,43 +2592,37 @@ class BoundaryConditionsCoupled(BoundaryConditions):
 
             if None not in val:
                 if all(isinstance(x, (int, float)) for x in val):
-                    val = Constant(val)
+                    val = self._C(val)
 
                 elif any(isinstance(x, str) for x in val):
-                    deg = bc['degree'] if 'degree' in bc else 3
-                    params = bc['parameters'] if 'parameters' in bc else dict()
-                    expr = Expression(val, degree=deg, **params)
-                    # if 't' in params:
-                    #     self.logger.debug('time-dependent DBC found! bid: {bid}, '
-                    #                       'i-comp: {i}'.format(bid=bc['id']))
-                    #     self.bc_dict['u']['time_bcs'].append(
-                    #         {'expression': val, 'id': bc['id']})
-                    val = expr
+                    # TODO: string Expression not yet ported — BC skipped
+                    self.logger.warning(
+                        'String-based Expression for velocity BC '
+                        '(bid={}) not yet ported — BC skipped.'.format(bc['id']))
+                    continue
 
-                elif utils.is_Expression(val):
+                elif isinstance(val, fem.Function):
                     expr = val
 
-                elif utils.is_Constant(val):
+                elif isinstance(val, fem.Constant):
                     pass
 
                 else:
                     raise Exception('Inconsistent Dirichlet value types at '
                                     'boundary {}'.format(bc['id']))
 
-                # if self.Vi.num_sub_spaces() > 0:
-                #     V = self.Vi.sub(i)
-                # else:
-                #     V = self.Vi
-
                 if utils.is_enriched(self.V):
-                    val = project(val, self.V.collapse())  # , solver_type='mumps')
-                    #             solver_type='cg')   ??
+                    V_collapsed, _ = self.V.collapse()
+                    val = _project(val, V_collapsed)
 
-                dbc = DirichletBC(self.V, val, self.bnds, bc['id'])
+                facets = self.facet_tags.find(bc['id'])
+                dofs = locate_dofs_topological(self.V, self.mesh.topology.dim - 1, facets)
+                dbc = dirichletbc(val, dofs, self.V)
                 self.bc_dict['u']['dirichlet'].append(dbc)
 
                 if expr:
-                    self.bc_dict['u']['dbc_expressions'][dbc] = {
+                    bc_key = bc['id']
+                    self.bc_dict['u']['dbc_expressions'][bc_key] = {
                         'expression': expr, 'id': bc['id']}
 
             else:
@@ -2475,55 +2632,55 @@ class BoundaryConditionsCoupled(BoundaryConditions):
                         continue
 
                     elif isinstance(val, (int, float)):
-                        val = Constant(val)
+                        val = self._C(val)
 
                     elif isinstance(val, str):
-                        deg = bc['degree'] if 'degree' in bc else 3
-                        params = bc['parameters'] if 'parameters' in bc else dict()
-                        expr = Expression(val, degree=deg, **params)
-                        val = expr
-                        # if 't' in params:
-                        #     self.logger.debug('time-dependent DBC found! bid: {bid}, '
-                        #                       'i-comp: {i}'.format(bid=bc['id'], i=i))
-                        #     self.bc_dict['u']['time_bcs'].append(
-                        #         {'expression': val, 'id': bc['id'], 'i': i})
-                    elif utils.is_Expression(val):
+                        # TODO: string Expression not yet ported — BC skipped
+                        self.logger.warning(
+                            'String-based Expression for velocity BC '
+                            '(bid={}, i={}) not yet ported — BC skipped.'.format(
+                                bc['id'], i))
+                        continue
+
+                    elif isinstance(val, fem.Function):
                         expr = val
 
-                    elif utils.is_Constant(val):
-                        # do nothing
+                    elif isinstance(val, fem.Constant):
                         pass
 
-                    Vi = self.V.sub(i)
+                    facets = self.facet_tags.find(bc['id'])
+                    V_sub, _ = self.V.sub(i).collapse()
+                    if utils.is_enriched(V_sub):
+                        val = _project(val, V_sub)
 
-                    if utils.is_enriched(Vi):
-                        val = project(val, Vi.collapse())
-                        #              solver_type='mumps')
-                        #              solver_type='cg')   ??
-
-                    dbc = DirichletBC(Vi, val, self.bnds, bc['id'])
+                    dofs = locate_dofs_topological(
+                        (self.V.sub(i), V_sub), self.mesh.topology.dim - 1, facets)
+                    dbc = dirichletbc(val, dofs, self.V.sub(i))
                     self.bc_dict['u']['dirichlet'].append(dbc)
 
                     if expr:
-                        self.bc_dict['u']['dbc_expressions'][dbc] = {
+                        bc_key = (bc['id'], i)
+                        self.bc_dict['u']['dbc_expressions'][bc_key] = {
                             'expression': expr, 'id': bc['id']}
 
         elif self.ale['type'] == 'external':
             self.vel_bc = Function(self.V)
+            facets = self.facet_tags.find(bc['id'])
 
-            for i in range(self.ndim):              
-                Vi = self.V.sub(i)
+            for i in range(self.ndim):
+                Vi_sub, _ = self.V.sub(i).collapse()
+                self.vel_bc_lst[i] = Function(Vi_sub)
 
-                self.vel_bc_lst[i] = Function(V)  
-
-                dbc = DirichletBC(Vi, self.vel_bc_lst[i], self.bnds, bc['id'])
-                self.bc_dict['u']['dirichlet'][i].append(dbc)
+                dofs = locate_dofs_topological(
+                    (self.V.sub(i), Vi_sub), self.mesh.topology.dim - 1, facets)
+                dbc = dirichletbc(self.vel_bc_lst[i], dofs, self.V.sub(i))
+                self.bc_dict['u']['dirichlet'].append(dbc)
 
     def _neumann_velocity(self, bc):
         ''' Create weak form of Neumann boundary condition '''
         v = TestFunction(self.V)
-        n = FacetNormal(self.V.mesh())
-        val = Constant(bc['value'])
+        n = FacetNormal(self.mesh)
+        val = self._C(bc['value'])
         val_ = val*self.J*inv(self.F).T*n
         # Classic formulation:
         #   val*dot(n, v)*self.ds(bc['id'])
@@ -2547,12 +2704,14 @@ class BoundaryConditionsCoupled(BoundaryConditions):
 
         # Reading the profile
         reading_csv = False
-        n = FacetNormal(self.V.mesh())
+        n = FacetNormal(self.mesh)
         uprofile = Function(self.V)
-        inout.read_HDF5_data(self.mesh.mpi_comm(), bc['profile'], uprofile, 'u')
+        inout.read_HDF5_data(self.mesh.comm, bc['profile'], uprofile, 'u')
         elem = J*dot(inv(F).T*n, inv(F).T*n)
-        area = assemble(elem*self.ds(bc['id']))
-        Norm_fact = abs(assemble(dot(uprofile,n)*self.ds(bc['id']))/area)
+        area = self.mesh.comm.allreduce(
+    assemble_scalar(fem_form(elem*self.ds(bc['id']))), op=MPI.SUM)
+        Norm_fact = abs(self.mesh.comm.allreduce(
+    assemble_scalar(fem_form(dot(uprofile,n)*self.ds(bc['id']))), op=MPI.SUM)/area)
         u = TrialFunction(self.V)
         v = TestFunction(self.V)
         
@@ -2561,7 +2720,8 @@ class BoundaryConditionsCoupled(BoundaryConditions):
         if '.csv' in bc['waveform']:
             reading_csv = True
             self.logger.info('taking inflow form csv file...')
-            flow_init = assemble(dot(uprofile,n)*self.ds(bc['id']))
+            flow_init = self.mesh.comm.allreduce(
+    assemble_scalar(fem_form(dot(uprofile,n)*self.ds(bc['id']))), op=MPI.SUM)
             flip = -1 if flow_init >0 else 1
             Norm_fact = flow_init*flip            
             time_data = []
@@ -2573,13 +2733,20 @@ class BoundaryConditionsCoupled(BoundaryConditions):
                     flow_data.append(float(row[1]))
             
             inflow_func = interp1d(time_data,flow_data, kind='cubic', fill_value='extrapolate')
-            waveform = Constant(inflow_func(0.0))
+            waveform = self._C(inflow_func(0.0))
         else:
             elem = J*dot(inv(F).T*n, inv(F).T*n) 
-            area = assemble(elem*self.ds(bc['id']))
-            Norm_fact = abs(assemble(dot(uprofile,n)*self.ds(bc['id']))/area)
+            area = self.mesh.comm.allreduce(
+    assemble_scalar(fem_form(elem*self.ds(bc['id']))), op=MPI.SUM)
+            Norm_fact = abs(self.mesh.comm.allreduce(
+    assemble_scalar(fem_form(dot(uprofile,n)*self.ds(bc['id']))), op=MPI.SUM)/area)
             params = bc['parameters']
-            waveform = Expression(bc['waveform'], degree=3, **params)
+            # TODO: string-based waveform Expression not yet ported;
+            # use a fem.Constant updated by solver via waveform_func each step
+            waveform = self._C(0.0)
+            self.logger.warning(
+                'String-based waveform Expression not yet ported; '
+                'waveform initialised to zero.')
 
 
         self.bc_dict['u']['dbc_expressions']['inflow'] = {'expression': waveform, 'id': bc['id']}
@@ -2600,7 +2767,7 @@ class BoundaryConditionsCoupled(BoundaryConditions):
     
         u = TrialFunction(self.V)
         v = TestFunction(self.V)
-        n = FacetNormal(self.V.mesh())
+        n = FacetNormal(self.mesh)
 
         l = bc['parameters']['l']
         rho = self.rho
@@ -2609,9 +2776,9 @@ class BoundaryConditionsCoupled(BoundaryConditions):
         bid = bc['id']
 
         self.bc_dict['p']['mapdd']['params'][bid] = {
-            'fmass': Constant(rho*k),
-            'fdiff': Constant(mu),
-            'l': Constant(l),
+            'fmass': self._C(rho*k),
+            'fdiff': self._C(mu),
+            'l': self._C(l),
         }
 
         prm = self.bc_dict['p']['mapdd']['params'][bid]
@@ -2649,8 +2816,8 @@ class BoundaryConditionsCoupled(BoundaryConditions):
         '''
         u = TrialFunction(self.V)
         v = TestFunction(self.V)
-        n = FacetNormal(self.V.mesh())
-        val = Constant(bc['value'])
+        n = FacetNormal(self.mesh)
+        val = self._C(bc['value'])
 
         self.bc_dict['u']['navierslip']['coef'].append(val)
         self.bc_dict['u']['navierslip']['id'].append(bc['id'])
@@ -2687,8 +2854,8 @@ class BoundaryConditionsCoupled(BoundaryConditions):
         u = TrialFunction(self.V)
         v = TestFunction(self.V)
         p = TrialFunction(self.Q)
-        n = FacetNormal(self.V.mesh())
-        val = Constant(bc['value'])
+        n = FacetNormal(self.mesh)
+        val = self._C(bc['value'])
         self.bc_dict['u']['transpiration']['coef'].append(val)
         self.bc_dict['u']['transpiration']['id'].append(bc['id'])
         method = (self.options['timemarching']['fractionalstep']
@@ -2717,7 +2884,7 @@ class BoundaryConditionsCoupled(BoundaryConditions):
             self.logger.warn('Inlet BCs are imposed strongly. Ignoring '
                              'Nitsche setting.')
 
-        if not isinstance(bc['value'], Expression):
+        if not isinstance(bc['value'], fem.Function):
             flow_direction = bc['flow_direction'] if 'flow_direction' in bc \
                 else 0
             assert flow_direction in range(self.ndim), (
@@ -2749,13 +2916,22 @@ class BoundaryConditionsCoupled(BoundaryConditions):
                 inflow_str = ('U/(R*R)*(R*R - pow(x[{0}] - x0, 2) - '
                               'pow(x[{1}] - x0, 2))'.format(*indices))
 
-            inflow_lst = ['0.0']*self.ndim
-            inflow_lst[flow_direction] = inflow_str
-            inflow = Expression(inflow_lst,
-                                U=bc['value']['U'],
-                                x0=x0,
-                                R=r0,
-                                degree=2)
+            U_val  = float(bc['value']['U'])
+            x0_val = float(x0)
+            r0_val = float(r0)
+            idx    = indices
+
+            inflow = Function(self.V)
+            def _parabola_vec(x, _U=U_val, _x0=x0_val, _r=r0_val,
+                              _fd=flow_direction, _idx=idx, _ndim=self.ndim):
+                vals = np.zeros((_ndim, x.shape[1]))
+                if _ndim == 2:
+                    vals[_fd] = _U * (1.0 - (x[_idx[0]] - _x0)**2 / _r**2)
+                else:
+                    vals[_fd] = _U / _r**2 * (
+                        _r**2 - (x[_idx[0]] - _x0)**2 - (x[_idx[1]] - _x0)**2)
+                return vals
+            inflow.interpolate(_parabola_vec)
             bc['value'] = inflow
 
         self._dirichlet_velocity(bc)
@@ -2771,8 +2947,7 @@ class BoundaryConditionsCoupled(BoundaryConditions):
             self.logger.warn('Inlet BCs are imposed strongly. Ignoring '
                              'Nitsche setting.')
 
-        if not isinstance(bc['value'], Expression):
-            # shallow copy for ReynoldsContinuation
+        if not isinstance(bc['value'], fem.Function):
             flow_direction = bc['flow_direction'] if 'flow_direction' in bc \
                 else 0
             assert flow_direction in range(self.ndim), (
@@ -2790,32 +2965,32 @@ class BoundaryConditionsCoupled(BoundaryConditions):
                 r0 = bc['value']['R']
                 x0 = 0.
 
-            # get the indices orthogonal to flow direction (coordinates of
-            # parabola)
             indices = list(range(self.ndim))
             indices.remove(flow_direction)
 
-            if self.ndim == 2:
-                inflow_str = ('U*(1 - pow(x[{0}] - x0, 2)/(R*R))*'
-                              'sin(a*DOLFIN_PI*t)'.format(*indices))
-            elif self.ndim == 3:
-                self.logger.warn('3D paraboloidal inlet profile only valid for'
-                                 ' circular cross sections')
-                inflow_str = ('U/(R*R)*(R*R - pow(x[{0}] - x0, 2) -'
-                              'pow(x[{1}] - x0, 2))*sin(a*DOLFIN_PI*t)'
-                              .format(*indices))
+            U_val  = float(bc['value']['U'])
+            x0_val = float(x0)
+            r0_val = float(r0)
+            a_val  = float(bc['value']['a'])
+            idx    = indices
+            time_factor = self._C(0.0)
 
-            inflow_lst = ['0.0']*self.ndim
-            inflow_lst[flow_direction] = inflow_str
+            spatial = Function(self.V)
+            def _parabola_vec(x, _U=U_val, _x0=x0_val, _r=r0_val,
+                              _fd=flow_direction, _idx=idx, _ndim=self.ndim):
+                vals = np.zeros((_ndim, x.shape[1]))
+                if _ndim == 2:
+                    vals[_fd] = _U * (1.0 - (x[_idx[0]] - _x0)**2 / _r**2)
+                else:
+                    vals[_fd] = _U / _r**2 * (
+                        _r**2 - (x[_idx[0]] - _x0)**2 - (x[_idx[1]] - _x0)**2)
+                return vals
+            spatial.interpolate(_parabola_vec)
 
-            inflow = Expression(inflow_lst,
-                                U=bc['value']['U'],
-                                x0=x0,
-                                R=r0,
-                                a=bc['value']['a'],
-                                t=0.0,
-                                degree=2)
-            bc['value'] = inflow
+            # time_factor updated each step: time_factor.value = sin(a*pi*t)
+            bc['time_factor'] = time_factor
+            bc['a'] = a_val
+            bc['value'] = time_factor * spatial
 
         # self.bc_dict['u']['time_bcs'].append(
         #     {'expression': bc['value'], 'id': bc['id']})
