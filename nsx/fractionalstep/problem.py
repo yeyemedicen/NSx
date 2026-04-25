@@ -3,8 +3,7 @@
 Author: Jeremias Garay
 Date: 
 '''
-#from re import L
-#from tkinter import E
+
 from .streamline_diffusion import SDParameter
 from ..logger.logger import LoggerBase
 from pathlib import Path
@@ -75,7 +74,6 @@ class Problem(LoggerBase):
         self.options = None
         self.inputfile = inputfile
         if inputfile:
-            # populate self.options dictionary
             self.get_parameters(inputfile)
 
         self._logging_filehandler = None
@@ -122,7 +120,8 @@ class Problem(LoggerBase):
 
     def check_version(self):
         ''' Check if compatible dolfinx version is installed '''
-        if dolfinx.__version__ < '0.7':
+        from packaging.version import Version as _V
+        if _V(dolfinx.__version__) < _V('0.7'):
             raise Exception('DOLFINx version 0.7 or higher required!')
 
     @staticmethod
@@ -2599,7 +2598,7 @@ class BoundaryConditionsCoupled(BoundaryConditions):
                     self.logger.warning(
                         'String-based Expression for velocity BC '
                         '(bid={}) not yet ported — BC skipped.'.format(bc['id']))
-                    continue
+                    return
 
                 elif isinstance(val, fem.Function):
                     expr = val

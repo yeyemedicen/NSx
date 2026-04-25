@@ -1,36 +1,93 @@
 ''' Fractional-Step Navier-Stokes solver module
 
-Author: David Nolte (dnolte@dim.uchile.cl)
-Date:   2019-10-02
+Author: Jeremias Garay
+Date:   2026-04-25
 
-Contributor: Reidmen (r.a.arostica.barrera@rug.nl)
-Date:        2021-10-25
 '''
-#from re import L
-#from turtle import back
-from dolfin import *
-import dolfin
+
+from mpi4py import MPI
+import dolfinx
+import dolfinx.fem as fem
+from dolfinx.fem import (
+    Function, functionspace, form as fem_form, assemble_scalar,
+)
+from dolfinx.fem.petsc import (
+    assemble_matrix, assemble_vector,
+    apply_lifting, set_bc,
+    create_matrix, create_vector,
+)
+from dolfinx.common import Timer
+from dolfinx.io import XDMFFile
+import ufl
+from ufl import (
+    TrialFunction, TestFunction, inner, dot, grad, dx,
+    FacetNormal, Identity, Measure,
+)
 from petsc4py import PETSc
-from common import inout, utils
-from ..logger.logger import LoggerBase
-from pathlib import Path
 import numpy as np
 import pickle
 import shutil
 import os
 import platform
-#import mritools.mritools
+from common import inout, utils
+from ..logger.logger import LoggerBase
+from pathlib import Path
 
-if dolfin.__version__ < '2019':
-    raise Exception('FEniCS version 2019 or higher required!')
+from packaging.version import Version as _V
+if _V(dolfinx.__version__) < _V('0.7'):
+    raise Exception('DOLFINx version 0.7 or higher required!')
 
 
 def rank0(func):
     ''' Rank 0 decorator: decorated function "does nothing" if rank > 0 '''
     def inner(*args, **kwargs):
-        if MPI.rank(MPI.comm_world) == 0:
+        if MPI.COMM_WORLD.rank == 0:
             func(*args, **kwargs)
     return inner
+
+
+def _assemble_mat(form, bcs=None, mat=None):
+    ''' Assemble bilinear UFL form into PETSc.Mat.
+    If mat is provided, re-assembles into it (zeroing first).
+    '''
+    compiled = fem_form(form)
+    if mat is None:
+        result = assemble_matrix(compiled, bcs=bcs or [])
+        result.assemble()
+        return result
+    mat.zeroEntries()
+    assemble_matrix(compiled, bcs=bcs or [], mat=mat)
+    mat.assemble()
+    return mat
+
+
+def _assemble_vec(form):
+    ''' Assemble linear UFL form into PETSc.Vec. '''
+    result = assemble_vector(fem_form(form))
+    result.ghostUpdate(addv=PETSc.InsertMode.ADD,
+                       mode=PETSc.ScatterMode.REVERSE)
+    return result
+
+
+def _mat_vec(A, x):
+    ''' Compute y = A * x, returning a new PETSc.Vec. '''
+    y = A.createVecLeft()
+    A.mult(x, y)
+    return y
+
+
+def _apply_dbc_to_mat(mat, bcs, diag=1.0):
+    ''' Zero rows/cols for DirichletBC DOFs and set diagonal to diag. '''
+    for bc in bcs:
+        dofs = bc.dof_indices()[0]
+        mat.zeroRowsColumnsLocal(dofs, diag)
+
+
+def _zero_mat_rows(mat, bcs):
+    ''' Zero rows of PETSc.Mat corresponding to DirichletBC DOFs. '''
+    for bc in bcs:
+        dofs = bc.dof_indices()[0]
+        mat.zeroRowsLocal(dofs)
 
 
 class Solver(LoggerBase):
@@ -91,9 +148,8 @@ class Solver(LoggerBase):
         else:
             self.phi = self.p
 
-        # Component <-> vector assigners
-        self.vec_assigner = FunctionAssigner(problem.V, [problem.Vi]*self.ndim)
-        self.comp_assigner = FunctionAssigner([problem.Vi]*self.ndim, problem.V)
+        # DOF block size for split/merge between V and Vi
+        self._bs = problem.V.dofmap.index_map_bs
 
         # Correction velocity increments
         self.du = [Function(problem.Vi, name='du_i') for i in range(self.ndim)]
@@ -107,6 +163,18 @@ class Solver(LoggerBase):
             self.dump_parameters()
 
         problem.close_logs()
+
+    def _split_vec_to_lst(self, u, u_lst):
+        ''' Copy vector Function u into list of scalar Functions u_lst. '''
+        bs = self._bs
+        for i, ui in enumerate(u_lst):
+            ui.x.array[:] = u.x.array[i::bs]
+
+    def _merge_lst_to_vec(self, u_lst, u):
+        ''' Copy list of scalar Functions u_lst into vector Function u. '''
+        bs = self._bs
+        for i, ui in enumerate(u_lst):
+            u.x.array[i::bs] = ui.x.array
 
     def _init_state_flags(self):
         ''' Initialize boolean state and option flags. '''
@@ -256,8 +324,8 @@ class Solver(LoggerBase):
             self.logger.info('Moving old checkpoint folder to safe location: '
                              + str(backup_path))
 
-            MPI.barrier(MPI.comm_world)
-            if MPI.rank(MPI.comm_world) == 0:
+            MPI.COMM_WORLD.Barrier()
+            if MPI.COMM_WORLD.rank == 0:
                 checkpoint_path.rename(backup_path)
                 pth = Path(io['write_path'])
                 files = ('u.xdmf', 'u.h5', 'p.xdmf', 'p.h5')
@@ -271,7 +339,7 @@ class Solver(LoggerBase):
                     [f.rename(backup_path.joinpath(f.name)) for f in
                      pth.glob(g)]
 
-            MPI.barrier(MPI.comm_world)
+            MPI.COMM_WORLD.Barrier()
 
     def read_checkpoint(self):
         ''' Read stored checkpoint, if io.restart.path is given and
@@ -300,7 +368,7 @@ class Solver(LoggerBase):
         except FileNotFoundError:
             raise
 
-        comm = self.u.function_space().mesh().mpi_comm()
+        comm = self.u.function_space.mesh.comm
         t_u = inout.read_HDF5_data(comm, str(restart_path.joinpath('u.h5')),
                                    self.u, '/u')
         inout.read_HDF5_data(comm, str(restart_path.joinpath('p.h5')),
@@ -563,26 +631,17 @@ class Solver(LoggerBase):
             raise Exception('Unsupported measurement FE degree: {}'
                             .format(degree))
 
-        if all_scalar:
-            self._observation_aux_assigner = []
-
         fun_lst = []
         fun_aux_lst = []
         V_aux = None
         for meshfile in mesh_lst:
             mesh, _, _ = inout.read_mesh(meshfile)
             if all_scalar:
-                V = FunctionSpace(mesh, element_family, degree)
-                # 1. interpolate velocity vector onto measurement grid (V_aux)
-                # 2. perform component projection in the measurement space
-                # ---> need to store both scalar and vector spaces
-                V_aux = VectorFunctionSpace(mesh, element_family, degree)
+                V = functionspace(mesh, ("Lagrange" if element_family == 'P' else "DG", degree))
+                V_aux = functionspace(mesh, ("Lagrange" if element_family == 'P' else "DG", degree, (self.ndim,)))
                 fun_aux_lst.append(Function(V_aux))
-                # fun_aux_lst.append([Function(V) for i in range(self.ndim)])
-                self._observation_aux_assigner.append(
-                    FunctionAssigner([V]*self.ndim, V_aux))
             else:
-                V = VectorFunctionSpace(mesh, element_family, degree)
+                V = functionspace(mesh, ("Lagrange" if element_family == 'P' else "DG", degree, (self.ndim,)))
             fun_lst.append(Function(V))
 
         self._observation_fun_aux_lst = fun_aux_lst
@@ -600,7 +659,7 @@ class Solver(LoggerBase):
                                         .format(direction))
                 res_lst.append(meas['resolution'])
             for meshfile, res in zip(mesh_lst, res_lst):
-                Mesh_coords = mesh.coordinates()
+                Mesh_coords = mesh.geometry.x
 
                 xmin = np.min(Mesh_coords[:,0])
                 xmax = np.max(Mesh_coords[:,0])
@@ -795,7 +854,6 @@ class Solver(LoggerBase):
         else:
             Xobs_aux_lst = self._observation_fun_aux_lst
 
-        LI = LagrangeInterpolator
         if not self._observation_res_lst:
             for i, (Xobs, Xobs_aux) in enumerate(zip(Xobs_lst, Xobs_aux_lst)):
                 if Xobs_aux:
@@ -806,7 +864,8 @@ class Solver(LoggerBase):
 
                     # handle cartesian component selection manually for performance
                     if direction.count(0) == 2 and direction.count(1) == 1:
-                        LI.interpolate(Xobs, self.u.sub(direction.index(1)))
+                        idx = direction.index(1)
+                        Xobs.interpolate(self.u_lst[idx])
 
                     else:
                         assert not Xobs.value_shape(), 'Xobs is not a scalar'
@@ -814,19 +873,20 @@ class Solver(LoggerBase):
                         direction = np.array(direction, dtype=float)
                         direction /= np.sqrt(np.dot(direction, direction))
 
-                        LI.interpolate(Xobs_aux, self.u)
+                        Xobs_aux.interpolate(self.u)
 
-                        # This is faster than simply Xobs_aux.split(True) !
-                        Xobs_aux_i = [Xobs] + [Xobs.copy(True) for i in
-                                               range(self.ndim - 1)]
-                        self._observation_aux_assigner[i].assign(Xobs_aux_i,
-                                                                 Xobs_aux)
-                        Xobs.vector()[:] *= direction[0]
+                        bs = Xobs_aux.function_space.dofmap.index_map_bs
+                        Xobs_aux_i = [Function(Xobs.function_space) for _ in
+                                      range(self.ndim)]
+                        Xobs_aux_i[0] = Xobs
+                        for k in range(self.ndim):
+                            Xobs_aux_i[k].x.array[:] = Xobs_aux.x.array[k::bs]
+                        Xobs.x.array[:] *= direction[0]
                         for Xi, d in zip(Xobs_aux_i[1:], direction[1:]):
                             if d:
-                                Xobs.vector().axpy(d, Xi.vector())
+                                Xobs.x.array[:] += d * Xi.x.array
                 else:
-                    LI.interpolate(Xobs, self.u)
+                    Xobs.interpolate(self.u)
         else:
             assert type(Xobs_lst[0]) == np.ndarray
             for i, (Xobs, X_fun, Xobs_aux) in enumerate(zip(Xobs_lst, self._observation_np_aux_fun_lst, Xobs_aux_lst)):
@@ -836,7 +896,7 @@ class Solver(LoggerBase):
 
                     direction = (self.options['estimation']['measurements'][i]
                                  ['velocity_direction'])    
-                X_fun = mritools.mritools.SpatialInterpolation([self.u], self.u.function_space(), X_fun.function_space(), Xobs_aux, direction)
+                X_fun = mritools.mritools.SpatialInterpolation([self.u], self.u.function_space, X_fun.function_space, Xobs_aux, direction)
 
                 padding = 0 if not 'padding' in self.options['estimation']['measurements'][i] else self.options['estimation']['measurements'][i]['padding']
                 Xobs_l = mritools.mritools.to_numpy_array(X_fun[0], None, self._observation_res_lst[i], box=False, padding=padding)
@@ -859,8 +919,8 @@ class Solver(LoggerBase):
         assert len(self.theta_internal) == len(parameters)
         for th_old, th_new in zip(self.theta_internal, parameters):
 
-            if isinstance(th_old, Constant):
-                th_old.assign(th_new)
+            if isinstance(th_old, fem.Constant):
+                th_old.value = float(th_new)
 
             elif isinstance(th_old, dict):
                 # parameters are expression parameters
@@ -868,6 +928,7 @@ class Solver(LoggerBase):
                 prms = th_old['parameter']
 
                 for expr in expr_lst:
+                    # TODO: expr.user_parameters is legacy; update if needed
                     expr.user_parameters[prms] = th_new
                     # TODO ... dirty/hacky
                     for dbc, dict_ in (self.bc_dict['u']['dbc_expressions']
@@ -890,14 +951,14 @@ class Solver(LoggerBase):
         if not state:
             return
 
-        self.u.assign(state[0])
-        self.comp_assigner.assign(self.u_lst, self.u)
+        self.u.x.array[:] = state[0].x.array
+        self._split_vec_to_lst(self.u, self.u_lst)
         enum_wk = enumerate(self.bc_dict['p']['windkessel']['params'].items())
         for k, (bid, prm) in enum_wk:
             # adding wk pressure if C != 0
             if abs(float(prm['C'])) > 1e-14:
-                value = state[k+1].vector().get_local()
-                mpi_comm = self.u.function_space().mesh().mpi_comm()
+                value = state[k+1].x.array
+                mpi_comm = self.u.function_space.mesh.comm
 
                 if mpi_comm.Get_size() > 1:
                     # parallel -- maybe not the best solution, but works
@@ -919,8 +980,8 @@ class Solver(LoggerBase):
                     mpi_comm.Bcast(value, root=0)
                     # info(f'DBG: bcast: {value}')
 
-                prm['pi'].assign(Constant(float(value)))
-                prm['pi0'].assign(Constant(float(value)))
+                prm['pi'].value = float(value)
+                prm['pi0'].value = float(value)
                 
                 # info(f"value = {value}, const = {prm['pi'].values()}")
 
@@ -928,20 +989,20 @@ class Solver(LoggerBase):
                 == 'IPCS'):
             assert True, 'experimental placeholder'
             # should work but not tested
-            self.comp_assigner.assign(self.u0_lst, state[1])
-            self.p.assign(state[2])
+            self._split_vec_to_lst(state[1], self.u0_lst)
+            self.p.x.array[:] = state[2].x.array
 
     def init_state(self,state):
         ''' initialize the state variables according inputfile values'''
 
-        state[0].assign(Function(self.u.function_space())) # initial velocity starts from 0
+        state[0].x.array[:] = 0.0  # initial velocity starts from 0
         if self._using_wk:
             enum_wk = enumerate(self.bc_dict['p']['windkessel']['params'].items())
             # update wk part of the state
             for k, (bid, prm) in enum_wk:
                 if abs(float(prm['C'])) > 1e-14:
                     value = float(prm['pi'])
-                    state[k+1].vector()[:] = value
+                    state[k+1].x.array[:] = value
 
     def update_state(self, state):
         ''' ROUKF interface: update state variables from solution functions
@@ -953,21 +1014,21 @@ class Solver(LoggerBase):
         if not state:
             return
 
-        state[0].assign(self.u)
+        state[0].x.array[:] = self.u.x.array
         enum_wk = enumerate(self.bc_dict['p']['windkessel']['params'].items())
         # update wk part of the state
         for k, (bid, prm) in enum_wk:
             if abs(float(prm['C'])) > 1e-14:
                 value = float(prm['pi'])
-                state[k+1].vector()[:] = value
+                state[k+1].x.array[:] = value
         # TODO: raise Exception for IPCS and windkessel
         if (self.options['timemarching']['fractionalstep']['scheme']
                 == 'IPCS'):
             assert True, 'experimental placeholder'
             assert len(state) == 3, 'expected state space dimension = 3'
             # should work but not tested
-            self.vec_assigner.assign(state[1], self.u0_lst)
-            state[2].assign(self.p)
+            self._merge_lst_to_vec(self.u0_lst, state[1])
+            state[2].x.array[:] = self.p.x.array
 
     # =========================================================================
     # Assembly and solver setup
@@ -978,85 +1039,82 @@ class Solver(LoggerBase):
         timer = Timer('Z init assembly')
         if self._using_ale:
             # matrices of displacement component space Di
-            self.mat['d']['diff'] = assemble(self.forms['d']['diff'])
-            self.mat['d']['div'] = assemble(self.forms['d']['div'])
-            self.vec['d']['rhs_const'] = assemble(self.forms['d']['rhs_const'])
+            self.mat['d']['diff'] = _assemble_mat(self.forms['d']['diff'])
+            self.mat['d']['div'] = _assemble_mat(self.forms['d']['div'])
+            self.vec['d']['rhs_const'] = _assemble_vec(self.forms['d']['rhs_const'])
 
         # matrices of velocity component space Vi
-        self.mat['u']['mass'] = assemble(self.forms['u']['mass'])
-        self.mat['u']['diff'] = assemble(self.forms['u']['diff'])
-        # self.mat['u']['mass_diff'] = assemble(self.forms['u']['mass'] +
-        #                                    self.forms['u']['diff'])
+        self.mat['u']['mass'] = _assemble_mat(self.forms['u']['mass'])
+        self.mat['u']['diff'] = _assemble_mat(self.forms['u']['diff'])
         self.mat['u']['rhs'] = self.mat['u']['mass'].copy()
-        # if ('supg_gradp' in self.forms['u'] and
-        #         self.forms['u']['supg_gradp']):
-        #     self.mat['u']['supg_gp'] = self.mat['u']['mass'].copy()
 
         if self.forms['u']['pres']:
-            self.mat['u']['pdiv'] = [assemble(a) for a in
-                                        self.forms['u']['pres']]
+            self.mat['u']['pdiv'] = [_assemble_mat(a) for a in
+                                     self.forms['u']['pres']]
         if self.forms['u']['gradp']:
-            self.mat['u']['gradp'] = [assemble(a) for a in
-                                        self.forms['u']['gradp']]
+            self.mat['u']['gradp'] = [_assemble_mat(a) for a in
+                                      self.forms['u']['gradp']]
 
         # init convection matrix (sparsity pattern)
-        # self.mat['u']['conv'] = assemble(self.forms['u']['conv'])
         self.mat['u']['conv'] = self.mat['u']['mass'].copy()
-        
+
         # assembling inflow matrices
         if self.forms['u']['inflow_lhs']:
             self.mat['u']['inflow'] = self.mat['u']['mass'].copy()
-            assemble(self.forms['u']['inflow_lhs'], tensor=self.mat['u']['inflow'])
+            _assemble_mat(self.forms['u']['inflow_lhs'],
+                          mat=self.mat['u']['inflow'])
         else:
             self.mat['u']['inflow'] = None
-        
+
         # assembling fnv matrices
         if 'fnv' in self.forms['u'].keys():
-            self.mat['u']['fnv'] = [self.mat['u']['mass'].copy()]*3
+            self.mat['u']['fnv'] = [self.mat['u']['mass'].copy()
+                                    for _ in range(self.ndim)]
             for i in range(self.ndim):
-                assemble(self.forms['u']['fnv'][i][0], tensor=self.mat['u']['fnv'][i])
+                _assemble_mat(self.forms['u']['fnv'][i][0],
+                              mat=self.mat['u']['fnv'][i])
         else:
             self.mat['u']['fnv'] = None
 
-        self.vec['u']['rhs_const'] = [assemble(form) if form else None for
+        self.vec['u']['rhs_const'] = [_assemble_vec(form) if form else None for
                                       key, form in
                                       self.forms['u']['neumann'].items()]
 
         if 'fnv' in self.forms['u'].keys():
-            self.vec['u']['fnv'] = [assemble(form[1]) if form else None for
-                                        key, form in
-                                        self.forms['u']['fnv'].items()]
+            self.vec['u']['fnv'] = [_assemble_vec(form[1]) if form else None for
+                                    key, form in
+                                    self.forms['u']['fnv'].items()]
         else:
             self.vec['u']['fnv'] = None
 
-        self.vec['u']['rhs_inflow'] = [assemble(form) if form else None for
-                                      key, form in
-                                      self.forms['u']['inflow'].items()]
-        
-        self.vec['u']['rhs_mapdd'] = [assemble(form) if form else None for
+        self.vec['u']['rhs_inflow'] = [_assemble_vec(form) if form else None for
+                                       key, form in
+                                       self.forms['u']['inflow'].items()]
+
+        self.vec['u']['rhs_mapdd'] = [_assemble_vec(form) if form else None for
                                       key, form in
                                       self.forms['u']['mapdd'].items()]
-        
 
         # matrices of pressure space Q
-        # right hand side matrix to be multiplied by u.vector()
+        # right hand side matrix to be multiplied by u.x.petsc_vec
         # div(u) and in case of transpiration BCs: dot(u, n) term
-        self.mat['p']['rhs_u'] = assemble(self.forms['p']['rhs_u'])
-        self.mat['p']['laplacian'] = assemble(self.forms['p']['laplacian'])
+        self.mat['p']['rhs_u'] = _assemble_mat(self.forms['p']['rhs_u'])
+        self.mat['p']['laplacian'] = _assemble_mat(self.forms['p']['laplacian'])
 
         # apply bdry conditions to pressure Laplacian
-        [bc.apply(self.mat['p']['laplacian']) for bc in self.bc_dict['p']['dirichlet']]
+        _apply_dbc_to_mat(self.mat['p']['laplacian'],
+                          self.bc_dict['p']['dirichlet'])
         # if windkessel, apply bdry conditions for explicit
         # or assemble LRC matrix for implicit method
         if self._using_wk:
             if not self.wk['implicit']:
-                [bc.apply(self.mat['p']['laplacian']) for bc in
-                        self.bc_dict['p']['windkessel']['dirichlet']]
+                _apply_dbc_to_mat(self.mat['p']['laplacian'],
+                                  self.bc_dict['p']['windkessel']['dirichlet'])
             else:
                 self.assembly_windkessel(self.mat['p']['laplacian'])
 
         if self.forms['p']['neumann']:
-            self.vec['p']['rhs_const'] = assemble(self.forms['p']['neumann'])
+            self.vec['p']['rhs_const'] = _assemble_vec(self.forms['p']['neumann'])
         else:
             self.vec['p']['rhs_const'] = 0
 
@@ -1087,40 +1145,33 @@ class Solver(LoggerBase):
         '''
 
         self.logger.info('Creating LRC matrix from windkessel BCs')
-        # TODO : switch to select windkessel method
         u_lst = []
         fac_l = []
         for bid, prm in self.bc_dict['p']['windkessel']['params'].items():
-            u_lst.append(
-                assemble(self.forms['p']['windkessel_lhs'][bid])
-            )
+            u_lst.append(_assemble_vec(self.forms['p']['windkessel_lhs'][bid]))
             fac_l.append(float(prm['delta_l']))
 
-        U_arr = np.hstack([v.get_local() for v in u_lst])
+        U_arr = np.hstack([v.getArray() for v in u_lst])
         diag = np.array(fac_l)
 
-        dofmap = self.p.function_space().dofmap()
-        # Local, global
-        sizes = [
-            dofmap.index_map().size(IndexMap.MapSize.OWNED),
-            dofmap.index_map().size(IndexMap.MapSize.GLOBAL),
-        ]
-        # create dense U matrix (tall and skinny)
-        comm = self.p.function_space().mesh().mpi_comm()
+        imap = self.p.function_space.dofmap.index_map
+        sizes_local = imap.size_local
+        sizes_global = imap.size_global
+        comm = self.p.function_space.mesh.comm
         ncol = len(u_lst)
         U = PETSc.Mat().createDense(
-            size=(sizes, (ncol, ncol)), array=U_arr, comm=comm
+            size=((sizes_local, sizes_global), (ncol, ncol)),
+            array=U_arr.reshape((sizes_local, ncol)), comm=comm
         )
         U.setUp()
         U.assemble()
-        # self.mat['p']['windkessel_lrc_U'] = U
 
         vec = PETSc.Vec().createSeq(size=len(diag))
         vec.setArray(diag)
         vec.assemble()
         self.vec['p']['windkessel_lhs_lrc_diag'] = vec
         self.mat['p']['windkessel_lhs_lrc'] = PETSc.Mat().createLRC(
-            as_backend_type(A).mat(), U, vec, U
+            A, U, vec, U
         )
 
     def init_assembly_robin(self):
@@ -1145,26 +1196,20 @@ class Solver(LoggerBase):
                 else:
                     if navslip_forms[i][i_bnd]['semi-implicit']:
                         self.mat['u']['lhs_navslip'][i].append(
-                            assemble(navslip_forms[i][i_bnd]['semi-implicit'],
-                                     tensor=sparse_pat.copy()))
+                            _assemble_mat(navslip_forms[i][i_bnd]['semi-implicit'],
+                                          mat=sparse_pat.copy()))
                     self.mat['u']['rhs_navslip'][i].append(
-                        {j: assemble(a, sparse_pat.copy()) for j, a in
+                        {j: _assemble_mat(a) for j, a in
                          navslip_forms[i][i_bnd]['explicit'].items()})
 
             if not self._optimizing:
                 self.mat['u']['rhs_navslip'][i].append(
-                    {j: assemble(a, sparse_pat.copy()) for j, a in
+                    {j: _assemble_mat(a) for j, a in
                      tmp_dict.items()})
-
-                # # DBG
-                # for j, Ai in self.mat['u']['rhs_navslip'][i][-1].items():
-                #     self.logger.warn('i = {}: ||Ai|| = {}'.format(
-                #         i, np.linalg.norm(Ai.array())))
-                # #
 
                 if tmp_form:
                     self.mat['u']['lhs_navslip'][i].append(
-                        assemble(tmp_form, tensor=sparse_pat.copy()))
+                        _assemble_mat(tmp_form, mat=sparse_pat.copy()))
 
                     # # DBG
                     # self.logger.warn('tmp_form: {}'.format(tmp_form))
@@ -1191,10 +1236,10 @@ class Solver(LoggerBase):
                 else:
                     if trans_forms[i][i_bnd]['semi-implicit']:
                         self.mat['u']['lhs_trans'][i].append(
-                            assemble(trans_forms[i][i_bnd]['semi-implicit'],
-                                     tensor=sparse_pat.copy()))
+                            _assemble_mat(trans_forms[i][i_bnd]['semi-implicit'],
+                                          mat=sparse_pat.copy()))
                     self.mat['u']['rhs_trans'][i].append(
-                        {j: assemble(a, sparse_pat.copy()) for j, a in
+                        {j: _assemble_mat(a) for j, a in
                          trans_forms[i][i_bnd]['explicit'].items()})
 
                 # in the case of CT, add (pn, vn)*ds(i) to boundary form
@@ -1204,37 +1249,36 @@ class Solver(LoggerBase):
 
             if not self._optimizing:
                 self.mat['u']['rhs_trans'][i].append(
-                    {j: assemble(a, sparse_pat.copy()) for j, a in
+                    {j: _assemble_mat(a) for j, a in
                      tmp_dict.items()})
                 if tmp_form_u:
-                        self.mat['u']['lhs_trans'][i].append(
-                            assemble(tmp_form_u, tensor=sparse_pat.copy()))
+                    self.mat['u']['lhs_trans'][i].append(
+                        _assemble_mat(tmp_form_u, mat=sparse_pat.copy()))
             if tmp_form_p:
-                    self.mat['u']['p_trans'][i] = assemble(
-                        tmp_form_p)
-        #                tmp_form_p, tensor=sparse_pat.copy())
+                self.mat['u']['p_trans'][i] = _assemble_mat(tmp_form_p)
 
         # PRESSURE BC
         self.mat['p']['mass_robin'] = [
-            assemble(a, tensor=self.mat['p']['laplacian'].copy()) for a in
+            _assemble_mat(a, mat=self.mat['p']['laplacian'].copy()) for a in
             self.forms['p']['robin']]
 
         self.mat['p']['u_norm_bound'] = [
-            assemble(a) for a in
+            _assemble_mat(a) for a in
             self.forms['p']['transpiration_dirichlet_u']]
         for a in self.forms['p']['transpiration_dirichlet_p']:
-            Atmp = assemble(a, keep_diagonal=True)
-            Atmp.ident_zeros()
+            Atmp = _assemble_mat(a)
+            # ensure diagonal DOFs are non-zero (replaces ident_zeros)
+            Atmp.setOption(PETSc.Mat.Option.KEEP_NONZERO_PATTERN, True)
             self.mat['p']['mass_bound'].append(Atmp)
 
         # set corresponding rows to zero in Robin mass matrices (if any)
         for mat in self.mat['p']['mass_robin']:
-            [bc.zero(mat) for bc in self.bc_dict['p']['dirichlet']]
+            _zero_mat_rows(mat, self.bc_dict['p']['dirichlet'])
 
         if not self._optimizing:
             for mat, coef in zip(self.mat['p']['mass_robin'],
                                  self.bc_dict['p']['transpiration']['coef']):
-                self.mat['p']['laplacian'].axpy(1./float(coef), mat, True)
+                self.mat['p']['laplacian'].axpy(1./float(coef), mat)
         else:
             # raise Exception('Robin BC optimization not implemented for PPE')
             pass
@@ -1291,7 +1335,7 @@ class Solver(LoggerBase):
         Aupd = self.mat['u']['mass'].copy()
         if self._applying_dc_on_update:
             if self.bc_dict['u']['same_dbc_boundaries']:
-                [bc.apply(Aupd) for bc in self.bc_dict['u']['dirichlet'][0]]
+                _apply_dbc_to_mat(Aupd, self.bc_dict['u']['dirichlet'][0])
         self.solver_u_upd.set_operator(Aupd)
 
         self.iterations_ksp.update({
@@ -1314,9 +1358,9 @@ class Solver(LoggerBase):
         ''' Assemble changing matrices for displacement. '''
         if not getattr(self, '_assembled_d', False):
             A = self.mat['d']['diff'] # copy ?
-            A.axpy(1., self.mat['d']['div'], True)
+            A.axpy(1., self.mat['d']['div'])
             for i in range(self.ndim):
-                [bc.apply(A) for bc in self.bc_dict['d']['dirichlet'][i]]
+                _apply_dbc_to_mat(A, self.bc_dict['d']['dirichlet'][i])
 
             self.solver_d.set_operator(A)
             self._assembled_d = True
@@ -1325,7 +1369,7 @@ class Solver(LoggerBase):
         ''' Build RHS vector for displacement solve. '''
         bd = self.vec['d']['rhs_const']
         for i in range(self.ndim):
-            [bc.apply(bd) for bc in self.bc_dict['d']['dirichlet'][i]]
+            set_bc(bd, self.bc_dict['d']['dirichlet'][i])
 
         return bd
 
@@ -1338,7 +1382,7 @@ class Solver(LoggerBase):
         self.assemble_displacement()
         bd = self.build_rhs_displacement()
 
-        self.solver_d.solve(self.d.vector(), bd)
+        self.solver_d.solve(self.d.x.petsc_vec, bd)
 
         if self.solver_d.conv_reason < 0:
             self.logger.error('Solver d DIVERGED ({})'.
@@ -1369,55 +1413,47 @@ class Solver(LoggerBase):
                 with Timer('Z assign conv'):
                     for uci, ui, u0i in zip(self._u_tmp_lst, self.u_lst,
                                             self.u0_lst):
-                        uci.assign(2*ui - u0i)
-                    self.vec_assigner.assign(self.u_conv_assigned,
-                                             self._u_tmp_lst)
+                        uci.x.array[:] = 2*ui.x.array - u0i.x.array
+                    self._merge_lst_to_vec(self._u_tmp_lst, self.u_conv_assigned)
         
         A = self.mat['u']['conv']
-        assemble(self.forms['u']['conv'], tensor=A)
+        _assemble_mat(self.forms['u']['conv'], mat=A)
 
-        # A.axpy(1., self.mat['u']['mass_diff'], True)
         if (self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS'
                 and self.t > self.options['timemarching']['dt'] + 1e-14):
             cf = 1.5
         else:
             cf = 1
-        
+
         if self._using_ale:
-            assemble(self.forms['u']['mass'], tensor=self.mat['u']['mass'])
-            assemble(self.forms['u']['diff'], tensor=self.mat['u']['diff'])
+            _assemble_mat(self.forms['u']['mass'], mat=self.mat['u']['mass'])
+            _assemble_mat(self.forms['u']['diff'], mat=self.mat['u']['diff'])
             # mat['u']['rhs'] changes over time when using ALE
             self.mat['u']['rhs'] = self.mat['u']['mass'].copy()
 
-        A.axpy(cf, self.mat['u']['mass'], True)
-        A.axpy(1., self.mat['u']['diff'], True)
+        A.axpy(cf, self.mat['u']['mass'])
+        A.axpy(1., self.mat['u']['diff'])
 
         if self.mat['u']['inflow']:
             # adding inflow lhs term if defined
-            A.axpy(1., self.mat['u']['inflow'], True)
+            A.axpy(1., self.mat['u']['inflow'])
 
         if 'fnv_type' in self.forms['u'].keys() and self.forms['u']['fnv_type'] == 'explicit':
             # adding one arbitrary LHS of the fnv matrices
-            A.axpy(1., self.mat['u']['fnv'][0], True)
+            A.axpy(1., self.mat['u']['fnv'][0])
 
         # assemble time/RHS SUPG matrices if present, add mass matrix
         # mat['u']['rhs'] was initialized to 'mass' and won't be changed
         # whenever ALE is not used
         if 'supg_time' in self.forms['u'] and self.forms['u']['supg_time']:
             assert True, 'supg_time should not be useable!!'
-            assemble(self.forms['u']['supg_time'],
-                     tensor=self.mat['u']['rhs'])
-            A.axpy(1., self.mat['u']['rhs'], True)
-            self.mat['u']['rhs'].axpy(1., self.mat['u']['mass'], True)
+            _assemble_mat(self.forms['u']['supg_time'],
+                          mat=self.mat['u']['rhs'])
+            A.axpy(1., self.mat['u']['rhs'])
+            self.mat['u']['rhs'].axpy(1., self.mat['u']['mass'])
 
         if self.bc_dict['u']['same_dbc_boundaries'] and not self._using_fnv_semi_implicit:
-            [bc.apply(A) for bc in self.bc_dict['u']['dirichlet'][0]]
-
-        # if ('supg_gradp' in self.forms['u'] and
-        #         self.forms['u']['supg_gradp']):
-        #     assemble(self.forms['u']['supg_gradp'][i],
-        #              tensor=self.mat['u']['supg_gp'])
-        #     self.mat['u']['rhs'].axpy(-1., self.mat['u']['supg_gp'], True)
+            _apply_dbc_to_mat(A, self.bc_dict['u']['dirichlet'][0])
 
         return A
 
@@ -1426,45 +1462,45 @@ class Solver(LoggerBase):
         component. '''
         if self.options['timemarching']['fractionalstep']['scheme'] == 'CTp':
             raise DeprecationWarning('CTp solver deprecated')
-            x_i = self.u0_lst[i].vector()
+            x_i = self.u0_lst[i].x.petsc_vec
         elif (self.options['timemarching']['fractionalstep']['scheme'] ==
               'IPCS'):
             # convection matrix was assembled already, so we can safely
             # overwrite u0 (time step k-1) for the RHS
-            # x_i = self.u0_lst[i].vector()
-            # x_i *= -0.5
-            # x_i.axpy(2., self.u_lst[i].vector())
-            x_i = 2*self.u_lst[i].vector() - 0.5*self.u0_lst[i].vector()
+            tmp = self.u_lst[i].x.petsc_vec.copy()
+            tmp.scale(2.0)
+            tmp.axpy(-0.5, self.u0_lst[i].x.petsc_vec)
+            x_i = tmp
         else:
             # CT
             if self._using_ale:
-                x_i = self.upd_lst[i].vector()
+                x_i = self.upd_lst[i].x.petsc_vec
             elif self._using_mapdd:
-                x_i = self.u0_lst[i].vector()
+                x_i = self.u0_lst[i].x.petsc_vec
             else:
-                x_i = self.u_lst[i].vector()
+                x_i = self.u_lst[i].x.petsc_vec
 
-        bu_i = self.mat['u']['rhs']*x_i
+        bu_i = _mat_vec(self.mat['u']['rhs'], x_i)
 
         if self.mat['u']['pdiv']:
             if self._using_ale:
-                [assemble(a, tensor=A) for a, A in 
+                [_assemble_mat(a, mat=A) for a, A in
                     zip(self.forms['u']['pres'], self.mat['u']['pdiv'])]
-            bu_i.axpy(-1.0, self.mat['u']['pdiv'][i]*self.p.vector())
+            bu_i.axpy(-1.0, _mat_vec(self.mat['u']['pdiv'][i], self.p.x.petsc_vec))
 
         if self.vec['u']['rhs_const'][i]:
             bu_i.axpy(1.0, self.vec['u']['rhs_const'][i])
 
         if self.vec['u']['rhs_inflow'][i]:
-            self.vec['u']['rhs_inflow'][i] = assemble(self.forms['u']['inflow'][i])
+            self.vec['u']['rhs_inflow'][i] = _assemble_vec(self.forms['u']['inflow'][i])
             bu_i.axpy(1.0, self.vec['u']['rhs_inflow'][i])
 
         if self.vec['u']['rhs_mapdd'][i]:
-            self.vec['u']['rhs_mapdd'][i] = assemble(self.forms['u']['mapdd'][i])
+            self.vec['u']['rhs_mapdd'][i] = _assemble_vec(self.forms['u']['mapdd'][i])
             bu_i.axpy(1.0, self.vec['u']['rhs_mapdd'][i])
 
         if self.vec['u']['fnv']:
-            self.vec['u']['fnv'][i] = assemble(self.forms['u']['fnv'][i][1])
+            self.vec['u']['fnv'][i] = _assemble_vec(self.forms['u']['fnv'][i][1])
             bu_i.axpy(1.0, self.vec['u']['fnv'][i])
 
 
@@ -1484,20 +1520,20 @@ class Solver(LoggerBase):
             implicit = False
 
         if i == 0:
-            self.x_i_presolve = [ui.vector().copy() for ui in self.u_lst]
+            self.x_i_presolve = [ui.x.petsc_vec.copy() for ui in self.u_lst]
 
         if not self._optimizing:
             if len(self.mat['u']['lhs_navslip'][i]):
-                A_robin.axpy(1., self.mat['u']['lhs_navslip'][i][0], True)
+                A_robin.axpy(1., self.mat['u']['lhs_navslip'][i][0])
             if len(self.mat['u']['lhs_trans'][i]):
-                A_robin.axpy(1., self.mat['u']['lhs_trans'][i][0], True)
+                A_robin.axpy(1., self.mat['u']['lhs_trans'][i][0])
 
             for rhs_ns in self.mat['u']['rhs_navslip'][i]:
                 for j, Nj in rhs_ns.items():
-                    bu_i.axpy(-1., Nj*self.x_i_presolve[j])
+                    bu_i.axpy(-1., _mat_vec(Nj, self.x_i_presolve[j]))
             for rhs_t in self.mat['u']['rhs_trans'][i]:
                 for j, Tj in rhs_t.items():
-                    bu_i.axpy(-1., Tj*self.x_i_presolve[j])
+                    bu_i.axpy(-1., _mat_vec(Tj, self.x_i_presolve[j]))
 
         else:
             for i_bnd in range(len(self.forms['u']['navierslip']['coef'])):
@@ -1508,10 +1544,10 @@ class Solver(LoggerBase):
 
                     if implicit:
                         lhs_ns = self.mat['u']['lhs_navslip'][i][i_bnd]
-                        A_robin.axpy(coef_ns, lhs_ns, True)
+                        A_robin.axpy(coef_ns, lhs_ns)
 
                     for j, Nj in rhs_ns.items():
-                        bu_i.axpy(-coef_ns, Nj*self.x_i_presolve[j])
+                        bu_i.axpy(-coef_ns, _mat_vec(Nj, self.x_i_presolve[j]))
 
                 if len(self.mat['u']['rhs_trans'][i]):
                     rhs_t = self.mat['u']['rhs_trans'][i][i_bnd]
@@ -1520,15 +1556,15 @@ class Solver(LoggerBase):
 
                     if implicit:
                         lhs_t = self.mat['u']['lhs_trans'][i][i_bnd]
-                        A_robin.axpy(coef_t, lhs_t, True)
+                        A_robin.axpy(coef_t, lhs_t)
 
                     for j, Tj in rhs_t.items():
-                        bu_i.axpy(-coef_t, Tj*self.x_i_presolve[j])
+                        bu_i.axpy(-coef_t, _mat_vec(Tj, self.x_i_presolve[j]))
 
         if self.mat['u']['p_trans'][i]:
             assert (self.options['timemarching']['fractionalstep']['scheme'] ==
                     'CT')
-            bu_i.axpy(-1., self.mat['u']['p_trans'][i]*self.p.vector())
+            bu_i.axpy(-1., _mat_vec(self.mat['u']['p_trans'][i], self.p.x.petsc_vec))
 
         # if A_robin:
         #     # just in case XXX check if necessary
@@ -1543,8 +1579,9 @@ class Solver(LoggerBase):
             return None
         else:
             A_fnv = A.copy()
-            assemble(self.forms['u']['fnv'][i][0], tensor=self.mat['u']['fnv'][i])
-            A_fnv.axpy(1., self.mat['u']['fnv'][i], True)
+            _assemble_mat(self.forms['u']['fnv'][i][0],
+                          mat=self.mat['u']['fnv'][i])
+            A_fnv.axpy(1., self.mat['u']['fnv'][i])
             return A_fnv
 
     def solve_tentative_velocity(self):
@@ -1570,37 +1607,36 @@ class Solver(LoggerBase):
                 # assembly of A, b done; u0_lst is "free"; assign
                 # u_i(corrected, u^k) for next iteration
                 # assign also when CT for FSI 
-                self.u0_lst[i].assign(u_i)
-
+                self.u0_lst[i].x.array[:] = u_i.x.array
 
             if self._using_mapdd:
                 # start with different previous velocity
-                #if self.t<=self.options['timemarching']['dt']*2:
-                #    self.u0_mapdd_lst[i].assign(u_i)
-                #else:
-                self.u0_mapdd_lst[i].assign(self.u0_lst[i])
+                self.u0_mapdd_lst[i].x.array[:] = self.u0_lst[i].x.array
 
 
             if A_robin:
-                [bc.apply(A_robin, bu_i) for bc in
-                 self.bc_dict['u']['dirichlet'][i]]
+                _apply_dbc_to_mat(A_robin, self.bc_dict['u']['dirichlet'][i])
+                apply_lifting(bu_i, [fem_form(self.forms['u']['mass'])],
+                              [self.bc_dict['u']['dirichlet'][i]])
+                set_bc(bu_i, self.bc_dict['u']['dirichlet'][i])
                 self.solver_u_ten.set_operator(A_robin)
             elif A_fnv:
-                [bc.apply(A_fnv) for bc in self.bc_dict['u']['dirichlet'][i]]
+                _apply_dbc_to_mat(A_fnv, self.bc_dict['u']['dirichlet'][i])
                 self.solver_u_ten.set_operator(A_fnv)
 
-
             if self.bc_dict['u']['same_dbc_boundaries']:
-                [bc.apply(bu_i) for bc in self.bc_dict['u']['dirichlet'][i]]
+                set_bc(bu_i, self.bc_dict['u']['dirichlet'][i])
             else:
                 A_cpy = A.copy()
-                [bc.apply(A_cpy, bu_i) for bc in
-                 self.bc_dict['u']['dirichlet'][i]]
+                _apply_dbc_to_mat(A_cpy, self.bc_dict['u']['dirichlet'][i])
+                apply_lifting(bu_i, [fem_form(self.forms['u']['mass'])],
+                              [self.bc_dict['u']['dirichlet'][i]])
+                set_bc(bu_i, self.bc_dict['u']['dirichlet'][i])
                 self.solver_u_ten.set_operator(A_cpy)
 
             self.logger.info('\t component {}'.format(i))
 
-            self.solver_u_ten.solve(u_i.vector(), bu_i)
+            self.solver_u_ten.solve(u_i.x.petsc_vec, bu_i)
 
             if self.solver_u_ten.conv_reason < 0:
                 self.logger.error('Solver u_ten {} DIVERGED ({})'.
@@ -1617,8 +1653,7 @@ class Solver(LoggerBase):
 
 
         with Timer('Z assign'):
-            # assign(self.u, self.u_lst)
-            self.vec_assigner.assign(self.u, self.u_lst)
+            self._merge_lst_to_vec(self.u_lst, self.u)
 
     # =========================================================================
     # Pressure projection step
@@ -1631,22 +1666,23 @@ class Solver(LoggerBase):
             cf = 1.5
         else:
             cf = 1.
-        bp = cf*self.mat['p']['rhs_u']*self.u.vector()
+        bp = _mat_vec(self.mat['p']['rhs_u'], self.u.x.petsc_vec)
+        bp.scale(cf)
 
         if self.vec['p']['rhs_const']:
-            bp += self.vec['p']['rhs_const']
+            bp.axpy(1.0, self.vec['p']['rhs_const'])
         # check neumann form again for compatibility with FSI
         elif self.forms['p']['neumann'] and self.ale['type'] == 'external':
-            bp += assemble(self.forms['p']['neumann'])
-         
-        if self._using_wk and self.wk['implicit']:
-            self.vec['p']['windkessel_rhs'] = assemble(self.forms['p']['windkessel_rhs'])
-            bp += self.vec['p']['windkessel_rhs']
+            bp.axpy(1.0, _assemble_vec(self.forms['p']['neumann']))
 
-        [bc.apply(bp) for bc in self.bc_dict['p']['dirichlet']]
+        if self._using_wk and self.wk['implicit']:
+            self.vec['p']['windkessel_rhs'] = _assemble_vec(self.forms['p']['windkessel_rhs'])
+            bp.axpy(1.0, self.vec['p']['windkessel_rhs'])
+
+        set_bc(bp, self.bc_dict['p']['dirichlet'])
 
         if self._using_wk and not self.wk['implicit']:
-            [bc.apply(bp) for bc in self.bc_dict['p']['windkessel']['dirichlet']]
+            set_bc(bp, self.bc_dict['p']['windkessel']['dirichlet'])
         
 
         # BCs are applied to Laplacian in init_assembly() !
@@ -1658,12 +1694,11 @@ class Solver(LoggerBase):
         
         if self._using_ale or self._using_mapdd:
             A = self.mat['p']['laplacian'].copy()
-            assemble(self.forms['p']['laplacian'], tensor=A)
-            [bc.apply(A) for bc in self.bc_dict['p']['dirichlet']]
+            _assemble_mat(self.forms['p']['laplacian'], mat=A)
+            _apply_dbc_to_mat(A, self.bc_dict['p']['dirichlet'])
             if self._using_wk:
                 if not self.wk['implicit']:
-                    [bc.apply(A) for bc in
-                            self.bc_dict['p']['windkessel']['dirichlet']]
+                    _apply_dbc_to_mat(A, self.bc_dict['p']['windkessel']['dirichlet'])
                     self.solver_p.set_operator(A)
                 else:
                     self.assembly_windkessel(A)
@@ -1686,7 +1721,7 @@ class Solver(LoggerBase):
         #     A = self.mat['p']['laplacian'].copy()
         #     for mat, coef in zip(self.mat['p']['mass_robin'],
         #                          self.bc_dict['p']['transpiration']['coef']):
-        #         A.axpy(1./float(coef), mat, True)
+        #         A.axpy(\1)
         #     self.solver_p.set_operator(A)
 
     def assemble_pressure_windkessel_impl(self):
@@ -1710,7 +1745,7 @@ class Solver(LoggerBase):
         A = self.mat['p']['laplacian'].copy()
         for mat, coef in zip(self.mat['p']['mass_robin'],
                              self.bc_dict['p']['transpiration']['coef']):
-            A.axpy(1./float(coef), mat, True)
+            A.axpy(1./float(coef), mat)
         self.solver_p.set_operator(A)
 
     def solve_pressure(self):
@@ -1724,8 +1759,8 @@ class Solver(LoggerBase):
         bp = self.build_rhs_pressure()
         # self.logger.info('|bp|2: {}'.format(np.linalg.norm(bp.get_local())))
 
-        self.solver_p.solve(self.phi.vector(), bp)
-        # self.logger.info('|p|2: {}'.format(np.linalg.norm(self.phi.vector().get_local())))
+        self.solver_p.solve(self.phi.x.petsc_vec, bp)
+        # self.logger.info('|p|2: {}'.format(np.linalg.norm(self.phi.x.array)))
         # self.logger.debug(f"|p| = {norm(self.phi)}")
 
         if self.solver_p.conv_reason < 0:
@@ -1745,7 +1780,7 @@ class Solver(LoggerBase):
         ''' Build RHS vector for tentative velocity solve, for the i'th
             component. '''
         if (self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS'
-                and self.t > self.options['timemarching']['dt'] + DOLFIN_EPS_LARGE):
+                and self.t > self.options['timemarching']['dt'] + 1e-14):
             # inverse of 1.5, as multiplied on RHS
             cf = 2./3.
         else:
@@ -1753,14 +1788,14 @@ class Solver(LoggerBase):
 
         A  = self.mat['u']['gradp'][i]
         if self._using_ale:
-            assemble(self.forms['u']['gradp'][i], tensor=A)
+            _assemble_mat(self.forms['u']['gradp'][i], mat=A)
 
-        # bu_i = cf*self.mat['u']['gradp'][i]*self.phi.vector()
-        bu_i = cf*A*self.phi.vector()
+        bu_i = _mat_vec(A, self.phi.x.petsc_vec)
+        bu_i.scale(cf)
 
         if self._applying_pen_on_update:
             if self.vec['u']['fnv']:
-                self.vec['u']['fnv'][i] = assemble(self.forms['u']['fnv'][i][1])
+                self.vec['u']['fnv'][i] = _assemble_vec(self.forms['u']['fnv'][i][1])
                 bu_i.axpy(1.0, self.vec['u']['fnv'][i])
 
         return bu_i
@@ -1777,7 +1812,7 @@ class Solver(LoggerBase):
             if (self.options['timemarching']['fractionalstep']['scheme']
                     == 'CTp') or self._using_mapdd:
                 # CTp: use old tentative velocity in time disc. term on RHS
-                self.u0_lst[i].assign(u_i)
+                self.u0_lst[i].x.array[:] = u_i.x.array
             #self.solver_u_upd.set_operator(self.mat['u']['mass'])
             bu_i = self.build_rhs_velocity_update(i)
 
@@ -1788,20 +1823,20 @@ class Solver(LoggerBase):
                     if self._applying_pen_on_update:
                         if 'fnv_type' in self.forms['u'].keys() and self.forms['u']['fnv_type'] == 'explicit':
                             # adding one arbitrary LHS of the fnv matrices
-                            Aupd.axpy(1., self.mat['u']['fnv'][0], True)
-                    
-                    [bc.apply(Aupd) for bc in self.bc_dict['u']['dirichlet'][i]]
+                            Aupd.axpy(1., self.mat['u']['fnv'][0])
+
+                    _apply_dbc_to_mat(Aupd, self.bc_dict['u']['dirichlet'][i])
                     self.solver_u_upd.set_operator(Aupd)
-                    
-                [bc.apply(bu_i) for bc in self.bc_dict['u']['dirichlet'][i]]
+
+                set_bc(bu_i, self.bc_dict['u']['dirichlet'][i])
             
-            self.solver_u_upd.solve(self.du[i].vector(), bu_i)
+            self.solver_u_upd.solve(self.du[i].x.petsc_vec, bu_i)
 
             if not self._using_ale:
-                u_i.vector().axpy(1.0, self.du[i].vector())
+                u_i.x.petsc_vec.axpy(1.0, self.du[i].x.petsc_vec)
             else:
-                self.upd_lst[i].vector()[:] = u_i.vector()
-                self.upd_lst[i].vector().axpy(1.0, self.du[i].vector())
+                self.upd_lst[i].x.array[:] = u_i.x.array
+                self.upd_lst[i].x.petsc_vec.axpy(1.0, self.du[i].x.petsc_vec)
 
             # [bc.apply(u_i.vector()) for bc in
             #  self.bc_dict['u']['dirichlet'][i]]
@@ -1816,20 +1851,19 @@ class Solver(LoggerBase):
             self.residuals_ksp['u_upd'][i].append(self.solver_u_ten.residuals)
         timer.stop()
         with Timer('Z assign'):
-            # assign(self.u, self.u_lst)
             if not self._using_ale:
-                self.vec_assigner.assign(self.u, self.u_lst)
+                self._merge_lst_to_vec(self.u_lst, self.u)
             else:
-                self.vec_assigner.assign(self.upd, self.upd_lst)
+                self._merge_lst_to_vec(self.upd_lst, self.upd)
 
     def pressure_increment(self):
         ''' IPCS: increment pressure. '''
         if self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS':
-            self.p.vector().axpy(1., self.phi.vector())
+            self.p.x.petsc_vec.axpy(1., self.phi.x.petsc_vec)
 
     def update_displacement(self):
         ''' Performs displacement update. '''
-        self.d0.vector()[:] = self.d.vector()
+        self.d0.x.array[:] = self.d.x.array
 
     def update_displacement_bcs(self):
         ''' Update time dependent boundary conditions. '''
@@ -1853,11 +1887,11 @@ class Solver(LoggerBase):
             if 'inflow_func' in dict_:
                 inflow_func = dict_['inflow_func']
                 inflow_upd = inflow_func(self.t)
-                expr.assign(Constant(inflow_upd))
+                expr.value = inflow_upd
             elif 'pinns_data' in dict_:
-                dict_['uprofile'][0].vector()[:] = dict_['pinns_data']['ux'].item()[self.it-1][:,0]
-                dict_['uprofile'][1].vector()[:] = dict_['pinns_data']['uy'].item()[self.it-1][:,0]
-                dict_['uprofile'][2].vector()[:] = dict_['pinns_data']['uz'].item()[self.it-1][:,0]
+                dict_['uprofile'][0].x.array[:] = dict_['pinns_data']['ux'].item()[self.it-1][:,0]
+                dict_['uprofile'][1].x.array[:] = dict_['pinns_data']['uy'].item()[self.it-1][:,0]
+                dict_['uprofile'][2].x.array[:] = dict_['pinns_data']['uz'].item()[self.it-1][:,0]
             else:
                 if 't' in expr.user_parameters:
                     expr.t = float(self.t)
@@ -1869,10 +1903,10 @@ class Solver(LoggerBase):
             # XXX DBF1 ? 
             with Timer('Z assign'):
                 self.transfer_velocity(self.v_s, self.v_bc) # in -> out
-                self.comp_assigner.assign(self.v_lst_bc, self.v_bc)
+                self._split_vec_to_lst(self.v_bc, self.v_lst_bc)
                 for bc, dict_ in self.bc_dict['u']['dbc_functions'].items():
                     func, i = dict_['function'], dict_['i']
-                    func.assign(self.v_lst_bc[i])
+                    func.x.array[:] = self.v_lst_bc[i].x.array
 
     # =========================================================================
     # Windkessel
@@ -1883,9 +1917,9 @@ class Solver(LoggerBase):
         '''
 
         F, J = self.F, self.J
-        ds = Measure('ds', domain=self.p.function_space().mesh(),
+        ds = Measure('ds', domain=self.p.function_space.mesh,
                         subdomain_data=self.bnds)
-        n = FacetNormal(self.p.function_space().mesh())
+        n = FacetNormal(self.p.function_space.mesh)
 
         for bid, prm in self.bc_dict['p']['windkessel']['params'].items():
             dt = float(self.options['timemarching']['dt'])
@@ -1898,42 +1932,46 @@ class Solver(LoggerBase):
             gamma = R_p + beta
 
             if flow:
-                Q = assemble(dot(self.u, J*inv(F).T*n)*ds(bid))
-                prm['Q'].assign(Constant(Q))
+                Q = self.p.function_space.mesh.comm.allreduce(
+                    assemble_scalar(fem_form(dot(self.u, J*ufl.inv(F).T*n)*ds(bid))),
+                    op=MPI.SUM)
+                prm['Q'].value = Q
 
             pi = float(prm['pi'])
             pi_upd = pi
 
-
             if self.wk['explicit']:
                 if not restart:
-                    pi_upd = Constant(alpha*pi + beta*Q)
-                
-                Pl_upd = Constant(R_p*Q + pi_upd)
-                
-                prm['pi'].assign(pi_upd)
-                prm['pi0'].assign(pi)
-                prm['Pl'].assign(Pl_upd)
+                    pi_upd = alpha*pi + beta*Q
+
+                Pl_upd = R_p*Q + float(pi_upd)
+
+                prm['pi'].value = float(pi_upd)
+                prm['pi0'].value = pi
+                prm['Pl'].value = Pl_upd
                 # updating the Dirichlet boundary condition
                 prms = self.bc_dict['p']['windkessel']['params']
 
                 for _, opts in self.bc_dict['p']['windkessel']['dbc_params'].items():
                     expr, bid2 = opts['expr'], opts['bid']
                     if bid2 == bid:
-                        expr.Pl = prms[bid]['Pl']
+                        expr.value = prms[bid]['Pl'].value
                         break
-            
+
             elif self.wk['implicit']:
                 if not flow and not restart:
-                    elem = J*sqrt(inner(inv(F).T*n, inv(F).T*n))
-                    area_new = assemble(elem*ds(bid))
-                    Pl = assemble(self.p*ds(bid))/area_new
+                    elem = J*ufl.sqrt(inner(ufl.inv(F).T*n, ufl.inv(F).T*n))
+                    comm = self.p.function_space.mesh.comm
+                    area_new = comm.allreduce(
+                        assemble_scalar(fem_form(elem*ds(bid))), op=MPI.SUM)
+                    Pl = comm.allreduce(
+                        assemble_scalar(fem_form(self.p*ds(bid))), op=MPI.SUM) / area_new
                     pi_upd = float((1 - beta/gamma)*alpha*pi + beta/gamma*Pl)
-                    
+
                     self.pi_functions[bid].append(pi)
-                    prm['area'].assign(Constant(area_new))
-                    prm['Pl'].assign(Constant(Pl))
-                    prm['pi'].assign(Constant(pi_upd))
+                    prm['area'].value = area_new
+                    prm['Pl'].value = Pl
+                    prm['pi'].value = pi_upd
         
 
         if self.wk['implicit']:
@@ -1974,8 +2012,8 @@ class Solver(LoggerBase):
             # info(f'R_d: {R_d}, at id {bid}')
             # info(f'alpha: {alpha}')
 
-            prm['delta_l'].assign(Constant(delta_l))
-            prm['delta_r'].assign(Constant(delta_r))
+            prm['delta_l'].value = delta_l
+            prm['delta_r'].value = delta_r
 
             fac_l.append(delta_l)
 
@@ -1989,15 +2027,16 @@ class Solver(LoggerBase):
             self.mat['p']['laplacian'])
 
     def project_enriched_dbc(self, bc, expr):
-        if utils.is_enriched(bc.function_space()):
-            V = bc.function_space()
-            bc.set_value(project(expr, V))
+        if utils.is_enriched(bc.function_space):
+            V = bc.function_space
+            projected = _project(expr, V)
+            bc.value.x.array[:] = projected.x.array
 
         # for bc in self.bc_dict['u']['time_bcs']:
         #     bc['expression'].t = float(self.t)
 
-        #     if utils.is_enriched(self.u_lst[0].function_space()):
-        #         Vi = self.u_lst[0].function_space()
+        #     if utils.is_enriched(self.u_lst[0].function_space):
+        #         Vi = self.u_lst[0].function_space
         #         bcs = self.bc_dict['u']['dirichlet'][bc['i']]
         #         bcs[bcs.index(bc['id'])] = DirichletBC(
         #             Vi, project(bc['expression'], Vi), self.bnds,
@@ -2015,11 +2054,10 @@ class Solver(LoggerBase):
                 bc_trans['dirichlet_functions'], bc_trans['coef'],
                 self.solver_p_mass, self.mat['p']['u_norm_bound']):
             # FIXME need to solve here
-            #  p_fun.vector().zero()
-            #  p_fun.vector().axpy(beta.values()[0], mat*self.u.vector())
             timer = Timer('Z pressure BC proj')
-            solver_p_mass.solve(p_fun.vector(),
-                                float(beta)*mat_u*self.u.vector())
+            rhs = _mat_vec(mat_u, self.u.x.petsc_vec)
+            rhs.scale(float(beta))
+            solver_p_mass.solve(p_fun.x.petsc_vec, rhs)
             timer.stop()
         # change Robin coefficient?
 
@@ -2048,22 +2086,29 @@ class Solver(LoggerBase):
             wstr += ' CP*'
         # TODO: extend flux_normalize to ALE
         if self.options['timemarching']['report'] == 2:
-            n = FacetNormal(self.u.function_space().mesh())
-            ds = Measure('ds', domain=self.p.function_space().mesh(),
+            n = FacetNormal(self.u.function_space.mesh)
+            ds = Measure('ds', domain=self.p.function_space.mesh,
                     subdomain_data=self.bnds)
-            flux = assemble(dot(self.u, n)*ds)
+            comm = self.u.function_space.mesh.comm
+            flux = comm.allreduce(
+                assemble_scalar(fem_form(dot(self.u, n)*ds)), op=MPI.SUM)
             fs_opt = self.options['timemarching']['fractionalstep']
             if fs_opt.get('flux_report_normalize_boundary', False):
-                flux /= assemble(dot(self, u, n)*ds(
-                    fs_opt['flux_report_normalize_boundary']))
+                denom = comm.allreduce(
+                    assemble_scalar(fem_form(dot(self.u, n)*ds(
+                        fs_opt['flux_report_normalize_boundary']))),
+                    op=MPI.SUM)
+                flux /= denom
 
             flux_str = 'sum of fluxes: {}'.format(flux)
         else:
             flux_str = ''
 
-        if (self.options['timemarching']['report'] == 3 
+        if (self.options['timemarching']['report'] == 3
             and self._using_ale):
-            new, old = assemble(self.J*dx), assemble(self.J0*dx)
+            comm = self.u.function_space.mesh.comm
+            new = comm.allreduce(assemble_scalar(fem_form(self.J*dx)), op=MPI.SUM)
+            old = comm.allreduce(assemble_scalar(fem_form(self.J0*dx)), op=MPI.SUM)
             self.logger.info('Volume change: {rate:.{width}f}'
                             .format(rate=new/old, width=6))
 
@@ -2107,31 +2152,30 @@ class Solver(LoggerBase):
         path = (self.ale['io']['read_path']
                 + '/checkpoint/{i}/'.format(i=i))
 
-        comm = self.u.function_space().mesh().mpi_comm()
+        comm = self.u.function_space.mesh.comm
         self.logger.info('Reading HDF5 data at iteration {}'.format(i))
         inout.read_HDF5_data(comm, path + '/u.h5', self.d_s, '/u')
         inout.read_HDF5_data(comm, path + '/v.h5', self.v_s, '/u')
 
     def transfer_displacement(self, d_in, d_out):
-        ''' Transfer displacement between FE spaces. '''
+        ''' Transfer displacement between FE spaces via DOLFINx interpolation. '''
         self.logger.debug('Transfer d between FE spaces.')
-        # ufl_function_space vs. function_space ?
-        if not hasattr(self, 'T_d'):
-            self.T_d = PETScDMCollection.create_transfer_matrix(
-                d_in.ufl_function_space(), d_out.ufl_function_space())
-
-        d_in.set_allow_extrapolation(True)
-        d_out.vector()[:] = self.T_d * d_in.vector()
+        if not hasattr(self, '_interp_data_d'):
+            from dolfinx.fem import create_nonmatching_meshes_interpolation_data
+            self._interp_data_d = create_nonmatching_meshes_interpolation_data(
+                d_out.function_space, d_in.function_space)
+        d_out.interpolate(d_in, nmm_interpolation_data=self._interp_data_d)
+        d_out.x.scatter_forward()
 
     def transfer_velocity(self, u_in, u_out):
-        ''' Transfer velocity between FE spaces. '''
+        ''' Transfer velocity between FE spaces via DOLFINx interpolation. '''
         self.logger.debug('Transfer u between FE spaces.')
-        if not hasattr(self, 'T_u'):
-            self.T_u = PETScDMCollection.create_transfer_matrix(
-                u_in.ufl_function_space(), u_out.ufl_function_space())
-
-        u_in.set_allow_extrapolation(True)
-        u_out.vector()[:] = self.T_u * u_in.vector()
+        if not hasattr(self, '_interp_data_u'):
+            from dolfinx.fem import create_nonmatching_meshes_interpolation_data
+            self._interp_data_u = create_nonmatching_meshes_interpolation_data(
+                u_out.function_space, u_in.function_space)
+        u_out.interpolate(u_in, nmm_interpolation_data=self._interp_data_u)
+        u_out.x.scatter_forward()
 
     @property
     def write_velocity(self):
@@ -2194,23 +2238,23 @@ class Solver(LoggerBase):
         if not t:
             t = self.t
 
-        if (not (hasattr(self, '_xdmf_u') or hasattr(self, '_xdmf_p'))
-                or not (self._xdmf_u or self._xdmf_p)):
-            self._xdmf_u = XDMFFile(self.options['io']['write_path']
-                                    + '/u.xdmf')
-            self._xdmf_p = XDMFFile(self.options['io']['write_path']
-                                    + '/p.xdmf')
-            self._xdmf_u.parameters['rewrite_function_mesh'] = False
-            self._xdmf_u.parameters['functions_share_mesh'] = True
-            self._xdmf_p.parameters['rewrite_function_mesh'] = False
+        comm = self.u.function_space.mesh.comm
+        write_path = self.options['io']['write_path']
+        if (not hasattr(self, '_xdmf_u') or self._xdmf_u is None):
+            import os
+            os.makedirs(write_path, exist_ok=True)
+            self._xdmf_u = XDMFFile(comm, write_path + '/u.xdmf', 'w')
+            self._xdmf_u.write_mesh(self.u.function_space.mesh)
+            self._xdmf_p = XDMFFile(comm, write_path + '/p.xdmf', 'w')
+            self._xdmf_p.write_mesh(self.p.function_space.mesh)
 
         if self._using_ale:
-            self._xdmf_u.write(self.d, float(t))
-            self._xdmf_u.write(self.upd, float(t))
+            self._xdmf_u.write_function(self.d, float(t))
+            self._xdmf_u.write_function(self.upd, float(t))
         else:
-            self._xdmf_u.write(self.u, float(t))
+            self._xdmf_u.write_function(self.u, float(t))
 
-        self._xdmf_p.write(self.p, float(t))
+        self._xdmf_p.write_function(self.p, float(t))
 
     def write_timeseries(self):
         ''' Write solution to HDF5 TimeSeries, initialize on first call.  '''
@@ -2233,8 +2277,8 @@ class Solver(LoggerBase):
 
         self.logger.debug('Writing solution at time t = {t} to TimeSeries'
                           .format(t=self.t))
-        self._hdf5_ts_u.store(self.u.vector(), float(self.t))
-        self._hdf5_ts_p.store(self.p.vector(), float(self.t))
+        self._hdf5_ts_u.store(self.u.x.petsc_vec, float(self.t))
+        self._hdf5_ts_p.store(self.p.x.petsc_vec, float(self.t))
 
     def write_checkpoint(self, i, update=False):
         ''' Write HDF5 checkpoint of u, p to <write_path>/checkpoints folder.
@@ -2251,14 +2295,14 @@ class Solver(LoggerBase):
 
         if self._using_ale:
             u = self.upd if update else self.u
-            comm = u.function_space().mesh().mpi_comm()
+            comm = u.function_space.mesh.comm
 
             inout.write_HDF5_data(comm, path + '/d.h5', self.d, '/d',
                                     t=self.t)
             inout.write_HDF5_data(comm, path + '/u.h5', u, '/u',
                                     t=self.t)
         else:
-            comm = self.u.function_space().mesh().mpi_comm()
+            comm = self.u.function_space.mesh.comm
 
             inout.write_HDF5_data(comm, path + '/u.h5', self.u, '/u',
                                     t=self.t)
@@ -2272,7 +2316,7 @@ class Solver(LoggerBase):
 
     def write_statistics(self):
         ''' Write number of linear iterations (KSP) and timings to files '''
-        #rank = MPI.rank(MPI.comm_world)
+        #rank = MPI.COMM_WORLD.rank
         #fname = self.options['io']['write_path'] + '/stats.{}.dat'.format(rank)
         
         #with open(fname, 'wb') as fout:
@@ -2321,14 +2365,10 @@ class Solver(LoggerBase):
             for Xobs_lst in Xobs_i:
                 # iterate through measurements
                 for Z, X_i in zip(Z_lst, Xobs_lst):
-                    if isinstance(X_i, dolfin.Function):
-                        # self.logger.warning('norm(Xobs_i): {}'.format(norm(X_i)))
-                        X_i.vector().axpy(-1., Z.vector())
-                        as_backend_type(X_i.vector()).update_ghost_values()
-                        X_i.vector()[:] *= -1
-                        # self.logger.warning('norm(Inno): {}'.format(norm(X_i)))
-                        as_backend_type(X_i.vector()).update_ghost_values()
-                        # probably not necessary
+                    if isinstance(X_i, fem.Function):
+                        X_i.x.petsc_vec.axpy(-1., Z.x.petsc_vec)
+                        X_i.x.array[:] *= -1
+                        X_i.x.scatter_forward()
                     else:
                         # assumed to be numpy array
                         X_i -= Z
@@ -2348,12 +2388,12 @@ class Solver(LoggerBase):
                 # iterate through measurements
                 for Z, Zm, X_i, venc in zip(
                         Z_lst, Zmod_lst, Xobs_lst , VENC_lst):
-                    if isinstance(Z, dolfin.Function):
-                        xi_vector = X_i.vector().get_local()
-                        zi_vector = Z.vector().get_local()
-                        mod_vector = Zm.vector().get_local()
-                        X_i.vector()[:] = (mod_vector/np.sqrt(2))*np.sin(np.pi/venc*(xi_vector - zi_vector))
-                        as_backend_type(X_i.vector()).update_ghost_values()
+                    if isinstance(Z, fem.Function):
+                        xi_vector = X_i.x.array
+                        zi_vector = Z.x.array
+                        mod_vector = Zm.x.array
+                        X_i.x.array[:] = (mod_vector/np.sqrt(2))*np.sin(np.pi/venc*(xi_vector - zi_vector))
+                        X_i.x.scatter_forward()
                     else:
                         X_i = Zm/np.sqrt(2)*np.sin(np.pi/venc*(X_i - Z))
 
@@ -2376,10 +2416,10 @@ class Solver(LoggerBase):
         # Xobs_i is replaced by innovation
         # for explicitness:i
         # Innov_particles = Xobs_i
-        if isinstance(Xobs_i[0][0], dolfin.Function):
+        if isinstance(Xobs_i[0][0], fem.Function):
             innov_numpy = np.array(
                 [np.concatenate(
-                    [1./sigma * iv.vector().get_local() for sigma, iv in
+                    [1./sigma * iv.x.array for sigma, iv in
                     zip(sigma_Z, iv_lst)])
                 for iv_lst in Xobs_i]
             ).T
@@ -2494,13 +2534,13 @@ class Solver(LoggerBase):
         hdf5_root_lst = [meas['file_root'] for meas in measurement_lst]
 
         for hdf5_root, Xobs in zip(hdf5_root_lst, Xobs_lst):
-            if isinstance(Xobs, dolfin.Function):
-                V = Xobs.function_space()
+            if isinstance(Xobs, fem.Function):
+                V = Xobs.function_space
                 u_next_lst.append(Function(V, name='u_next'))
                 u_prev_lst.append(Function(V, name='u_prev'))
                 Z_lst.append(Function(V, name='innovation'))
 
-                comm = V.mesh().mpi_comm()
+                comm = V.mesh.comm
                 t_prev = inout.read_HDF5_data(comm, hdf5_root.format(i=indices[0]),
                                               u_prev_lst[-1], '/u')
                 # self.logger.debug('t_prev: ' + str(t_prev))
@@ -2568,11 +2608,11 @@ class Solver(LoggerBase):
 
         # initializing moduli measurements
         for hdf5_root, Xobs in zip(hdf5_root_lst_mod, Xobs_lst):
-            V = Xobs.function_space()
+            V = Xobs.function_space
             mod_next_lst.append(Function(V, name='mod_next'))
             mod_prev_lst.append(Function(V, name='mod_prev'))
             Zmod_lst.append(Function(V, name='module'))
-            comm = V.mesh().mpi_comm()
+            comm = V.mesh.comm
             #reading the data but dropping the time 
             _ = inout.read_HDF5_data(comm, hdf5_root.format(i=indices[0]),
                                       mod_prev_lst[-1], '/M')
@@ -2623,8 +2663,8 @@ class Solver(LoggerBase):
             if sigma_Z[k] == 'initial':
                 # Computing sigma from initial measurements
                 u_prev_lst = self.cache['measurements']['u_prev_lst']
-                if isinstance(u_prev_lst[k], dolfin.Function):
-                    uvec = u_prev_lst[k].vector().get_local()
+                if isinstance(u_prev_lst[k], fem.Function):
+                    uvec = u_prev_lst[k].x.array
                 else:
                     uvec = u_prev_lst[k]
 
@@ -2636,8 +2676,8 @@ class Solver(LoggerBase):
                     # Magnetization functional
                     VENC = meas['VENC']
                     mod_prev_lst = self.cache['measurements']['mod_prev_lst']
-                    if isinstance(mod_prev_lst[k], dolfin.Function):
-                        Mvec = mod_prev_lst[k].vector().get_local()
+                    if isinstance(mod_prev_lst[k], fem.Function):
+                        Mvec = mod_prev_lst[k].x.array
                     else:
                         Mvec = mod_prev_lst[k]
                     ss = Mvec**2*(1-np.cos(np.pi/VENC*uvec))
@@ -2693,10 +2733,10 @@ class Solver(LoggerBase):
 
                 for i, (u_prev, u_next, froot) in enumerate(zip(u_prev_lst, u_next_lst,
                                                  hdf5_root_lst)):
-                    if isinstance(u_prev, dolfin.Function):
-                        u_prev.assign(u_next)
+                    if isinstance(u_prev, fem.Function):
+                        u_prev.x.array[:] = u_next.x.array
 
-                        mpi_comm = u_next.function_space().mesh().mpi_comm()
+                        mpi_comm = u_next.function_space.mesh.comm
                         t_next = inout.read_HDF5_data(
                             mpi_comm, froot.format(i=file_indices[idx + 1]),
                             u_next, '/u')
@@ -2714,9 +2754,9 @@ class Solver(LoggerBase):
 
                 if self._using_magnetization:
                     for i, (mod_prev, mod_next, froot) in enumerate(zip(mod_prev_lst, mod_next_lst, hdf5_mod_root_lst)):
-                        if isinstance(mod_prev, dolfin.Function):
-                            mod_prev.assign(mod_next)
-                            mpi_comm = mod_next.function_space().mesh().mpi_comm()
+                        if isinstance(mod_prev, fem.Function):
+                            mod_prev.x.array[:] = mod_next.x.array
+                            mpi_comm = mod_next.function_space.mesh.comm
                             _ = inout.read_HDF5_data(mpi_comm, froot.format(i=file_indices[idx + 1]),mod_next, '/M')
                         else:
                             mod_prev *= 0
@@ -2730,16 +2770,16 @@ class Solver(LoggerBase):
 
             else:
                 # reached last measurement, continue using last measurement!
-                if isinstance(u_next_lst[0], dolfin.Function):
-                    [Z.assign(u_next) for Z, u_next in zip(Z_lst, u_next_lst)]
+                if isinstance(u_next_lst[0], fem.Function):
+                    [Z.x.array.__setitem__(slice(None), u_next.x.array) for Z, u_next in zip(Z_lst, u_next_lst)]
                 else:
                     Z_lst = u_next_lst
                 self.logger.debug('read_measurement: last file, i={}, t={}'.
                                   format(idx, t_next))
 
                 if Zmod_lst:
-                    if isinstance(mod_next_lst[0], dolfin.Function):
-                        [Zm.assign(mod_next) for Zm, mod_next in zip(Zmod_lst, mod_next_lst)]
+                    if isinstance(mod_next_lst[0], fem.Function):
+                        [Zm.x.array.__setitem__(slice(None), mod_next.x.array) for Zm, mod_next in zip(Zmod_lst, mod_next_lst)]
                     else:
                         Zmod_lst = mod_next_lst
 
@@ -2762,41 +2802,35 @@ class Solver(LoggerBase):
                 self.logger.debug('read_measurement: Interpolating! '
                                   'weights = ({}, {})'.format(c0, c1))
                 for Z, u_prev, u_next in zip(Z_lst, u_prev_lst, u_next_lst):
-                    if isinstance(Z, dolfin.Function):
-                        Z.assign(u_prev)
-                        Z.vector()[:] *= c0
-                        as_backend_type(Z.vector()).update_ghost_values()
-                        Z.vector().axpy(c1, u_next.vector())
-                        as_backend_type(Z.vector()).update_ghost_values()
+                    if isinstance(Z, fem.Function):
+                        Z.x.array[:] = c0*u_prev.x.array + c1*u_next.x.array
+                        Z.x.scatter_forward()
                     else:
                         Z *= 0
                         Z += c0*u_prev + c1*u_next
                 if Zmod_lst:
                     for Zm, mod_prev, mod_next in zip(Zmod_lst, mod_prev_lst, mod_next_lst):
-                        if isinstance(Zm, dolfin.Function):
-                            Zm.assign(mod_prev)
-                            Zm.vector()[:] *= c0
-                            as_backend_type(Zm.vector()).update_ghost_values()
-                            Zm.vector().axpy(c1, mod_next.vector())
-                            as_backend_type(Zm.vector()).update_ghost_values()
+                        if isinstance(Zm, fem.Function):
+                            Zm.x.array[:] = c0*mod_prev.x.array + c1*mod_next.x.array
+                            Zm.x.scatter_forward()
                         else:
-                            Zm *= 0 
+                            Zm *= 0
                             Zm += c0*Z + c1*mod_next
 
             else:
                 self.logger.debug('read_measurement: NO interpolation! '
                                   't = t_p')
                 for Z, u_prev in zip(Z_lst, u_prev_lst):
-                    if isinstance(Z, dolfin.Function):
-                        Z.assign(u_prev)
+                    if isinstance(Z, fem.Function):
+                        Z.x.array[:] = u_prev.x.array
                     else:
                         Z *= 0
                         Z += u_prev
 
                 if Zmod_lst:
                     for Zm, mod_prev in zip(Zmod_lst, mod_prev_lst):
-                        if isinstance(Zm, dolfin.Function):
-                            Zm.assign(mod_prev)
+                        if isinstance(Zm, fem.Function):
+                            Zm.x.array[:] = mod_prev.x.array
                         else:
                             Zm *= 0
                             Zm += mod_prev
@@ -2811,20 +2845,18 @@ class Solver(LoggerBase):
             self.logger.debug('read_measurement: Interpolating t < t_prev: '
                               'weight = {}'.format(c0))
             for Z, u_prev in zip(Z_lst, u_prev_lst):
-                if isinstance(Z, dolfin.Function):
-                    Z.assign(u_prev)
-                    Z.vector()[:] *= c0
-                    as_backend_type(Z.vector()).update_ghost_values()
+                if isinstance(Z, fem.Function):
+                    Z.x.array[:] = c0*u_prev.x.array
+                    Z.x.scatter_forward()
                 else:
                     Z *= 0
                     Z += c0*u_prev
 
             if Zmod_lst:
                 for Zm, mod_prev in zip(Zmod_lst, mod_prev_lst):
-                    if isinstance(Zm, dolfin.Function):
-                        Zm.assign(mod_prev)
-                        Zm.vector()[:] *= c0
-                        as_backend_type(Zm.vector()).update_ghost_values()
+                    if isinstance(Zm, fem.Function):
+                        Zm.x.array[:] = c0*mod_prev.x.array
+                        Zm.x.scatter_forward()
                     else:
                         Zm *= 0
                         Zm += c0*mod_prev
@@ -2852,14 +2884,16 @@ class Solver(LoggerBase):
                 'get_state_functionspaces() not supported for {}'.format(
                     self.options['timemarching']['fractionalstep']['scheme']))
 
-        W_lst = [self.u.function_space()]
+        W_lst = [self.u.function_space]
 
         for bc in self.options['boundary_conditions']:
             type_ = bc.get('type', None)
             prms = bc.get('parameters', dict())
             C_ = prms['C'] if 'C' in prms else None
             if type_ == 'windkessel' and C_:
-                R = FunctionSpace(self.u.function_space().mesh(), 'R', 0)
+                # DOLFINx: use DG0 as a surrogate for the legacy 'R' (real) space
+                # for the single-DOF windkessel state variable
+                R = functionspace(self.u.function_space.mesh, ("DG", 0))
                 W_lst.append(R)
 
         self.logger.warning(
@@ -3009,16 +3043,16 @@ class SolverCoupled(Solver):
         timer = Timer('Z init assembly')
         
         if self._using_ale:
-            self.mat['d']['diff'] = assemble(self.forms['d']['diff'])
-            self.mat['d']['div'] = assemble(self.forms['d']['div'])
-            self.vec['d']['rhs_const'] = assemble(self.forms['d']['rhs_const'])
+            self.mat['d']['diff'] = _assemble_mat(self.forms['d']['diff'])
+            self.mat['d']['div'] = _assemble_mat(self.forms['d']['div'])
+            self.vec['d']['rhs_const'] = _assemble_vec(self.forms['d']['rhs_const'])
 
             for label in ['diff', 'div']:
-                [bc.apply(self.mat['d'][label] for bc in 
-                    self.bc_dict['d']['dirichlet'])]
+                _apply_dbc_to_mat(self.mat['d'][label],
+                                  self.bc_dict['d']['dirichlet'])
 
-        self.mat['u']['mass'] = assemble(self.forms['u']['mass'])
-        self.mat['u']['diff'] = assemble(self.forms['u']['diff'])
+        self.mat['u']['mass'] = _assemble_mat(self.forms['u']['mass'])
+        self.mat['u']['diff'] = _assemble_mat(self.forms['u']['diff'])
         # self.mat['u']['mass_diff'] = assemble(self.forms['u']['mass'] +
         #                                    self.forms['u']['diff'])
         self.mat['u']['rhs'] = self.mat['u']['mass'].copy()
@@ -3027,45 +3061,45 @@ class SolverCoupled(Solver):
         #     self.mat['u']['supg_gp'] = self.mat['u']['mass'].copy()
 
         if self.forms['u']['pres']:
-            self.mat['u']['pdiv'] = assemble(self.forms['u']['pres'])
+            self.mat['u']['pdiv'] = _assemble_mat(self.forms['u']['pres'])
         if self.forms['u']['gradp']:
-            self.mat['u']['gradp'] = assemble(self.forms['u']['gradp'])
+            self.mat['u']['gradp'] = _assemble_mat(self.forms['u']['gradp'])
 
         # init convection matrix (sparsity pattern)
-        # self.mat['u']['conv'] = assemble(self.forms['u']['conv'])
         self.mat['u']['conv'] = self.mat['u']['mass'].copy()
 
         # assembling inflow matrices
         if self.forms['u']['inflow_lhs']:
             self.mat['u']['inflow_lhs'] = self.mat['u']['mass'].copy()
-            assemble(self.forms['u']['inflow_lhs'], tensor=self.mat['u']['inflow_lhs'])
+            _assemble_mat(self.forms['u']['inflow_lhs'],
+                          mat=self.mat['u']['inflow_lhs'])
 
         if self.forms['u']['neumann']:
-            self.vec['u']['rhs_const'] = assemble(self.forms['u']['neumann'])
+            self.vec['u']['rhs_const'] = _assemble_vec(self.forms['u']['neumann'])
         else:
             self.vec['u']['rhs_const'] = None
 
         # inflow RHS
         if self.forms['u']['inflow_rhs']:
-            self.vec['u']['inflow_rhs'] = assemble(self.forms['u']['inflow_rhs'])
+            self.vec['u']['inflow_rhs'] = _assemble_vec(self.forms['u']['inflow_rhs'])
         # mapdd RHS
         if self.forms['u']['mapdd_rhs']:
-            self.vec['u']['mapdd_rhs'] = assemble(self.forms['u']['mapdd_rhs'])
+            self.vec['u']['mapdd_rhs'] = _assemble_vec(self.forms['u']['mapdd_rhs'])
 
         # matrices of pressure space Q
         # right hand side matrix to be multiplied by u.vector()
         # div(u) and in case of transpiration BCs: dot(u, n) term
-        self.mat['p']['rhs_u'] = assemble(self.forms['p']['rhs_u'])
-        self.mat['p']['laplacian'] = assemble(self.forms['p']['laplacian'])
+        self.mat['p']['rhs_u'] = _assemble_mat(self.forms['p']['rhs_u'])
+        self.mat['p']['laplacian'] = _assemble_mat(self.forms['p']['laplacian'])
 
         # apply boundary conditions to pressure Laplacian
-        [bc.apply(self.mat['p']['laplacian']) for bc in
-         self.bc_dict['p']['dirichlet']]
+        _apply_dbc_to_mat(self.mat['p']['laplacian'],
+                          self.bc_dict['p']['dirichlet'])
 
         if self.forms['p']['neumann']:
-            self.vec['p']['rhs_const'] = assemble(self.forms['p']['neumann'])
+            self.vec['p']['rhs_const'] = _assemble_vec(self.forms['p']['neumann'])
         else:
-            self.vec['p']['rhs_const'] = 0
+            self.vec['p']['rhs_const'] = None
 
         # Transpiration and Navier-Slip matrices
         self.init_assembly_robin()
@@ -3087,13 +3121,13 @@ class SolverCoupled(Solver):
                              navslip_forms['forms'][i_bnd]['implicit'])
             else:
                 self.mat['u']['lhs_navslip'].append(
-                    assemble(navslip_forms['forms'][i_bnd]['implicit'],
-                             tensor=sparse_pat.copy()))
+                    _assemble_mat(navslip_forms['forms'][i_bnd]['implicit'],
+                                  mat=sparse_pat.copy()))
 
         # this is bit cumbersome, but close the the uncoupled version
         if not self._optimizing and tmp_form:
             self.mat['u']['lhs_navslip'].append(
-                assemble(tmp_form, tensor=sparse_pat.copy()))
+                _assemble_mat(tmp_form, mat=sparse_pat.copy()))
 
         tmp_form_u = 0
         tmp_form_p = 0
@@ -3105,8 +3139,8 @@ class SolverCoupled(Solver):
                                    trans_forms['forms'][i_bnd]['implicit'])
             else:
                 self.mat['u']['lhs_trans'].append(
-                    assemble(trans_forms['forms'][i_bnd]['implicit'],
-                             tensor=sparse_pat.copy()))
+                    _assemble_mat(trans_forms['forms'][i_bnd]['implicit'],
+                                  mat=sparse_pat.copy()))
 
             # in the case of CT, add (pn, vn)*ds(i) to boundary form
             if (self.options['timemarching']['fractionalstep']['scheme'] ==
@@ -3114,33 +3148,37 @@ class SolverCoupled(Solver):
                 tmp_form_p += trans_forms['forms'][i_bnd]['pressure']
 
         if not self._optimizing and tmp_form_u:
-                    self.mat['u']['lhs_trans'].append(
-                        assemble(tmp_form_u, tensor=sparse_pat.copy()))
+            self.mat['u']['lhs_trans'].append(
+                _assemble_mat(tmp_form_u, mat=sparse_pat.copy()))
         if tmp_form_p:
-                self.mat['u']['p_trans'] = assemble(tmp_form_p)
-        #                tmp_form_p, tensor=sparse_pat.copy())
+            self.mat['u']['p_trans'] = _assemble_mat(tmp_form_p)
 
         # PRESSURE BC
         self.mat['p']['mass_robin'] = [
-            assemble(a, tensor=self.mat['p']['laplacian'].copy()) for a in
+            _assemble_mat(a, mat=self.mat['p']['laplacian'].copy()) for a in
             self.forms['p']['robin']]
 
         self.mat['p']['u_norm_bound'] = [
-            assemble(a) for a in
+            _assemble_mat(a) for a in
             self.forms['p']['transpiration_dirichlet_u']]
         for a in self.forms['p']['transpiration_dirichlet_p']:
-            Atmp = assemble(a, keep_diagonal=True)
-            Atmp.ident_zeros()
+            Atmp = _assemble_mat(a)
+            # zero out near-zero diagonal entries so the matrix is invertible
+            Atmp.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
+            diag = Atmp.getDiagonal()
+            diag_arr = diag.getArray()
+            diag_arr[diag_arr == 0] = 1.0
+            Atmp.setDiagonal(diag)
             self.mat['p']['mass_bound'].append(Atmp)
 
         # set corresponding rows to zero in Robin mass matrices (if any)
         for mat in self.mat['p']['mass_robin']:
-            [bc.zero(mat) for bc in self.bc_dict['p']['dirichlet']]
+            _zero_mat_rows(mat, self.bc_dict['p']['dirichlet'])
 
         if not self._optimizing:
             for mat, coef in zip(self.mat['p']['mass_robin'],
                                  self.bc_dict['p']['transpiration']['coef']):
-                self.mat['p']['laplacian'].axpy(1./float(coef), mat, True)
+                self.mat['p']['laplacian'].axpy(1./float(coef), mat)
         else:
             # raise Exception('Robin BC optimization not implemented for PPE')
             pass
@@ -3155,16 +3193,14 @@ class SolverCoupled(Solver):
         if not state:
             return
 
-        self.u.assign(state[0])
-        # self.comp_assigner.assign(self.u_lst, self.u)
+        self.u.x.array[:] = state[0].x.array
 
         if (self.options['timemarching']['fractionalstep']['scheme'] ==
                 'IPCS'):
             assert True, 'experimental placeholder'
             # should work but not tested
-            # self.comp_assigner.assign(self.u0_lst, state[1])
-            self.u0.assign(state[1])
-            self.p.assign(state[2])
+            self.u0.x.array[:] = state[1].x.array
+            self.p.x.array[:] = state[2].x.array
 
     def update_state(self, state):
         ''' ROUKF interface: update state variables from solution functions
@@ -3176,15 +3212,15 @@ class SolverCoupled(Solver):
         if not state:
             return
 
-        state[0].assign(self.u)
+        state[0].x.array[:] = self.u.x.array
 
         if (self.options['timemarching']['fractionalstep']['scheme'] ==
                 'IPCS'):
             assert True, 'experimental placeholder'
             assert len(state) == 3, 'expected state space dimension = 3'
             # should work but not tested
-            state[1].assign(self.u0)
-            state[2].assign(self.p)
+            state[1].x.array[:] = self.u0.x.array
+            state[2].x.array[:] = self.p.x.array
 
     def init_solvers(self):
         ''' Initialize linear system solvers '''
@@ -3200,7 +3236,7 @@ class SolverCoupled(Solver):
                                         self._logging_filehandler,
                                         verbose=True)
             A = self.mat['d']['diff']
-            A.axpy(1., self.mat['d']['div'], True)
+            A.axpy(1., self.mat['d']['div'])
             self.solver_d.set_operator(A)
 
             self.iterations_ksp.update({'d': []})
@@ -3252,47 +3288,40 @@ class SolverCoupled(Solver):
                      'parameter_element_constant' in sd_opt and
                      sd_opt['parameter_element_constant'])):
                 with Timer('Z assign conv'):
-                    self.u_conv_assigned.assign(2*self.u - self.u0)
+                    self.u_conv_assigned.x.array[:] = 2*self.u.x.array - self.u0.x.array
 
         A = self.mat['u']['conv']
-        assemble(self.forms['u']['conv'], tensor=A)
+        _assemble_mat(self.forms['u']['conv'], mat=A)
 
-        # A.axpy(1., self.mat['u']['mass_diff'], True)
         if (self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS'
                 and self.t > self.options['timemarching']['dt'] + 1e-14):
             cf = 1.5
         else:
             cf = 1
-        
+
         if self._using_ale:
-            assemble(self.forms['u']['mass'], tensor=self.mat['u']['mass'])
-            assemble(self.forms['u']['diff'], tensor=self.mat['u']['diff'])
+            _assemble_mat(self.forms['u']['mass'], mat=self.mat['u']['mass'])
+            _assemble_mat(self.forms['u']['diff'], mat=self.mat['u']['diff'])
             # mat['u']['rhs'] changes over time when using ALE
             self.mat['u']['rhs'] = self.mat['u']['mass'].copy()
 
-        A.axpy(cf, self.mat['u']['mass'], True)
-        A.axpy(1., self.mat['u']['diff'], True)
+        A.axpy(cf, self.mat['u']['mass'])
+        A.axpy(1., self.mat['u']['diff'])
         # adding inflow lhs term if defined
         if self.mat['u']['inflow_lhs']:
-            A.axpy(1., self.mat['u']['inflow_lhs'], True)
+            A.axpy(1., self.mat['u']['inflow_lhs'])
 
         # assemble time/RHS SUPG matrices if present, add mass matrix
         # mat['u']['rhs'] was initialized to 'mass' and won't be changed
         # otherwise
         if 'supg_time' in self.forms['u'] and self.forms['u']['supg_time']:
             assert True, 'supg_time should not be useable!!'
-            assemble(self.forms['u']['supg_time'],
-                     tensor=self.mat['u']['rhs'])
-            A.axpy(1., self.mat['u']['rhs'], True)
-            self.mat['u']['rhs'].axpy(1., self.mat['u']['mass'], True)
+            _assemble_mat(self.forms['u']['supg_time'],
+                          mat=self.mat['u']['rhs'])
+            A.axpy(1., self.mat['u']['rhs'])
+            self.mat['u']['rhs'].axpy(1., self.mat['u']['mass'])
 
-        [bc.apply(A) for bc in self.bc_dict['u']['dirichlet']]
-
-        # if ('supg_gradp' in self.forms['u'] and
-        #         self.forms['u']['supg_gradp']):
-        #     assemble(self.forms['u']['supg_gradp'][i],
-        #              tensor=self.mat['u']['supg_gp'])
-        #     self.mat['u']['rhs'].axpy(-1., self.mat['u']['supg_gp'], True)
+        _apply_dbc_to_mat(A, self.bc_dict['u']['dirichlet'])
 
         return A
 
@@ -3303,31 +3332,30 @@ class SolverCoupled(Solver):
                 'IPCS'):
             # convection matrix was assembled already, so we can safely
             # overwrite u0 (time step k-1) for the RHS
-            # x_i = self.u0_lst[i].vector()
-            # x_i *= -0.5
-            # x_i.axpy(2., self.u_lst[i].vector())
-            x = 2*self.u.vector() - 0.5*self.u0.vector()
+            x = self.u.x.petsc_vec.copy()
+            x.scale(2.0)
+            x.axpy(-0.5, self.u0.x.petsc_vec)
         else:
             # CT
             if self._using_mapdd:
-                x = self.u0.vector()
+                x = self.u0.x.petsc_vec
             else:
-                x = self.u.vector()
+                x = self.u.x.petsc_vec
 
-        bu = self.mat['u']['rhs']*x
+        bu = _mat_vec(self.mat['u']['rhs'], x)
 
         if self.mat['u']['pdiv']:
-            bu.axpy(-1.0, self.mat['u']['pdiv']*self.p.vector())
+            bu.axpy(-1.0, _mat_vec(self.mat['u']['pdiv'], self.p.x.petsc_vec))
 
         if self.vec['u']['rhs_const']:
             bu.axpy(1.0, self.vec['u']['rhs_const'])
 
         if self.vec['u']['inflow_rhs']:
-            self.vec['u']['inflow_rhs'] = assemble(self.forms['u']['inflow_rhs'])
+            self.vec['u']['inflow_rhs'] = _assemble_vec(self.forms['u']['inflow_rhs'])
             bu.axpy(1.0, self.vec['u']['inflow_rhs'])
 
         if self.vec['u']['mapdd_rhs']:
-            self.vec['u']['mapdd_rhs'] = assemble(self.forms['u']['mapdd_rhs'])
+            self.vec['u']['mapdd_rhs'] = _assemble_vec(self.forms['u']['mapdd_rhs'])
             bu.axpy(1.0, self.vec['u']['mapdd_rhs'])
 
 
@@ -3343,26 +3371,26 @@ class SolverCoupled(Solver):
 
         if not self._optimizing:
             assert len(self.mat['u']['lhs_navslip'])
-            A_robin.axpy(1., self.mat['u']['lhs_navslip'][0], True)
+            A_robin.axpy(1., self.mat['u']['lhs_navslip'][0])
             assert len(self.mat['u']['lhs_trans'])
-            A_robin.axpy(1., self.mat['u']['lhs_trans'][0], True)
+            A_robin.axpy(1., self.mat['u']['lhs_trans'][0])
 
         else:
             for i_bnd in range(len(self.forms['u']['navierslip']['coef'])):
                 coef_ns = float(self.forms['u']['navierslip']['coef']
                                 [i_bnd])
                 lhs_ns = self.mat['u']['lhs_navslip'][i_bnd]
-                A_robin.axpy(coef_ns, lhs_ns, True)
+                A_robin.axpy(coef_ns, lhs_ns)
 
                 coef_t = float(self.forms['u']['transpiration']['coef']
                                [i_bnd])
                 lhs_t = self.mat['u']['lhs_trans'][i_bnd]
-                A_robin.axpy(coef_t, lhs_t, True)
+                A_robin.axpy(coef_t, lhs_t)
 
         if self.mat['u']['p_trans']:
             assert (self.options['timemarching']['fractionalstep']['scheme'] ==
                     'CT')
-            bu.axpy(-1., self.mat['u']['p_trans']*self.p.vector())
+            bu.axpy(-1., _mat_vec(self.mat['u']['p_trans'], self.p.x.petsc_vec))
 
         return A_robin
 
@@ -3373,7 +3401,7 @@ class SolverCoupled(Solver):
         self.update_velocity_bcs()
 
         if self._using_mapdd:
-            self.u0_mapdd.assign(self.u0)
+            self.u0_mapdd.x.array[:] = self.u0.x.array
 
         A = self.assemble_tentative_velocity()
 
@@ -3384,17 +3412,20 @@ class SolverCoupled(Solver):
                 ['IPCS', 'CT']) and not self._using_mapdd:
             # assembly of A, b done; u0_lst is "free"; assign
             # u_i(corrected, u^k) for next iteration
-            self.u0.assign(self.u)
+            self.u0.x.array[:] = self.u.x.array
 
         if A_robin:
-            [bc.apply(A_robin, bu) for bc in self.bc_dict['u']['dirichlet']]
+            _apply_dbc_to_mat(A_robin, self.bc_dict['u']['dirichlet'])
+            apply_lifting(bu, [fem_form(self.forms['u']['mass'])],
+                          [self.bc_dict['u']['dirichlet']])
+            set_bc(bu, self.bc_dict['u']['dirichlet'])
             self.solver_u_ten.set_operator(A_robin)
 
         else:
             self.solver_u_ten.set_operator(A)
-            [bc.apply(bu) for bc in self.bc_dict['u']['dirichlet']]
+            set_bc(bu, self.bc_dict['u']['dirichlet'])
 
-        self.solver_u_ten.solve(self.u.vector(), bu)
+        self.solver_u_ten.solve(self.u.x.petsc_vec, bu)
 
         if self.solver_u_ten.conv_reason < 0:
             self.logger.error('Solver u_ten DIVERGED ({})'.
@@ -3416,7 +3447,8 @@ class SolverCoupled(Solver):
             cf = 2./3.
         else:
             cf = 1.
-        bu = cf*self.mat['u']['gradp']*self.phi.vector()
+        bu = _mat_vec(self.mat['u']['gradp'], self.phi.x.petsc_vec)
+        bu.scale(cf)
         return bu
 
     def solve_velocity_update(self):
@@ -3428,15 +3460,15 @@ class SolverCoupled(Solver):
         if (self.options['timemarching']['fractionalstep']['scheme'] ==
                 'CTp') or self._using_mapdd:
             # CTp: use old tentative velocity in time disc. term on RHS
-            self.u0.assign(self.u)
+            self.u0.x.array[:] = self.u.x.array
 
         bu = self.build_rhs_velocity_update()
 
         if self._applying_dc_on_update:
-            [bc.apply(bu) for bc in self.bc_dict['u']['dirichlet']]
+            set_bc(bu, self.bc_dict['u']['dirichlet'])
 
-        self.solver_u_upd.solve(self.du.vector(), bu)
-        self.u.vector().axpy(1.0, self.du.vector())
+        self.solver_u_upd.solve(self.du.x.petsc_vec, bu)
+        self.u.x.petsc_vec.axpy(1.0, self.du.x.petsc_vec)
 
         if self.solver_u_upd.conv_reason < 0:
             self.logger.error('Solver u_upd DIVERGED ({})'.
@@ -3454,8 +3486,8 @@ class SolverCoupled(Solver):
     #     for bc in self.bc_dict['u']['time_bcs']:
     #         bc['expression'].t = float(self.t)
 
-    #         if utils.is_enriched(self.u.function_space()):
-    #             V = self.u.function_space()
+    #         if utils.is_enriched(self.u.function_space):
+    #             V = self.u.function_space
     #             bcs = self.bc_dict['u']['dirichlet']
     #             bcs[bcs.index(bc['id'])] = DirichletBC(
     #                 V, project(bc['expression'], V), self.bnds,
@@ -3502,7 +3534,7 @@ class PETScSolver(LoggerBase):
         ''' Clean up PETScOptions '''
         # super().__del__()
         self.close_logs()
-        PETScOptions.clear()
+        PETSc.Options().clear()
         type(self)._initialized = False
 
     def setup_ksp(self):
@@ -3541,21 +3573,13 @@ class PETScSolver(LoggerBase):
         ''' Set operator A of linear problem Ax = b and set-up solver and
         preconditioner matrix Ap.
         Args:
-            A:       dolfin Matrix or PETSc.Mat matrix
-            Ap:      precondition matrix, dolfin Matrix or PETSc.Mat matrix
+            A:       PETSc.Mat matrix
+            Ap:      precondition matrix, PETSc.Mat (optional)
         '''
-        if isinstance(A, (Matrix, PETScMatrix)):
-            A = as_backend_type(A).mat()
-
-        elif isinstance(A, PETSc.Mat):
-            pass
-
-        else:
+        if not isinstance(A, PETSc.Mat):
             raise Exception(f"Unknown matrix type: {type(A)}")
-
-        if isinstance(Ap, (Matrix, PETScMatrix)):
-            Ap = as_backend_type(Ap).mat()
-
+        if Ap is not None and not isinstance(Ap, PETSc.Mat):
+            raise Exception(f"Unknown preconditioner matrix type: {type(Ap)}")
         self.ksp.setOperators(A, Ap)
         self.ksp.setUp()
 
@@ -3565,17 +3589,18 @@ class PETScSolver(LoggerBase):
         Saves iteration count, residuals and termination reason.
 
         Args:
-            x           solution vector (dolfin Vector)
-            b           rhs vector (dolfin Vector)
-            A (opt)     matrix (dolfin Matrix)
+            x           solution PETSc.Vec
+            b           rhs PETSc.Vec
+            A (opt)     matrix PETSc.Mat
         '''
-        if A:
-            self.ksp.setOperators(as_backend_type(A).mat())
+        if A is not None:
+            self.ksp.setOperators(A)
             self.ksp.setUp()
 
         t0 = Timer('Z PETScSolver SOLVE ')
-        self.ksp.solve(as_backend_type(b).vec(), as_backend_type(x).vec())
-        as_backend_type(x).update_ghost_values()
+        self.ksp.solve(b, x)
+        x.ghostUpdate(addv=PETSc.InsertMode.INSERT,
+                      mode=PETSc.ScatterMode.FORWARD)
 
         self.timing['ksp'] = t0.stop()
         self.iterations = self.ksp.getIterationNumber()
@@ -3597,108 +3622,108 @@ class PETScSolver(LoggerBase):
         self.logger.info('  Setting PETScOptions:')
         for popt in self.petsc_options:
             # self.logger.info('  -' + ' '.join(popt))
-            PETScOptions.set(*popt)
+            PETSc.Options().setValue(*popt)
 
     def _set_options_default(self):
         ''' Set default options '''
         meth = self.options['linear_solver']['method']
         if meth.lower() == 'mumps':
-            PETScOptions.set('d_ksp_type', 'preonly') 
-            PETScOptions.set('d_pc_type', 'lu')
+            PETSc.Options().setValue('d_ksp_type', 'preonly') 
+            PETSc.Options().setValue('d_pc_type', 'lu')
 
-            PETScOptions.set('u_ten_ksp_type', 'preonly')
-            PETScOptions.set('u_ten_pc_type', 'lu')
-            PETScOptions.set('u_ten_pc_factor_mat_solver_package', 'mumps')
-            PETScOptions.set('u_ten_mat_mumps_icntl_14', 40)
-            PETScOptions.set('p_ksp_type', 'preonly')
-            PETScOptions.set('p_pc_type', 'lu')
-            PETScOptions.set('p_pc_factor_mat_solver_package', 'mumps')
-            PETScOptions.set('p_mat_mumps_icntl_14', 40)
-            PETScOptions.set('u_upd_ksp_type', 'preonly')
-            PETScOptions.set('u_upd_pc_type', 'lu')
-            PETScOptions.set('u_upd_pc_factor_mat_solver_package', 'mumps')
-            PETScOptions.set('u_upd_mat_mumps_icntl_14', 40)
+            PETSc.Options().setValue('u_ten_ksp_type', 'preonly')
+            PETSc.Options().setValue('u_ten_pc_type', 'lu')
+            PETSc.Options().setValue('u_ten_pc_factor_mat_solver_package', 'mumps')
+            PETSc.Options().setValue('u_ten_mat_mumps_icntl_14', 40)
+            PETSc.Options().setValue('p_ksp_type', 'preonly')
+            PETSc.Options().setValue('p_pc_type', 'lu')
+            PETSc.Options().setValue('p_pc_factor_mat_solver_package', 'mumps')
+            PETSc.Options().setValue('p_mat_mumps_icntl_14', 40)
+            PETSc.Options().setValue('u_upd_ksp_type', 'preonly')
+            PETSc.Options().setValue('u_upd_pc_type', 'lu')
+            PETSc.Options().setValue('u_upd_pc_factor_mat_solver_package', 'mumps')
+            PETSc.Options().setValue('u_upd_mat_mumps_icntl_14', 40)
 
-            PETScOptions.set('p_mass_ksp_type', 'preonly')
-            PETScOptions.set('p_mass_pc_type', 'lu')
-            PETScOptions.set('p_mass_pc_factor_mat_solver_package', 'mumps')
-            PETScOptions.set('p_mass_mat_mumps_icntl_14', 40)
+            PETSc.Options().setValue('p_mass_ksp_type', 'preonly')
+            PETSc.Options().setValue('p_mass_pc_type', 'lu')
+            PETSc.Options().setValue('p_mass_pc_factor_mat_solver_package', 'mumps')
+            PETSc.Options().setValue('p_mass_mat_mumps_icntl_14', 40)
 
         elif meth.lower() in ('petsc', 'lu'):
-            PETScOptions.set('d_ksp_type', 'preonly') 
-            PETScOptions.set('d_pc_type', 'lu')
+            PETSc.Options().setValue('d_ksp_type', 'preonly') 
+            PETSc.Options().setValue('d_pc_type', 'lu')
 
-            PETScOptions.set('u_ten_ksp_type', 'preonly')
-            PETScOptions.set('u_ten_pc_type', 'lu')
-            PETScOptions.set('p_ksp_type', 'preonly')
-            PETScOptions.set('p_pc_type', 'lu')
-            PETScOptions.set('u_upd_ksp_type', 'preonly')
-            PETScOptions.set('u_upd_pc_type', 'lu')
+            PETSc.Options().setValue('u_ten_ksp_type', 'preonly')
+            PETSc.Options().setValue('u_ten_pc_type', 'lu')
+            PETSc.Options().setValue('p_ksp_type', 'preonly')
+            PETSc.Options().setValue('p_pc_type', 'lu')
+            PETSc.Options().setValue('u_upd_ksp_type', 'preonly')
+            PETSc.Options().setValue('u_upd_pc_type', 'lu')
 
-            PETScOptions.set('p_mass_ksp_type', 'preonly')
-            PETScOptions.set('p_mass_pc_type', 'lu')
+            PETSc.Options().setValue('p_mass_ksp_type', 'preonly')
+            PETSc.Options().setValue('p_mass_pc_type', 'lu')
 
         elif meth.lower() == 'default':
-            PETScOptions.set('d_ksp_type', 'cg') 
-            PETScOptions.set('d_ksp_rtol', 1.0e-6)
+            PETSc.Options().setValue('d_ksp_type', 'cg') 
+            PETSc.Options().setValue('d_ksp_rtol', 1.0e-6)
             
             # BiCGSTAB/Jacobi + CG/GAMG
-            PETScOptions.set('u_ten_ksp_type', 'bcgs')
-            # PETScOptions.set('u_ten_ksp_converged_reason')
-            # PETScOptions.set('u_ten_ksp_monitor_true_residual')
-            PETScOptions.set('u_ten_ksp_rtol', 1.0e-6)
-            PETScOptions.set('u_ten_ksp_initial_guess_nonzero')
-            PETScOptions.set('u_ten_pc_type', 'jacobi')
-            # PETScOptions.set('u_ten_pc_type', 'gamg')
-            # PETScOptions.set('u_ten_pc_gamg_type', 'agg')
-            # PETScOptions.set('u_ten_pc_gamg_threshold', 0.03)
-            # PETScOptions.set('u_ten_pc_gamg_square_graph', 10)
-            # PETScOptions.set('u_ten_pc_gamg_sym_graph')
-            # PETScOptions.set('u_ten_mg_levels_ksp_type', 'richardson')
-            # PETScOptions.set('u_ten_mg_levels_pc_type', 'sor')
+            PETSc.Options().setValue('u_ten_ksp_type', 'bcgs')
+            # PETSc.Options().setValue('u_ten_ksp_converged_reason')
+            # PETSc.Options().setValue('u_ten_ksp_monitor_true_residual')
+            PETSc.Options().setValue('u_ten_ksp_rtol', 1.0e-6)
+            PETSc.Options().setValue('u_ten_ksp_initial_guess_nonzero')
+            PETSc.Options().setValue('u_ten_pc_type', 'jacobi')
+            # PETSc.Options().setValue('u_ten_pc_type', 'gamg')
+            # PETSc.Options().setValue('u_ten_pc_gamg_type', 'agg')
+            # PETSc.Options().setValue('u_ten_pc_gamg_threshold', 0.03)
+            # PETSc.Options().setValue('u_ten_pc_gamg_square_graph', 10)
+            # PETSc.Options().setValue('u_ten_pc_gamg_sym_graph')
+            # PETSc.Options().setValue('u_ten_mg_levels_ksp_type', 'richardson')
+            # PETSc.Options().setValue('u_ten_mg_levels_pc_type', 'sor')
 
-            PETScOptions.set('p_ksp_type', 'cg')
+            PETSc.Options().setValue('p_ksp_type', 'cg')
             # gmres would remove nullspace automatically
-            # PETScOptions.set('p_ksp_converged_reason')
-            # PETScOptions.set('p_ksp_monitor_true_residual')
-            PETScOptions.set('p_ksp_rtol', 1.0e-8)
-            PETScOptions.set('p_pc_type', 'gamg')
-            PETScOptions.set('p_pc_gamg_type', 'agg')
-            PETScOptions.set('p_pc_gamg_threshold', 0.03)
-            PETScOptions.set('p_pc_gamg_square_graph', 10)
-            PETScOptions.set('p_pc_gamg_sym_graph')     # needed for parallel
-            PETScOptions.set('p_mg_levels_ksp_type', 'richardson')
-            PETScOptions.set('p_mg_levels_pc_type', 'sor')
+            # PETSc.Options().setValue('p_ksp_converged_reason')
+            # PETSc.Options().setValue('p_ksp_monitor_true_residual')
+            PETSc.Options().setValue('p_ksp_rtol', 1.0e-8)
+            PETSc.Options().setValue('p_pc_type', 'gamg')
+            PETSc.Options().setValue('p_pc_gamg_type', 'agg')
+            PETSc.Options().setValue('p_pc_gamg_threshold', 0.03)
+            PETSc.Options().setValue('p_pc_gamg_square_graph', 10)
+            PETSc.Options().setValue('p_pc_gamg_sym_graph')     # needed for parallel
+            PETSc.Options().setValue('p_mg_levels_ksp_type', 'richardson')
+            PETSc.Options().setValue('p_mg_levels_pc_type', 'sor')
 
             # 3D poisson: taken from Chris Richardson's and Jack Hale's
             # poisson.py
-            # PETScOptions.set('p_pc_type', 'hypre')
-            # PETScOptions.set('p_pc_hypre_type', 'boomeramg')
-            # PETScOptions.set('p_pc_hypre_boomeramg_agg_nl', 4)
-            # PETScOptions.set('p_pc_hypre_boomeramg_agg_num_paths', 2)
+            # PETSc.Options().setValue('p_pc_type', 'hypre')
+            # PETSc.Options().setValue('p_pc_hypre_type', 'boomeramg')
+            # PETSc.Options().setValue('p_pc_hypre_boomeramg_agg_nl', 4)
+            # PETSc.Options().setValue('p_pc_hypre_boomeramg_agg_num_paths', 2)
             # # Truncation factor for interpolation (note: increasing towrds 1
             # # appears to reduce memory useage)
-            # PETScOptions.set('p_pc_hypre_boomeramg_truncfactor', 0.9)
+            # PETSc.Options().setValue('p_pc_hypre_boomeramg_truncfactor', 0.9)
             # # Max elements per row for interpolation operator
-            # PETScOptions.set('p_pc_hypre_boomeramg_P_max', 5)
-            # # PETScOptions.set('p_pc_hypre_boomeramg_max_levels', 10)
+            # PETSc.Options().setValue('p_pc_hypre_boomeramg_P_max', 5)
+            # # PETSc.Options().setValue('p_pc_hypre_boomeramg_max_levels', 10)
             # # Strong threshold (BoomerAMG docs recommend 0.5-0.6 for 3D
             # #   Poisson)
-            # PETScOptions.set('p_pc_hypre_boomeramg_strong_threshold', 0.5)
+            # PETSc.Options().setValue('p_pc_hypre_boomeramg_strong_threshold', 0.5)
 
-            PETScOptions.set('u_upd_ksp_type', 'cg')
-            # PETScOptions.set('u_upd_ksp_converged_reason')
-            # PETScOptions.set('u_upd_ksp_monitor_true_residual')
-            PETScOptions.set('u_upd_ksp_rtol', 1.0e-8)
-            PETScOptions.set('u_upd_ksp_initial_guess_nonzero')
-            PETScOptions.set('u_upd_pc_type', 'jacobi')
+            PETSc.Options().setValue('u_upd_ksp_type', 'cg')
+            # PETSc.Options().setValue('u_upd_ksp_converged_reason')
+            # PETSc.Options().setValue('u_upd_ksp_monitor_true_residual')
+            PETSc.Options().setValue('u_upd_ksp_rtol', 1.0e-8)
+            PETSc.Options().setValue('u_upd_ksp_initial_guess_nonzero')
+            PETSc.Options().setValue('u_upd_pc_type', 'jacobi')
 
-            PETScOptions.set('p_mass_ksp_type', 'cg')
-            # PETScOptions.set('p_mass_ksp_converged_reason')
-            # PETScOptions.set('p_mass_ksp_monitor_true_residual')
-            PETScOptions.set('p_mass_ksp_rtol', 1.0e-8)
-            PETScOptions.set('p_mass_ksp_initial_guess_nonzero')
-            PETScOptions.set('p_mass_pc_type', 'jacobi')
+            PETSc.Options().setValue('p_mass_ksp_type', 'cg')
+            # PETSc.Options().setValue('p_mass_ksp_converged_reason')
+            # PETSc.Options().setValue('p_mass_ksp_monitor_true_residual')
+            PETSc.Options().setValue('p_mass_ksp_rtol', 1.0e-8)
+            PETSc.Options().setValue('p_mass_ksp_initial_guess_nonzero')
+            PETSc.Options().setValue('p_mass_pc_type', 'jacobi')
 
         else:
             raise Exception('linear solver method set "{}" unknown'.
@@ -3718,7 +3743,7 @@ class Mat(object):
         ''' '''
         self.form = form
         self.bcs = bcs
-        self.mat = PETScMatrix()
+        self.mat = None
         self._assembled = False
         self._bcs_applied = False
         if assemble:
@@ -3726,22 +3751,25 @@ class Mat(object):
 
     def assemble(self):
         ''' '''
-        assemble(self.form, tensor=self.mat)
+        if self.mat is None:
+            self.mat = _assemble_mat(self.form)
+        else:
+            _assemble_mat(self.form, mat=self.mat)
         self._assembled = True
         self._bcs_applied = False
 
     def apply_bcs(self):
         ''' '''
         assert self._assembled
-        [bc.apply(self.mat) for bc in bcs]
+        _apply_dbc_to_mat(self.mat, self.bcs)
         self._bcs_applied = True
 
-    def axpy(self, x, A, same_sparse=True):
+    def axpy(self, x, A):
         ''' '''
         assert self._assembled
         if isinstance(A, self.__class__):
             A = A.mat
-        self.mat.axpy(x, A, same_sparse)
+        self.mat.axpy(x, A)
 
 
 def solver(problem):
