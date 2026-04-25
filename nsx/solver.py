@@ -1,4 +1,5 @@
 
+from common.inout import read_parameters
 
 def init(inputfile):
     ''' Select solver according to inputfile and return solver instance.

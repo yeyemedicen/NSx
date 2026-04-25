@@ -111,8 +111,8 @@ class Problem(LoggerBase):
         if not self.options:
             raise Exception('Options not set. call get_parameters(optfile) '
                             'first!')
-        self.set_constants()
         self.init_mesh()
+        self.set_constants()
         self.init_ale_operators()
         self.create_functionspaces()
         self.boundary_conditions()
@@ -158,9 +158,7 @@ class Problem(LoggerBase):
         else:
             self._using_ale = False
 
-        self.logger.debug('Parameters:')
-        self.logger.debug(inout.dump_parameters(self.options))
-
+        
     def setup_logger(self):
         ''' Create logging File Handler '''
         MPI.COMM_WORLD.Barrier()
@@ -175,8 +173,8 @@ class Problem(LoggerBase):
         self.set_log_filehandler(str(path))
 
     def _C(self, val):
-        ''' Shorthand: fem.self._C(self.mesh, val) '''
-        return fem.self._C(self.mesh, np.array(val, dtype=PETSc.ScalarType))
+        ''' Shorthand: fem.Constant(self.mesh, val) '''
+        return fem.Constant(self.mesh, np.array(val, dtype=PETSc.ScalarType))
 
     # =========================================================================
     # Mesh, function spaces, and operators
@@ -1211,11 +1209,18 @@ class BoundaryConditions(LoggerBase):
                     val = self._C(val)
 
                 elif isinstance(val, str):
-                    # TODO: replace string Expression with fem.Function + interpolate
-                    self.logger.warning(
-                        'String-based Expression for velocity BC '
-                        '(bid={}, i={}) not yet ported — BC skipped.'.format(bc['id'], i))
-                    continue
+                    params = bc.get('parameters', {})
+                    try:
+                        val = self._C(float(val))
+                    except ValueError:
+                        if val in params:
+                            val = self._C(float(params[val]))
+                        else:
+                            self.logger.warning(
+                                'String BC value "{}" at bid={}, i={} has no matching '
+                                'parameter — component BC skipped.'.format(
+                                    val, bc['id'], i))
+                            continue
 
                 elif isinstance(val, fem.Function):
                     expr = val
@@ -2452,8 +2457,9 @@ class BoundaryConditionsCoupled(BoundaryConditions):
         self.rho = problem.rho
         self.mu = problem.mu
         self.bnds = problem.bnds
-        self.ndim = self.mesh.topology.dim
         self.mesh = problem.mesh
+        self.facet_tags = problem.facet_tags
+        self.ndim = self.mesh.topology.dim
         self.ds = ufl.Measure('ds', domain=self.mesh, subdomain_data=self.facet_tags)
 
         self._using_wk = False
@@ -2594,11 +2600,23 @@ class BoundaryConditionsCoupled(BoundaryConditions):
                     val = self._C(val)
 
                 elif any(isinstance(x, str) for x in val):
-                    # TODO: string Expression not yet ported — BC skipped
-                    self.logger.warning(
-                        'String-based Expression for velocity BC '
-                        '(bid={}) not yet ported — BC skipped.'.format(bc['id']))
-                    return
+                    params = bc.get('parameters', {})
+                    resolved = []
+                    for x in val:
+                        if isinstance(x, (int, float)):
+                            resolved.append(float(x))
+                        elif isinstance(x, str):
+                            try:
+                                resolved.append(float(x))
+                            except ValueError:
+                                if x in params:
+                                    resolved.append(float(params[x]))
+                                else:
+                                    self.logger.warning(
+                                        'String BC value "{}" at bid={} has no matching '
+                                        'parameter — BC skipped.'.format(x, bc['id']))
+                                    return
+                    val = self._C(resolved)
 
                 elif isinstance(val, fem.Function):
                     expr = val
@@ -2634,12 +2652,15 @@ class BoundaryConditionsCoupled(BoundaryConditions):
                         val = self._C(val)
 
                     elif isinstance(val, str):
-                        # TODO: string Expression not yet ported — BC skipped
-                        self.logger.warning(
-                            'String-based Expression for velocity BC '
-                            '(bid={}, i={}) not yet ported — BC skipped.'.format(
-                                bc['id'], i))
-                        continue
+                        params = bc.get('parameters', {})
+                        if val in params:
+                            val = self._C(float(params[val]))
+                        else:
+                            self.logger.warning(
+                                'String BC value "{}" at bid={}, i={} has no matching '
+                                'parameter — component BC skipped.'.format(
+                                    val, bc['id'], i))
+                            continue
 
                     elif isinstance(val, fem.Function):
                         expr = val

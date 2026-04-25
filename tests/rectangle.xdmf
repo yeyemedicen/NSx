@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<!DOCTYPE Xdmf SYSTEM "Xdmf.dtd" []>
+<Xdmf Version="3.0" xmlns:xi="https://www.w3.org/2001/XInclude">
+  <Domain>
+    <Grid Name="mesh" GridType="Uniform">
+      <Topology TopologyType="Triangle" NumberOfElements="112" NodesPerElement="3">
+        <DataItem Dimensions="112 3" NumberType="Int" Format="HDF">rectangle.h5:/Mesh/mesh/topology</DataItem>
+      </Topology>
+      <Geometry GeometryType="XY">
+        <DataItem Dimensions="71 2" Format="HDF">rectangle.h5:/Mesh/mesh/geometry</DataItem>
+      </Geometry>
+    </Grid>
+    <Grid Name="cells" GridType="Uniform">
+      <xi:include xpointer="xpointer(/Xdmf/Domain/Grid/Geometry)" />
+      <Topology TopologyType="Triangle" NumberOfElements="112" NodesPerElement="3">
+        <DataItem Dimensions="112 3" NumberType="Int" Format="HDF">rectangle.h5:/MeshTags/cells/topology</DataItem>
+      </Topology>
+      <Attribute Name="cells" AttributeType="Scalar" Center="Cell">
+        <DataItem Dimensions="112 1" Format="HDF">rectangle.h5:/MeshTags/cells/Values</DataItem>
+      </Attribute>
+    </Grid>
+    <Grid Name="facets" GridType="Uniform">
+      <xi:include xpointer="xpointer(/Xdmf/Domain/Grid/Geometry)" />
+      <Topology TopologyType="PolyLine" NumberOfElements="28" NodesPerElement="2">
+        <DataItem Dimensions="28 2" NumberType="Int" Format="HDF">rectangle.h5:/MeshTags/facets/topology</DataItem>
+      </Topology>
+      <Attribute Name="facets" AttributeType="Scalar" Center="Cell">
+        <DataItem Dimensions="28 1" Format="HDF">rectangle.h5:/MeshTags/facets/Values</DataItem>
+      </Attribute>
+    </Grid>
+  </Domain>
+</Xdmf>

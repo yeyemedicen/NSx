@@ -50,13 +50,19 @@ def _assemble_mat(form, bcs=None, mat=None):
     ''' Assemble bilinear UFL form into PETSc.Mat.
     If mat is provided, re-assembles into it (zeroing first).
     '''
+    import dolfinx.cpp.fem.petsc as _cpp_petsc
+    from dolfinx.fem import pack_constants, pack_coefficients
     compiled = fem_form(form)
     if mat is None:
         result = assemble_matrix(compiled, bcs=bcs or [])
         result.assemble()
         return result
     mat.zeroEntries()
-    assemble_matrix(compiled, bcs=bcs or [], mat=mat)
+    _cpp_petsc.assemble_matrix(mat, compiled._cpp_object,
+                               pack_constants(compiled),
+                               pack_coefficients(compiled),
+                               [bc._cpp_object for bc in (bcs or [])],
+                               False)
     mat.assemble()
     return mat
 
