@@ -72,7 +72,7 @@ fem:
             gamma: 1e+8
         backflow_boundaries: []
         streamline_diffusion:
-            enabled: False
+            enabled: True
             parameter: 'standard'   # standard, shakib, codina, klr
             length_scale: 'metric' # average, max, metric
             parameter_element_constant: True

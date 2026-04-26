@@ -111,7 +111,7 @@ class SDParameter(LoggerBase):
             len_scale = 'average'
 
         self.logger.info('SD parameter: shakib\n\tlength scale: {ls}\n'
-                         '\tC_inv: {c}'.format(ls=len_scale, c=float(Cinv.value)))
+                         '\tC_inv: {c}'.format(ls=len_scale, c=float(np.asarray(Cinv.value).flat[0])))
         return tau
 
     def tau_standard(self, u_conv, u_conv_assigned):

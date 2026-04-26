@@ -7,6 +7,10 @@ ProblemCoupled:INFO: Creating pressure space: P1
 ProblemCoupled:INFO: Number of velocity DOFs: 810
 ProblemCoupled:INFO: Number of pressure DOFs: 405
 BoundaryConditionsCoupled:INFO: Processing boundary conditions
+SDParameter:INFO: SD parameter: shakib
+	length scale: metric
+	C_inv: 30.0
+ProblemCoupled:INFO: SD/SUPG residual: minimal
 SolverCoupled:INFO: Initializing
 SolverCoupled:INFO: Copying inputfile to results directory
 SolverCoupled:INFO: inputfile: tests/input.yaml
