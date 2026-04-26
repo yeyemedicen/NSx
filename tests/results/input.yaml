@@ -58,7 +58,7 @@ windkessel:
     implicit: False
 
 fem:
-    velocity_space: p2  # p1 p1b/p1+ p2
+    velocity_space: p1  # p1 p1b/p1+ p2
     pressure_space: p1  # p1 p0/dg0 dg1
     DC_in_update: True
     PEN_in_update: False

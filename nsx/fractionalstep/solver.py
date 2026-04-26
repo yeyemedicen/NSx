@@ -403,6 +403,7 @@ class Solver(LoggerBase):
 
     def solve(self):
         ''' Solve fractional step scheme '''
+        from nsx.reporter import ProgressReporter
         timer = Timer('Z TimeStepping')
 
         self.init()
@@ -411,15 +412,31 @@ class Solver(LoggerBase):
         T = self.options['timemarching']['T']
         times = np.arange(self.t + dt, T + dt, dt)
 
-        for i, t in enumerate(times):
-            it = i + 1
-            self.it = it
-            self.timestep(it, t)
+        rank = MPI.COMM_WORLD.rank
+        reporter = ProgressReporter(len(times), dt, rank=rank)
+        reporter.print_banner()
+        reporter.start()
+        self._reporter = reporter
 
-            self.monitor(it)
+        try:
+            for i, t in enumerate(times):
+                it = i + 1
+                self.it = it
+                self.timestep(it, t)
 
-            if self._diverged:
-                break
+                #self.monitor(it)
+
+                reporter.update(
+                    it, t,
+                    norm_u_tent=getattr(self, '_norm_u_tent', float('nan')),
+                    norm_p=getattr(self, '_norm_p', float('nan')),
+                    norm_u_upd=getattr(self, '_norm_u_upd', float('nan')),
+                )
+
+                if self._diverged:
+                    break
+        finally:
+            reporter.close()
 
         self.t_elapsed = timer.stop()
         self.write_statistics()
@@ -429,6 +446,7 @@ class Solver(LoggerBase):
         ''' Cleanup '''
         self.close_xdmf()
         self.close_logs()
+        PETSc.Options().clear()
 
     def timestep(self, i=0, t=None, state=None, parameters=None,
                 restart=False, observations=None):
@@ -468,8 +486,9 @@ class Solver(LoggerBase):
             # self.logger.debug('|d| = {:.4e}'.format(norm(self.d)))
 
         self.solve_tentative_velocity()
-        norm_u = np.sqrt(fem.assemble_scalar(fem.form(ufl.inner(self.u, self.u) * ufl.dx)))
-        self.logger.info('|u_ten| = {:.4e}'.format(norm_u))
+        self._norm_u_tent = np.sqrt(
+            fem.assemble_scalar(fem.form(ufl.inner(self.u, self.u) * ufl.dx))
+        )
 
         if self._using_wk:
             self.solve_windkessel()
@@ -489,6 +508,9 @@ class Solver(LoggerBase):
 
         # post processing
         self.solve_pressure()
+        self._norm_p = np.sqrt(
+            fem.assemble_scalar(fem.form(self.p * self.p * ufl.dx))
+        )
 
         if self.write_velocity == 'tentative':
             self.write_timestep(i)
@@ -504,8 +526,9 @@ class Solver(LoggerBase):
 
         self.solve_velocity_update()
         self.pressure_increment()
-        #self.logger.debug('|p| = {}'.format(norm(self.p)))
-        #self.logger.debug('|u_upd| = {}'.format(norm(self.u)))
+        self._norm_u_upd = np.sqrt(
+            fem.assemble_scalar(fem.form(ufl.inner(self.u, self.u) * ufl.dx))
+        )
         if (state and (self.options['timemarching']['fractionalstep']
                        ['scheme'] == 'CT')):
             if self.state_velocity == 'update':
@@ -1595,7 +1618,6 @@ class Solver(LoggerBase):
     def solve_tentative_velocity(self):
         ''' Solve tentative velocity PDE '''
         timer = Timer('Z solve u_ten')
-        self.logger.info('Solve tentative velocity')
         self.update_velocity_bcs()
 
         A = self.assemble_tentative_velocity()
@@ -1757,7 +1779,6 @@ class Solver(LoggerBase):
 
     def solve_pressure(self):
         ''' Projection step. Solve pressure poisson equation. '''
-        self.logger.info('pressure projection')
         timer = Timer('Z solve p')
 
         self.update_pressure_bcs()
@@ -1811,7 +1832,6 @@ class Solver(LoggerBase):
         ''' Solve velocity update PDE '''
 
         timer = Timer('Z solve u_upd')
-        self.logger.info('Solve velocity update')
 
 
         for i, u_i in enumerate(self.u_lst):
@@ -2119,11 +2139,15 @@ class Solver(LoggerBase):
             self.logger.info('Volume change: {rate:.{width}f}'
                             .format(rate=new/old, width=6))
 
-        if self.options['timemarching']['report']:
-            self.logger.info('t = {t:.{width}f} \t({T}) \t{w}\t{f}'
-                             .format(t=self.t,
-                                     T=self.options['timemarching']['T'],
-                                     w=wstr, f=flux_str, width=6))
+        if self.options['timemarching']['report'] and (wstr or flux_str):
+            reporter = getattr(self, '_reporter', None)
+            msg = 't = {t:.{width}f} \t{w}\t{f}'.format(
+                t=self.t, w=wstr, f=flux_str, width=6)
+            if reporter is not None and reporter._bar is not None:
+                from tqdm import tqdm as _tqdm
+                _tqdm.write(msg)
+            else:
+                self.logger.info(msg)
 
     def read_timestep(self, i):
         ''' HDF5 checkpoint read out
@@ -3427,7 +3451,6 @@ class SolverCoupled(Solver):
     def solve_tentative_velocity(self):
         ''' Solve tentative velocity PDE '''
         timer = Timer('Z solve u_ten')
-        self.logger.info('Solve tentative velocity')
         self.update_velocity_bcs()
 
         if self._using_mapdd:
@@ -3489,7 +3512,6 @@ class SolverCoupled(Solver):
         ''' Solve velocity update PDE '''
 
         timer = Timer('Z solve u_upd')
-        self.logger.info('Solve velocity update')
 
         if (self.options['timemarching']['fractionalstep']['scheme'] ==
                 'CTp') or self._using_mapdd:

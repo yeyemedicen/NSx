@@ -15,6 +15,7 @@ class ParallelFilter(logging.Filter):
 
 
 ch = logging.StreamHandler()
+ch.setLevel(logging.WARNING)
 ch.addFilter(ParallelFilter())
 formatter = logging.Formatter('%(name)s:%(levelname)s: %(message)s')
 ch.setFormatter(formatter)
