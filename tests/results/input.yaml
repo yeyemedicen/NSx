@@ -1,5 +1,5 @@
 
-mesh: './tests/rectangle.xdmf'
+mesh: './tests/rectangle_shared.xdmf'
 
 # Physical parameters of the fluid  
 fluid:
@@ -13,19 +13,19 @@ io:
         path: '' 
         time: 0
     write_xdmf: True
-    write_checkpoints: False
+    write_checkpoints: True
     write_hdf5_timeseries: False
     write_velocity: 'tentative'     # update or tentative
 
 boundary_conditions:
     - 
-        id: 1
+        id: 2
         type: 'dirichlet'
         value: ['U','0']
         parameters:
-            U: 1
+            U: 0.1
     - 
-        id: 2
+        id: 1
         type: 'dirichlet'
         value: ['0','0']
     - 
@@ -58,7 +58,7 @@ windkessel:
     implicit: False
 
 fem:
-    velocity_space: p1  # p1 p1b/p1+ p2
+    velocity_space: p2  # p1 p1b/p1+ p2
     pressure_space: p1  # p1 p0/dg0 dg1
     DC_in_update: True
     PEN_in_update: False

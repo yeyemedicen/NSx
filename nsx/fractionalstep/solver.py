@@ -34,9 +34,9 @@ from ..logger.logger import LoggerBase
 from pathlib import Path
 
 from packaging.version import Version as _V
+
 if _V(dolfinx.__version__) < _V('0.7'):
     raise Exception('DOLFINx version 0.7 or higher required!')
-
 
 def rank0(func):
     ''' Rank 0 decorator: decorated function "does nothing" if rank > 0 '''
@@ -44,7 +44,6 @@ def rank0(func):
         if MPI.COMM_WORLD.rank == 0:
             func(*args, **kwargs)
     return inner
-
 
 def _assemble_mat(form, bcs=None, mat=None):
     ''' Assemble bilinear UFL form into PETSc.Mat.
@@ -66,7 +65,6 @@ def _assemble_mat(form, bcs=None, mat=None):
     mat.assemble()
     return mat
 
-
 def _assemble_vec(form):
     ''' Assemble linear UFL form into PETSc.Vec. '''
     result = assemble_vector(fem_form(form))
@@ -74,20 +72,17 @@ def _assemble_vec(form):
                        mode=PETSc.ScatterMode.REVERSE)
     return result
 
-
 def _mat_vec(A, x):
     ''' Compute y = A * x, returning a new PETSc.Vec. '''
     y = A.createVecLeft()
     A.mult(x, y)
     return y
 
-
 def _apply_dbc_to_mat(mat, bcs, diag=1.0):
     ''' Zero rows/cols for DirichletBC DOFs and set diagonal to diag. '''
     for bc in bcs:
         dofs = bc.dof_indices()[0]
         mat.zeroRowsColumnsLocal(dofs, diag)
-
 
 def _zero_mat_rows(mat, bcs):
     ''' Zero rows of PETSc.Mat corresponding to DirichletBC DOFs. '''
@@ -366,22 +361,28 @@ class Solver(LoggerBase):
 
         # check if restart path is checkpoint path and backup
         restart_path = Path(io['restart']['path'])
-        try:
-            if self._using_ale:
-                restart_path.joinpath('d.h5').resolve()
-            restart_path.joinpath('u.h5').resolve()
-            restart_path.joinpath('p.h5').resolve()
-        except FileNotFoundError:
-            raise
+        w_path = restart_path / 'w.h5'
+        if not w_path.exists():
+            raise FileNotFoundError(
+                'Checkpoint file not found: {}'.format(w_path))
+        if self._using_ale and not (restart_path / 'd.h5').exists():
+            raise FileNotFoundError(
+                'ALE checkpoint not found: {}'.format(restart_path / 'd.h5'))
 
-        comm = self.u.function_space.mesh.comm
-        t_u = inout.read_HDF5_data(comm, str(restart_path.joinpath('u.h5')),
-                                   self.u, '/u')
-        inout.read_HDF5_data(comm, str(restart_path.joinpath('p.h5')),
-                             self.p, '/p')
+        import h5py
+        w_file = restart_path / 'w.h5'
+        with h5py.File(str(w_file), 'r') as f:
+            self.u.x.array[:] = f['u'][:]
+            self.p.x.array[:] = f['p'][:]
+            t_u = float(f.attrs.get('t', 0.0))
+        self.u.x.scatter_forward()
+        self.p.x.scatter_forward()
+
         if self._using_ale:
-            inout.read_HDF5_data(comm, str(restart_path.joinpath('d.h5')),
-                                self.d, '/d')
+            with h5py.File(str(restart_path / 'd.h5'), 'r') as f:
+                self.d.x.array[:] = f['d'][:]
+            self.d.x.scatter_forward()
+
         assert np.allclose(t_u, io['restart']['time'])
 
         # self.t is time of first computed time step
@@ -467,7 +468,8 @@ class Solver(LoggerBase):
             # self.logger.debug('|d| = {:.4e}'.format(norm(self.d)))
 
         self.solve_tentative_velocity()
-        #self.logger.debug('|u_ten| = {:.4e}'.format(norm(self.u)))
+        norm_u = np.sqrt(fem.assemble_scalar(fem.form(ufl.inner(self.u, self.u) * ufl.dx)))
+        self.logger.info('|u_ten| = {:.4e}'.format(norm_u))
 
         if self._using_wk:
             self.solve_windkessel()
@@ -1619,7 +1621,6 @@ class Solver(LoggerBase):
                 # start with different previous velocity
                 self.u0_mapdd_lst[i].x.array[:] = self.u0_lst[i].x.array
 
-
             if A_robin:
                 _apply_dbc_to_mat(A_robin, self.bc_dict['u']['dirichlet'][i])
                 apply_lifting(bu_i, [fem_form(self.forms['u']['mass'])],
@@ -2245,22 +2246,49 @@ class Solver(LoggerBase):
             t = self.t
 
         comm = self.u.function_space.mesh.comm
+        mesh = self.u.function_space.mesh
         write_path = self.options['io']['write_path']
         if (not hasattr(self, '_xdmf_u') or self._xdmf_u is None):
             import os
             os.makedirs(write_path, exist_ok=True)
             self._xdmf_u = XDMFFile(comm, write_path + '/u.xdmf', 'w')
-            self._xdmf_u.write_mesh(self.u.function_space.mesh)
+            self._xdmf_u.write_mesh(mesh)
             self._xdmf_p = XDMFFile(comm, write_path + '/p.xdmf', 'w')
             self._xdmf_p.write_mesh(self.p.function_space.mesh)
+
+            # For velocity elements of degree > 1, ParaView requires P1
+            # interpolation — XDMF stores data at geometry (P1) nodes only.
+            vel_space = self.options['fem']['velocity_space'].lower().strip()
+            if vel_space == 'p1':
+                self._u_vis = None
+            else:
+                self._u_vis = Function(
+                    functionspace(mesh, ('Lagrange', 1, (self.ndim,))),
+                    name='u')
+
+            # Same for pressure spaces that are not nodal P1.
+            pres_space = self.options['fem']['pressure_space'].lower().strip()
+            if pres_space == 'p1':
+                self._p_vis = None
+            else:
+                self._p_vis = Function(
+                    functionspace(mesh, ('Lagrange', 1)), name='p')
 
         if self._using_ale:
             self._xdmf_u.write_function(self.d, float(t))
             self._xdmf_u.write_function(self.upd, float(t))
         else:
-            self._xdmf_u.write_function(self.u, float(t))
+            u_write = self.u
+            if self._u_vis is not None:
+                self._u_vis.interpolate(self.u)
+                u_write = self._u_vis
+            self._xdmf_u.write_function(u_write, float(t))
 
-        self._xdmf_p.write_function(self.p, float(t))
+        p_write = self.p
+        if self._p_vis is not None:
+            self._p_vis.interpolate(self.p)
+            p_write = self._p_vis
+        self._xdmf_p.write_function(p_write, float(t))
 
     def write_timeseries(self):
         ''' Write solution to HDF5 TimeSeries, initialize on first call.  '''
@@ -2287,7 +2315,12 @@ class Solver(LoggerBase):
         self._hdf5_ts_p.store(self.p.x.petsc_vec, float(self.t))
 
     def write_checkpoint(self, i, update=False):
-        ''' Write HDF5 checkpoint of u, p to <write_path>/checkpoints folder.
+        ''' Write checkpoint of u, p to <write_path>/checkpoint/<i>/w.h5.
+
+        Both fields are stored together in a single HDF5 file as raw DOF
+        arrays (/u, /p) plus a timestamp attribute, avoiding any split-order
+        ambiguity that arises when reconstructing from a mixed-space function.
+        ALE displacement is written separately to d.h5.
 
         Args:
             i       (int)  iteration count
@@ -2296,29 +2329,24 @@ class Solver(LoggerBase):
         if not self.options['io']['write_checkpoints']:
             return
 
-        path = (self.options['io']['write_path']
-                + '/checkpoint/{i}/'.format(i=i))
+        import h5py, os
+        path = self.options['io']['write_path'] + '/checkpoint/{i}/'.format(i=i)
+        os.makedirs(path, exist_ok=True)
+
+        u_out = (self.upd if (self._using_ale and update) else self.u)
+
+        with h5py.File(path + 'w.h5', 'w') as f:
+            f.create_dataset('u', data=u_out.x.array)
+            f.create_dataset('p', data=self.p.x.array)
+            f.attrs['t'] = float(self.t)
 
         if self._using_ale:
-            u = self.upd if update else self.u
-            comm = u.function_space.mesh.comm
-
-            inout.write_HDF5_data(comm, path + '/d.h5', self.d, '/d',
-                                    t=self.t)
-            inout.write_HDF5_data(comm, path + '/u.h5', u, '/u',
-                                    t=self.t)
-        else:
-            comm = self.u.function_space.mesh.comm
-
-            inout.write_HDF5_data(comm, path + '/u.h5', self.u, '/u',
-                                    t=self.t)
-
-        inout.write_HDF5_data(comm, path + '/p.h5', self.p, '/p', t=self.t)
+            with h5py.File(path + 'd.h5', 'w') as f:
+                f.create_dataset('d', data=self.d.x.array)
+                f.attrs['t'] = float(self.t)
 
         if self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS':
             self.logger.warn('Checkpointing for IPCS experimental!')
-            inout.write_HDF5_data(comm, path + 'u0.h5', self.u0, '/u',
-                                  t=self.t)
 
     def write_statistics(self):
         ''' Write number of linear iterations (KSP) and timings to files '''
@@ -2916,14 +2944,10 @@ class Solver(LoggerBase):
             # a little hacky, I admit
             return
 
-        if hasattr(self, '_xdmf_d'):
-            del self._xdmf_d
-        if hasattr(self, '_xdmf_u'):
-            del self._xdmf_u
-        if hasattr(self, '_xdmf_p'):
-            del self._xdmf_p
-        if hasattr(self, '_xdmf_du'):
-            del self._xdmf_du
+        for attr in ('_xdmf_d', '_xdmf_u', '_xdmf_p', '_xdmf_du',
+                     '_u_vis', '_p_vis'):
+            if hasattr(self, attr):
+                delattr(self, attr)
 
 
 # TODO: Extend coupled solver for the full ALE case!
@@ -3428,8 +3452,12 @@ class SolverCoupled(Solver):
             self.solver_u_ten.set_operator(A_robin)
 
         else:
-            self.solver_u_ten.set_operator(A)
+            _apply_dbc_to_mat(A, self.bc_dict['u']['dirichlet'])
+            apply_lifting(bu, [fem_form(self.forms['u']['mass'])],
+                          [self.bc_dict['u']['dirichlet']])
             set_bc(bu, self.bc_dict['u']['dirichlet'])
+            self.solver_u_ten.set_operator(A)
+
 
         self.solver_u_ten.solve(self.u.x.petsc_vec, bu)
 
@@ -3486,19 +3514,6 @@ class SolverCoupled(Solver):
         self.residuals_ksp['u_upd'].append(self.solver_u_ten.residuals)
 
         timer.stop()
-
-    # def update_velocity_bcs(self):
-    #     ''' Update time dependent boundary conditions. '''
-    #     for bc in self.bc_dict['u']['time_bcs']:
-    #         bc['expression'].t = float(self.t)
-
-    #         if utils.is_enriched(self.u.function_space):
-    #             V = self.u.function_space
-    #             bcs = self.bc_dict['u']['dirichlet']
-    #             bcs[bcs.index(bc['id'])] = DirichletBC(
-    #                 V, project(bc['expression'], V), self.bnds,
-    #                 bc['id']
-    #             )
 
 
 class PETScSolver(LoggerBase):

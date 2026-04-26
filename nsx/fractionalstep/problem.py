@@ -157,8 +157,7 @@ class Problem(LoggerBase):
             self._using_ale = True
         else:
             self._using_ale = False
-
-        
+     
     def setup_logger(self):
         ''' Create logging File Handler '''
         MPI.COMM_WORLD.Barrier()
@@ -887,7 +886,7 @@ class BoundaryConditions(LoggerBase):
         self.facet_tags = problem.facet_tags
         self.bnds = problem.bnds   # alias kept for compatibility
         self.ndim = self.mesh.topology.dim
-        self.ds = problem.ds
+        self.ds = ufl.Measure('ds', domain=self.mesh, subdomain_data=self.facet_tags)
 
         self.u_lst = problem.u_lst
         self.u0_lst = problem.u0_lst
@@ -1092,7 +1091,7 @@ class BoundaryConditions(LoggerBase):
                     pass
 
                 facets = self.facet_tags.find(bc['id'])
-                if self.D.num_sub_elements > 0:
+                if self.D.element.num_sub_elements > 0:
                     D_sub, _ = self.D.sub(i).collapse()
                     dofs = locate_dofs_topological(
                         (self.D.sub(i), D_sub), self.mesh.topology.dim - 1, facets)
@@ -1157,7 +1156,7 @@ class BoundaryConditions(LoggerBase):
                 for i in range(self.ndim):
                     expr = Function(self.Vi)
 
-                    if self.Vi.num_sub_elements > 0:
+                    if self.Vi.element.num_sub_elements > 0:
                         Vi_sub, _ = self.Vi.sub(i).collapse()
                         dofs = locate_dofs_topological(
                             (self.Vi.sub(i), Vi_sub),
@@ -1229,7 +1228,7 @@ class BoundaryConditions(LoggerBase):
                     pass
 
                 facets = self.facet_tags.find(bc['id'])
-                if self.Vi.num_sub_elements > 0:
+                if self.Vi.element.num_sub_elements > 0:
                     Vi_sub, _ = self.Vi.sub(i).collapse()
                     dofs = locate_dofs_topological(
                         (self.Vi.sub(i), Vi_sub),
