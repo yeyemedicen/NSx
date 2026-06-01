@@ -31,6 +31,37 @@ from petsc4py import PETSc
 from common import inout, utils
 
 
+def _compute_inlet_local_frame(inlet_coords):
+    """Compute an orthonormal local frame for an inlet face via SVD.
+
+    Works for any inlet orientation in 2D or 3D.  For 2D meshes DOLFINx
+    stores z=0, so the third singular value is ~0 — callers should guard
+    against R2 < eps before using t2.
+
+    Parameters
+    ----------
+    inlet_coords : (N, 3) array of inlet DOF positions.
+
+    Returns
+    -------
+    centroid : (3,) centroid of the inlet point cloud
+    t1       : (3,) principal tangent (max variance)
+    t2       : (3,) secondary tangent (mid variance; ~zero for 2-D meshes)
+    n_hat    : (3,) unit normal (min variance; arbitrary sign — caller orients)
+    R1       : half-extent along t1
+    R2       : half-extent along t2 (≈ 0 for 2-D meshes)
+    """
+    centroid = inlet_coords.mean(axis=0)
+    centered = inlet_coords - centroid
+    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+    t1, t2, n_hat = Vt[0], Vt[1], Vt[2]
+    s1 = centered @ t1
+    s2 = centered @ t2
+    R1 = (s1.max() - s1.min()) / 2.0
+    R2 = (s2.max() - s2.min()) / 2.0
+    return centroid, t1, t2, n_hat, R1, R2
+
+
 def _dof_count(V):
     ''' Global DOF count for a FunctionSpace. '''
     return V.dofmap.index_map.size_global * V.dofmap.index_map_bs
@@ -1022,6 +1053,8 @@ class BoundaryConditions(LoggerBase):
                 self._inflow_pinns_profile(bc)
             elif bc['type'] == 'mapdd':
                 self._mapdd(bc)
+            elif bc['type'] == 'parable':
+                self._parable(bc)
             else:
                 raise Exception('Unknown velocity BC at boundary {}'.
                                 format(bc['id']))
@@ -1444,6 +1477,141 @@ class BoundaryConditions(LoggerBase):
         a_lhs += prm['l']*mu*dot(gradu_t,gradv_t)*self.ds(bc['id'])
         a_lhs += prm['l']*rho*k*ui*vi*self.ds(bc['id'])
         self.bc_dict['u']['mapdd_lhs'].append(a_lhs)
+
+    def _parable(self, bc):
+        '''Parabolic (paraboloid) fully-Dirichlet inlet BC.
+
+        The spatial shape is computed automatically from the inlet DOF
+        positions via SVD — no geometry assumptions or manual radius needed.
+        Works for any inlet orientation in 2-D and 3-D.
+
+        Parameters in bc dict
+        ---------------------
+        id       : boundary tag ID
+        U        : peak velocity at the centroid (float)
+        waveform : (optional) path to a CSV file with two columns (time, Q)
+                   where Q is the total volumetric flow rate at that time.
+                   Omit for a constant-in-time profile at amplitude U.
+        '''
+        if 'U' not in bc:
+            raise KeyError("'parable' BC requires parameter 'U' "
+                           "(peak velocity at the centroid)")
+
+        U = float(bc['U'])
+        _eps = 1e-12
+        fdim = self.ndim - 1
+        facets = self.facet_tags.find(bc['id'])
+
+        # --- inlet DOF coordinates ---
+        all_coords = self.Vi.tabulate_dof_coordinates()   # (total_dofs, 3)
+        dofs_Vi = locate_dofs_topological(self.Vi, fdim, facets)
+        inlet_coords = all_coords[dofs_Vi]                # (N_inlet, 3)
+        if len(inlet_coords) == 0:
+            raise RuntimeError(
+                'Parabolic BC: no DOFs found on boundary id={}'.format(bc['id']))
+
+        # --- SVD local frame ---
+        centroid, t1, t2, n_hat, R1, R2 = \
+            _compute_inlet_local_frame(inlet_coords)
+
+        # orient normal inward (towards mesh interior)
+        if np.dot(all_coords.mean(axis=0) - centroid, n_hat) < 0:
+            n_hat = -n_hat
+
+        self.logger.info(
+            'Parabolic BC bid={}: R1={:.4g}, R2={:.4g}, '
+            'n=[{:.3g},{:.3g},{:.3g}]'.format(bc['id'], R1, R2, *n_hat))
+
+        # --- spatial profile factory (returns scalar callable for Vi) ---
+        def _make_interp(comp, scale):
+            _c, _t1, _t2 = centroid, t1, t2
+            _n, _R1, _R2 = n_hat, R1, R2
+            _U, _s, _i = U, scale, comp
+            def _f(x):
+                pts = x.T - _c
+                profile = 1.0 - (pts @ _t1 / _R1) ** 2
+                if _R2 > _eps:
+                    profile -= (pts @ _t2 / _R2) ** 2
+                return _U * _s * np.clip(profile, 0.0, None) * _n[_i]
+            return _f
+
+        # --- temporal waveform (CSV → Q(t) normalization) ---
+        reading_csv = False
+        inflow_func_t = None
+        Norm_fact = None
+
+        if ('waveform' in bc and isinstance(bc['waveform'], str)
+                and '.csv' in bc['waveform']):
+            reading_csv = True
+            time_data, flow_data = [], []
+            with open(bc['waveform']) as csv_file:
+                for row in csv.reader(csv_file, delimiter=','):
+                    time_data.append(float(row[0]))
+                    flow_data.append(float(row[1]))
+            inflow_func_t = interp1d(time_data, flow_data,
+                                     kind='cubic', fill_value='extrapolate')
+
+            # numerical normalization: total flow of the unit profile (U=1)
+            n_facet = FacetNormal(self.mesh)
+            u_tmp = Function(self.V)
+
+            def _unit_profile(x,
+                              _c=centroid, _t1=t1, _t2=t2, _n=n_hat,
+                              _R1=R1, _R2=R2, _nd=self.ndim):
+                pts = x.T - _c
+                prof = 1.0 - (pts @ _t1 / _R1) ** 2
+                if _R2 > _eps:
+                    prof -= (pts @ _t2 / _R2) ** 2
+                prof = np.clip(prof, 0.0, None)
+                vals = np.zeros((_nd, x.shape[1]))
+                for k in range(_nd):
+                    vals[k] = prof * _n[k]
+                return vals
+
+            u_tmp.interpolate(_unit_profile)
+            Norm_fact = abs(self.mesh.comm.allreduce(
+                assemble_scalar(
+                    fem_form(dot(u_tmp, n_facet) * self.ds(bc['id']))),
+                op=MPI.SUM))
+            if Norm_fact < _eps:
+                raise RuntimeError(
+                    'Parabolic BC bid={}: unit-flow Norm_fact ≈ 0 ({:.2e}). '
+                    'Check boundary id.'.format(bc['id'], Norm_fact))
+
+            t0_scale = inflow_func_t(0.0) / Norm_fact
+        else:
+            t0_scale = 1.0
+
+        # --- per-component Functions and DirichletBCs ---
+        parable_funcs = []
+        for i in range(self.ndim):
+            func_i = Function(self.Vi)
+            func_i.interpolate(_make_interp(i, t0_scale))
+
+            if self.Vi.element.num_sub_elements > 0:
+                Vi_sub, _ = self.Vi.sub(i).collapse()
+                dofs_i = locate_dofs_topological(
+                    (self.Vi.sub(i), Vi_sub), fdim, facets)
+                dbc_i = dirichletbc(func_i, dofs_i, self.Vi.sub(i))
+            else:
+                dofs_i = locate_dofs_topological(self.Vi, fdim, facets)
+                dbc_i = dirichletbc(func_i, dofs_i, self.Vi)
+
+            self.bc_dict['u']['dirichlet'][i].append(dbc_i)
+            parable_funcs.append(func_i)
+
+        # --- register for time updates (CSV waveform only) ---
+        if reading_csv:
+            self.bc_dict['u']['dbc_expressions'][('parable', bc['id'])] = {
+                'parable_funcs': parable_funcs,
+                'parable_waveform': inflow_func_t,
+                'Norm_fact': Norm_fact,
+                'centroid': centroid,
+                't1': t1, 't2': t2, 'n': n_hat,
+                'R1': R1, 'R2': R2, 'U': U,
+                'id': bc['id'],
+            }
+    
 
     def _windkessel(self, bc):
         ''' Create Windkessel pressure BC.

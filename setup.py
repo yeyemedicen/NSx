@@ -1,25 +1,16 @@
 import os
-from distutils.core import setup
+from setuptools import setup
 
 from nsx import __version__
 
-'''
-    Install with
-        $ pip install --user
-    or
-        $ pip install -e . --user
-    for an editable development build (no need to reinstall package after
-    modifications).
-'''
-
 here = os.path.abspath(os.path.dirname(__file__))
 
-with open(os.path.join(here, 'README.rst'), encoding='utf-8') as f:
-    long_description = f.read()
+readme_path = os.path.join(here, 'README.rst')
+long_description = open(readme_path, encoding='utf-8').read() if os.path.exists(readme_path) else ''
 
 setup(
-    name='navierstokes',
-    packages=['navierstokes'],
+    name='nsx',
+    packages=['nsx'],
     version=__version__,
     description='Navier-Stokes FEM solver',
     long_description=long_description,

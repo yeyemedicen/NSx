@@ -1919,6 +1919,21 @@ class Solver(LoggerBase):
                 dict_['uprofile'][0].x.array[:] = dict_['pinns_data']['ux'].item()[self.it-1][:,0]
                 dict_['uprofile'][1].x.array[:] = dict_['pinns_data']['uy'].item()[self.it-1][:,0]
                 dict_['uprofile'][2].x.array[:] = dict_['pinns_data']['uz'].item()[self.it-1][:,0]
+            elif 'parable_funcs' in dict_:
+                _eps = 1e-12
+                scale = dict_['parable_waveform'](self.t) / dict_['Norm_fact']
+                c, t1, t2 = dict_['centroid'], dict_['t1'], dict_['t2']
+                n_hat = dict_['n']
+                R1, R2, U = dict_['R1'], dict_['R2'], dict_['U']
+                for i, func_i in enumerate(dict_['parable_funcs']):
+                    def _interp(x, _i=i, _c=c, _t1=t1, _t2=t2, _n=n_hat,
+                                _R1=R1, _R2=R2, _U=U, _s=scale, _e=_eps):
+                        pts = x.T - _c
+                        profile = 1.0 - (pts @ _t1 / _R1) ** 2
+                        if _R2 > _e:
+                            profile -= (pts @ _t2 / _R2) ** 2
+                        return _U * _s * np.clip(profile, 0.0, None) * _n[_i]
+                    func_i.interpolate(_interp)
             else:
                 if 't' in expr.user_parameters:
                     expr.t = float(self.t)
