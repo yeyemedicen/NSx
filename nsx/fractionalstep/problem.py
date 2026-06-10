@@ -184,7 +184,15 @@ class Problem(LoggerBase):
         self.options = inout.read_parameters(inputfile)
         self.ale = Problem.default_ale()
         if 'ale' in self.options.keys():
-            self.ale.update(self.options['ale'])
+            def _deep_merge_ale(base, override):
+                result = dict(base)
+                for k, v in override.items():
+                    if k in result and hasattr(result[k], 'items') and hasattr(v, 'items'):
+                        result[k] = _deep_merge_ale(result[k], v)
+                    else:
+                        result[k] = v
+                return result
+            self.ale = _deep_merge_ale(self.ale, self.options['ale'])
             self._using_ale = True
         else:
             self._using_ale = False
@@ -826,6 +834,7 @@ class Problem(LoggerBase):
         sd = SDParameter(self.options, self.mesh, mu, rho, k,
                          self._logging_filehandler)
         tau = sd.stabilization_parameter(u_conv, self.u_conv_assigned)
+        self._sd_param = sd   # stored so solver can call sd.update_tau() each step
 
         ui = TrialFunction(self.Vi)
         vi = TestFunction(self.Vi)
@@ -849,6 +858,7 @@ class Problem(LoggerBase):
         a_supg_convdiff = tau*dot(u_conv, grad(vi))*residual_convdiff*dx
 
         return {'supg_convdiff': a_supg_convdiff, 'supg_time': a_supg_time}
+
 
     # =========================================================================
     # Boundary conditions
@@ -1126,8 +1136,11 @@ class BoundaryConditions(LoggerBase):
                 facets = self.facet_tags.find(bc['id'])
                 if self.D.element.num_sub_elements > 0:
                     D_sub, _ = self.D.sub(i).collapse()
-                    dofs = locate_dofs_topological(
+                    dofs_pair = locate_dofs_topological(
                         (self.D.sub(i), D_sub), self.mesh.topology.dim - 1, facets)
+                    # DOLFINx 0.10 returns [dofs_in_sub, dofs_in_collapsed].
+                    # dirichletbc(Constant, ...) needs a 1-D array (sub-space DOFs).
+                    dofs = dofs_pair[0] if isinstance(dofs_pair, (list, tuple)) else dofs_pair
                     dbc = dirichletbc(val, dofs, self.D.sub(i))
                 else:
                     dofs = locate_dofs_topological(
@@ -1191,14 +1204,16 @@ class BoundaryConditions(LoggerBase):
 
                     if self.Vi.element.num_sub_elements > 0:
                         Vi_sub, _ = self.Vi.sub(i).collapse()
-                        dofs = locate_dofs_topological(
+                        dofs_pair = locate_dofs_topological(
                             (self.Vi.sub(i), Vi_sub),
                             self.mesh.topology.dim - 1, facets)
-                        dbc = dirichletbc(expr, dofs, self.Vi.sub(i))
+                        # DOLFINx 0.10: Function BC needs Sequence[ndarray] + V
+                        dbc = dirichletbc(expr, dofs_pair, self.Vi.sub(i))
                     else:
                         dofs = locate_dofs_topological(
                             self.Vi, self.mesh.topology.dim - 1, facets)
-                        dbc = dirichletbc(expr, dofs, self.Vi)
+                        # DOLFINx 0.10: dirichletbc(Function, dofs) — no V argument
+                        dbc = dirichletbc(expr, dofs)
 
                     self.bc_dict['u']['dirichlet'][i].append(dbc)
                     bc_key = (bc['id'], i)
@@ -1263,14 +1278,22 @@ class BoundaryConditions(LoggerBase):
                 facets = self.facet_tags.find(bc['id'])
                 if self.Vi.element.num_sub_elements > 0:
                     Vi_sub, _ = self.Vi.sub(i).collapse()
-                    dofs = locate_dofs_topological(
+                    dofs_pair = locate_dofs_topological(
                         (self.Vi.sub(i), Vi_sub),
                         self.mesh.topology.dim - 1, facets)
-                    dbc = dirichletbc(val, dofs, self.Vi.sub(i))
+                    if isinstance(val, fem.Function):
+                        dbc = dirichletbc(val, dofs_pair, self.Vi.sub(i))
+                    else:
+                        dofs = dofs_pair[0] if isinstance(dofs_pair, (list, tuple)) else dofs_pair
+                        dbc = dirichletbc(val, dofs, self.Vi.sub(i))
                 else:
                     dofs = locate_dofs_topological(
                         self.Vi, self.mesh.topology.dim - 1, facets)
-                    dbc = dirichletbc(val, dofs, self.Vi)
+                    if isinstance(val, fem.Function):
+                        # DOLFINx 0.10: Function BC infers space from Function itself
+                        dbc = dirichletbc(val, dofs)
+                    else:
+                        dbc = dirichletbc(val, dofs, self.Vi)
 
                 self.bc_dict['u']['dirichlet'][i].append(dbc)
 
@@ -1348,10 +1371,8 @@ class BoundaryConditions(LoggerBase):
         inout.read_HDF5_data(self.mesh.comm, bc['profile'], uprofile, 'u')
 
         elem = J*dot(inv(F).T*n, inv(F).T*n)
-        area = self.mesh.comm.allreduce(
-    assemble_scalar(fem_form(elem*self.ds(bc['id']))), op=MPI.SUM)
-        Norm_fact = abs(self.mesh.comm.allreduce(
-    assemble_scalar(fem_form(dot(uprofile,n)*self.ds(bc['id']))), op=MPI.SUM)/area)
+        area = self.mesh.comm.allreduce(assemble_scalar(fem_form(elem*self.ds(bc['id']))), op=MPI.SUM)
+        Norm_fact = abs(self.mesh.comm.allreduce(assemble_scalar(fem_form(dot(uprofile,n)*self.ds(bc['id']))), op=MPI.SUM)/area)
         ui = TrialFunction(self.Vi)
         vi = TestFunction(self.Vi)
         
@@ -1493,11 +1514,11 @@ class BoundaryConditions(LoggerBase):
                    where Q is the total volumetric flow rate at that time.
                    Omit for a constant-in-time profile at amplitude U.
         '''
-        if 'U' not in bc:
-            raise KeyError("'parable' BC requires parameter 'U' "
+        if 'U' not in bc['parameters']:
+            raise KeyError("'parable' BC requires 'parameters: U' "
                            "(peak velocity at the centroid)")
 
-        U = float(bc['U'])
+        U = float(bc['parameters']['U'])
         _eps = 1e-12
         fdim = self.ndim - 1
         facets = self.facet_tags.find(bc['id'])
@@ -1535,77 +1556,112 @@ class BoundaryConditions(LoggerBase):
                 return _U * _s * np.clip(profile, 0.0, None) * _n[_i]
             return _f
 
-        # --- temporal waveform (CSV → Q(t) normalization) ---
-        reading_csv = False
-        inflow_func_t = None
-        Norm_fact = None
+        # --- temporal waveform → unified scale_func(t) → float ---
+        # Reserved parameters not treated as expression variables:
+        _reserved = {'U', 'waveform'}
+        scale_func = None   # None means constant (no update needed)
 
-        if ('waveform' in bc and isinstance(bc['waveform'], str)
-                and '.csv' in bc['waveform']):
-            reading_csv = True
-            time_data, flow_data = [], []
-            with open(bc['waveform']) as csv_file:
-                for row in csv.reader(csv_file, delimiter=','):
-                    time_data.append(float(row[0]))
-                    flow_data.append(float(row[1]))
-            inflow_func_t = interp1d(time_data, flow_data,
-                                     kind='cubic', fill_value='extrapolate')
+        if 'waveform' in bc['parameters']:
+            waveform = bc['parameters']['waveform']
 
-            # numerical normalization: total flow of the unit profile (U=1)
-            n_facet = FacetNormal(self.mesh)
-            u_tmp = Function(self.V)
+            if isinstance(waveform, str) and waveform.endswith('.csv'):
+                # CSV mode: columns (time, Q_total); normalise by unit-profile flow
+                time_data, flow_data = [], []
+                with open(waveform) as csv_file:
+                    for row in csv.reader(csv_file, delimiter=','):
+                        time_data.append(float(row[0]))
+                        flow_data.append(float(row[1]))
+                _interp_csv = interp1d(time_data, flow_data,
+                                       kind='cubic', fill_value='extrapolate')
 
-            def _unit_profile(x,
-                              _c=centroid, _t1=t1, _t2=t2, _n=n_hat,
-                              _R1=R1, _R2=R2, _nd=self.ndim):
-                pts = x.T - _c
-                prof = 1.0 - (pts @ _t1 / _R1) ** 2
-                if _R2 > _eps:
-                    prof -= (pts @ _t2 / _R2) ** 2
-                prof = np.clip(prof, 0.0, None)
-                vals = np.zeros((_nd, x.shape[1]))
-                for k in range(_nd):
-                    vals[k] = prof * _n[k]
-                return vals
+                # numerical Norm_fact: total flow of the unit parabolic profile
+                n_facet = FacetNormal(self.mesh)
+                u_tmp = Function(self.V)
 
-            u_tmp.interpolate(_unit_profile)
-            Norm_fact = abs(self.mesh.comm.allreduce(
-                assemble_scalar(
-                    fem_form(dot(u_tmp, n_facet) * self.ds(bc['id']))),
-                op=MPI.SUM))
-            if Norm_fact < _eps:
-                raise RuntimeError(
-                    'Parabolic BC bid={}: unit-flow Norm_fact ≈ 0 ({:.2e}). '
-                    'Check boundary id.'.format(bc['id'], Norm_fact))
+                def _unit_profile(x,
+                                  _c=centroid, _t1=t1, _t2=t2, _n=n_hat,
+                                  _R1=R1, _R2=R2, _nd=self.ndim):
+                    pts = x.T - _c
+                    prof = 1.0 - (pts @ _t1 / _R1) ** 2
+                    if _R2 > _eps:
+                        prof -= (pts @ _t2 / _R2) ** 2
+                    prof = np.clip(prof, 0.0, None)
+                    vals = np.zeros((_nd, x.shape[1]))
+                    for k in range(_nd):
+                        vals[k] = prof * _n[k]
+                    return vals
 
-            t0_scale = inflow_func_t(0.0) / Norm_fact
-        else:
-            t0_scale = 1.0
+                u_tmp.interpolate(_unit_profile)
+                Norm_fact = abs(self.mesh.comm.allreduce(
+                    assemble_scalar(
+                        fem_form(dot(u_tmp, n_facet) * self.ds(bc['id']))),
+                    op=MPI.SUM))
+                if Norm_fact < _eps:
+                    raise RuntimeError(
+                        'Parabolic BC bid={}: unit-flow Norm_fact ≈ 0 ({:.2e}). '
+                        'Check boundary id.'.format(bc['id'], Norm_fact))
+
+                scale_func = lambda t, _f=_interp_csv, _n=Norm_fact: float(_f(t)) / _n
+                self.logger.info(
+                    'Parabolic BC bid={}: CSV waveform, Norm_fact={:.4g}'
+                    .format(bc['id'], Norm_fact))
+
+            elif isinstance(waveform, str):
+                # Expression mode: e.g. 'cos(w*t)'; extra bc parameters are
+                # substituted as named variables. 't' is reserved for time.
+                extra = {k: float(v) for k, v in bc['parameters'].items()
+                         if k not in _reserved}
+                if 't' in extra:
+                    raise KeyError(
+                        "'t' is reserved for simulation time and cannot be "
+                        "used as a waveform parameter in parable BC "
+                        "bid={}".format(bc['id']))
+                _expr_str = waveform
+                _math_ns = {
+                    'sin': np.sin,  'cos': np.cos,  'tan': np.tan,
+                    'exp': np.exp,  'log': np.log,  'sqrt': np.sqrt,
+                    'abs': np.abs,  'tanh': np.tanh, 'pi': np.pi,
+                }
+                def scale_func(t, _e=_expr_str, _p=extra, _m=_math_ns):
+                    ns = {'t': float(t)}
+                    ns.update(_p)
+                    ns.update(_m)
+                    return float(eval(_e, {"__builtins__": {}}, ns))
+
+                self.logger.info(
+                    'Parabolic BC bid={}: expression waveform "{}", '
+                    'params={}'.format(bc['id'], waveform, extra))
+
+        t0_scale = scale_func(0.0) if scale_func is not None else 1.0
 
         # --- per-component Functions and DirichletBCs ---
+        # DOLFINx dirichletbc overloads for a Function:
+        #   (Function, ndarray)                        – scalar/non-sub space
+        #   (Function, Sequence[ndarray], SubSpace)    – enriched/sub space
         parable_funcs = []
+        enriched = self.Vi.element.num_sub_elements > 0
         for i in range(self.ndim):
-            func_i = Function(self.Vi)
-            func_i.interpolate(_make_interp(i, t0_scale))
-
-            if self.Vi.element.num_sub_elements > 0:
+            if enriched:
                 Vi_sub, _ = self.Vi.sub(i).collapse()
+                func_i = Function(Vi_sub)
+                func_i.interpolate(_make_interp(i, t0_scale))
                 dofs_i = locate_dofs_topological(
                     (self.Vi.sub(i), Vi_sub), fdim, facets)
                 dbc_i = dirichletbc(func_i, dofs_i, self.Vi.sub(i))
             else:
+                func_i = Function(self.Vi)
+                func_i.interpolate(_make_interp(i, t0_scale))
                 dofs_i = locate_dofs_topological(self.Vi, fdim, facets)
-                dbc_i = dirichletbc(func_i, dofs_i, self.Vi)
+                dbc_i = dirichletbc(func_i, dofs_i)
 
             self.bc_dict['u']['dirichlet'][i].append(dbc_i)
             parable_funcs.append(func_i)
 
-        # --- register for time updates (CSV waveform only) ---
-        if reading_csv:
+        # --- register for time updates (any time-dependent waveform) ---
+        if scale_func is not None:
             self.bc_dict['u']['dbc_expressions'][('parable', bc['id'])] = {
                 'parable_funcs': parable_funcs,
-                'parable_waveform': inflow_func_t,
-                'Norm_fact': Norm_fact,
+                'parable_scale_func': scale_func,
                 'centroid': centroid,
                 't1': t1, 't2': t2, 'n': n_hat,
                 'R1': R1, 'R2': R2, 'U': U,

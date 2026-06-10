@@ -79,10 +79,19 @@ def _mat_vec(A, x):
     return y
 
 def _apply_dbc_to_mat(mat, bcs, diag=1.0):
-    ''' Zero rows/cols for DirichletBC DOFs and set diagonal to diag. '''
+    ''' Zero rows AND cols for DirichletBC DOFs and set diagonal to diag.
+    Use only for pressure matrices (symmetric treatment). '''
     for bc in bcs:
         dofs = bc.dof_indices()[0]
         mat.zeroRowsColumnsLocal(dofs, diag)
+
+def _apply_dbc_rows_to_mat(mat, bcs, diag=1.0):
+    ''' Zero rows only for DirichletBC DOFs and set diagonal to diag.
+    Matches legacy FEniCS bc.apply(A) behaviour for velocity matrices:
+    columns are left intact so no apply_lifting is needed on the RHS. '''
+    for bc in bcs:
+        dofs = bc.dof_indices()[0]
+        mat.zeroRowsLocal(dofs, diag)
 
 def _zero_mat_rows(mat, bcs):
     ''' Zero rows of PETSc.Mat corresponding to DirichletBC DOFs. '''
@@ -151,6 +160,9 @@ class Solver(LoggerBase):
 
         # DOF block size for split/merge between V and Vi
         self._bs = problem.V.dofmap.index_map_bs
+
+        # Element-constant SUPG tau updater (None if SUPG disabled or pointwise)
+        self._sd_param = getattr(problem, '_sd_param', None)
 
         # Correction velocity increments
         self.du = [Function(problem.Vi, name='du_i') for i in range(self.ndim)]
@@ -1366,7 +1378,7 @@ class Solver(LoggerBase):
         Aupd = self.mat['u']['mass'].copy()
         if self._applying_dc_on_update:
             if self.bc_dict['u']['same_dbc_boundaries']:
-                _apply_dbc_to_mat(Aupd, self.bc_dict['u']['dirichlet'][0])
+                _apply_dbc_rows_to_mat(Aupd, self.bc_dict['u']['dirichlet'][0])
         self.solver_u_upd.set_operator(Aupd)
 
         self.iterations_ksp.update({
@@ -1446,7 +1458,11 @@ class Solver(LoggerBase):
                                             self.u0_lst):
                         uci.x.array[:] = 2*ui.x.array - u0i.x.array
                     self._merge_lst_to_vec(self._u_tmp_lst, self.u_conv_assigned)
-        
+
+        # Refresh element-constant SUPG tau from the current u_conv_assigned
+        if self._sd_param is not None:
+            self._sd_param.update_tau()
+
         A = self.mat['u']['conv']
         _assemble_mat(self.forms['u']['conv'], mat=A)
 
@@ -1484,7 +1500,7 @@ class Solver(LoggerBase):
             self.mat['u']['rhs'].axpy(1., self.mat['u']['mass'])
 
         if self.bc_dict['u']['same_dbc_boundaries'] and not self._using_fnv_semi_implicit:
-            _apply_dbc_to_mat(A, self.bc_dict['u']['dirichlet'][0])
+            _apply_dbc_rows_to_mat(A, self.bc_dict['u']['dirichlet'][0])
 
         return A
 
@@ -1651,9 +1667,13 @@ class Solver(LoggerBase):
                 self.solver_u_ten.set_operator(A_robin)
             elif A_fnv:
                 _apply_dbc_to_mat(A_fnv, self.bc_dict['u']['dirichlet'][i])
+                apply_lifting(bu_i, [fem_form(self.forms['u']['mass'])],
+                              [self.bc_dict['u']['dirichlet'][i]])
+                set_bc(bu_i, self.bc_dict['u']['dirichlet'][i])
                 self.solver_u_ten.set_operator(A_fnv)
-
-            if self.bc_dict['u']['same_dbc_boundaries']:
+            elif self.bc_dict['u']['same_dbc_boundaries']:
+                # A already has DBC applied (zeroRowsColumns) from
+                # assemble_tentative_velocity; lifting is a no-op.
                 set_bc(bu_i, self.bc_dict['u']['dirichlet'][i])
             else:
                 A_cpy = A.copy()
@@ -1708,6 +1728,9 @@ class Solver(LoggerBase):
             self.vec['p']['windkessel_rhs'] = _assemble_vec(self.forms['p']['windkessel_rhs'])
             bp.axpy(1.0, self.vec['p']['windkessel_rhs'])
 
+
+        apply_lifting(bp, [fem_form(self.forms['p']['laplacian'])],
+                      [self.bc_dict['p']['dirichlet']])
         set_bc(bp, self.bc_dict['p']['dirichlet'])
 
         if self._using_wk and not self.wk['implicit']:
@@ -1725,6 +1748,7 @@ class Solver(LoggerBase):
             A = self.mat['p']['laplacian'].copy()
             _assemble_mat(self.forms['p']['laplacian'], mat=A)
             _apply_dbc_to_mat(A, self.bc_dict['p']['dirichlet'])
+
             if self._using_wk:
                 if not self.wk['implicit']:
                     _apply_dbc_to_mat(A, self.bc_dict['p']['windkessel']['dirichlet'])
@@ -1864,6 +1888,14 @@ class Solver(LoggerBase):
             else:
                 self.upd_lst[i].x.array[:] = u_i.x.array
                 self.upd_lst[i].x.petsc_vec.axpy(1.0, self.du[i].x.petsc_vec)
+                # ALE: advance u_lst to the corrected (divergence-free)
+                # velocity so the next-step BDF2 extrapolation
+                # u_conv = 2*u_n - u_{n-1} uses physical velocities, not
+                # stale tentative u*.  Without this, when save/restore snapshots
+                # u_lst and line 1656 writes u0_lst ← u_lst, the BDF2 history
+                # is corrupted with stale tentative velocities.
+                u_i.x.array[:] = self.upd_lst[i].x.array
+                u_i.x.scatter_forward()
 
             # [bc.apply(u_i.vector()) for bc in
             #  self.bc_dict['u']['dirichlet'][i]]
@@ -1882,6 +1914,11 @@ class Solver(LoggerBase):
                 self._merge_lst_to_vec(self.u_lst, self.u)
             else:
                 self._merge_lst_to_vec(self.upd_lst, self.upd)
+                # ALE: self.u must reflect the corrected (divergence-free)
+                # velocity so ProblemCoupled's u_conv = 2*self.u - self.u0 and
+                # JellyFSI traction computation use the physical u_{n+1}.
+                # u_lst was already advanced to the corrected velocity above.
+                self._merge_lst_to_vec(self.u_lst, self.u)
 
     def pressure_increment(self):
         ''' IPCS: increment pressure. '''
@@ -1920,11 +1957,11 @@ class Solver(LoggerBase):
                 dict_['uprofile'][1].x.array[:] = dict_['pinns_data']['uy'].item()[self.it-1][:,0]
                 dict_['uprofile'][2].x.array[:] = dict_['pinns_data']['uz'].item()[self.it-1][:,0]
             elif 'parable_funcs' in dict_:
-                _eps = 1e-12
-                scale = dict_['parable_waveform'](self.t) / dict_['Norm_fact']
+                scale = dict_['parable_scale_func'](self.t)
                 c, t1, t2 = dict_['centroid'], dict_['t1'], dict_['t2']
                 n_hat = dict_['n']
                 R1, R2, U = dict_['R1'], dict_['R2'], dict_['U']
+                _eps = 1e-12
                 for i, func_i in enumerate(dict_['parable_funcs']):
                     def _interp(x, _i=i, _c=c, _t1=t1, _t2=t2, _n=n_hat,
                                 _R1=R1, _R2=R2, _U=U, _s=scale, _e=_eps):
@@ -2203,24 +2240,32 @@ class Solver(LoggerBase):
         inout.read_HDF5_data(comm, path + '/u.h5', self.d_s, '/u')
         inout.read_HDF5_data(comm, path + '/v.h5', self.v_s, '/u')
 
+    @staticmethod
+    def _make_interp_data(V_to, V_from):
+        ''' Build DOLFINx 0.10 non-matching mesh interpolation data. '''
+        import numpy as np
+        from dolfinx.fem import create_interpolation_data
+        cells = np.arange(
+            V_to.mesh.topology.index_map(V_to.mesh.topology.dim).size_local,
+            dtype=np.int32)
+        return cells, create_interpolation_data(V_to, V_from, cells, padding=1e-14)
+
     def transfer_displacement(self, d_in, d_out):
         ''' Transfer displacement between FE spaces via DOLFINx interpolation. '''
         self.logger.debug('Transfer d between FE spaces.')
         if not hasattr(self, '_interp_data_d'):
-            from dolfinx.fem import create_nonmatching_meshes_interpolation_data
-            self._interp_data_d = create_nonmatching_meshes_interpolation_data(
+            self._interp_cells_d, self._interp_data_d = self._make_interp_data(
                 d_out.function_space, d_in.function_space)
-        d_out.interpolate(d_in, nmm_interpolation_data=self._interp_data_d)
+        d_out.interpolate_nonmatching(d_in, self._interp_cells_d, self._interp_data_d)
         d_out.x.scatter_forward()
 
     def transfer_velocity(self, u_in, u_out):
         ''' Transfer velocity between FE spaces via DOLFINx interpolation. '''
         self.logger.debug('Transfer u between FE spaces.')
         if not hasattr(self, '_interp_data_u'):
-            from dolfinx.fem import create_nonmatching_meshes_interpolation_data
-            self._interp_data_u = create_nonmatching_meshes_interpolation_data(
+            self._interp_cells_u, self._interp_data_u = self._make_interp_data(
                 u_out.function_space, u_in.function_space)
-        u_out.interpolate(u_in, nmm_interpolation_data=self._interp_data_u)
+        u_out.interpolate_nonmatching(u_in, self._interp_cells_u, self._interp_data_u)
         u_out.x.scatter_forward()
 
     @property
@@ -3390,7 +3435,7 @@ class SolverCoupled(Solver):
             A.axpy(1., self.mat['u']['rhs'])
             self.mat['u']['rhs'].axpy(1., self.mat['u']['mass'])
 
-        _apply_dbc_to_mat(A, self.bc_dict['u']['dirichlet'])
+        _apply_dbc_rows_to_mat(A, self.bc_dict['u']['dirichlet'])
 
         return A
 
@@ -3483,16 +3528,12 @@ class SolverCoupled(Solver):
             self.u0.x.array[:] = self.u.x.array
 
         if A_robin:
-            _apply_dbc_to_mat(A_robin, self.bc_dict['u']['dirichlet'])
-            apply_lifting(bu, [fem_form(self.forms['u']['mass'])],
-                          [self.bc_dict['u']['dirichlet']])
+            _apply_dbc_rows_to_mat(A_robin, self.bc_dict['u']['dirichlet'])
             set_bc(bu, self.bc_dict['u']['dirichlet'])
             self.solver_u_ten.set_operator(A_robin)
 
         else:
-            _apply_dbc_to_mat(A, self.bc_dict['u']['dirichlet'])
-            apply_lifting(bu, [fem_form(self.forms['u']['mass'])],
-                          [self.bc_dict['u']['dirichlet']])
+            _apply_dbc_rows_to_mat(A, self.bc_dict['u']['dirichlet'])
             set_bc(bu, self.bc_dict['u']['dirichlet'])
             self.solver_u_ten.set_operator(A)
 

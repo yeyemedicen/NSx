@@ -39,6 +39,24 @@ class SDParameter(LoggerBase):
         self.mu = mu
         self.rho = rho
         self.k = k
+        self._tau_func = None   # DG0 Function for element-constant tau
+        self._tau_expr = None   # fem.Expression to interpolate into _tau_func
+
+    def update_tau(self):
+        ''' Re-evaluate element-constant tau (call before each conv assembly). '''
+        if self._tau_func is not None:
+            self._tau_func.interpolate(self._tau_expr)
+
+    def _make_element_constant_tau(self, tau_ufl):
+        ''' Project UFL tau expression to DG0 (piecewise-constant per element),
+        matching legacy FEniCS CompiledExpression with DG0 element. '''
+        from dolfinx.fem import functionspace, Function, Expression as FEMExpression
+        V_dg0 = functionspace(self.mesh, ("DG", 0))
+        self._tau_func = Function(V_dg0)
+        self._tau_expr = FEMExpression(tau_ufl,
+                                       V_dg0.element.interpolation_points)
+        self.update_tau()
+        return self._tau_func
 
     def stabilization_parameter(self, u_conv, u_conv_assigned=None):
         ''' SD stabilization parameter.
@@ -78,6 +96,7 @@ class SDParameter(LoggerBase):
         rho = self.rho
         mu = self.mu
         k = self.k
+        elem_const = bool(opt.get('parameter_element_constant', False))
 
         cinv_default = 30. if opt['length_scale'] == 'metric' else 12.
         Cinv = _C(self.mesh, opt['Cinv']) if isinstance(opt['Cinv'], (int, float)) \
@@ -85,7 +104,7 @@ class SDParameter(LoggerBase):
 
         if opt['length_scale'] == 'metric':
             G = _metric_tensor(self.mesh)
-            tau = 1. / sqrt(
+            tau_ufl = 1. / sqrt(
                 (alpha * k)**2
                 + dot(u_conv_assigned, G * u_conv_assigned)
                 + Cinv * (mu / rho)**2 * inner(G, G)
@@ -94,7 +113,7 @@ class SDParameter(LoggerBase):
         elif opt['length_scale'] == 'max':
             h = ufl.MaxCellEdgeLength(self.mesh)
             u_norm2 = dot(u_conv_assigned, u_conv_assigned)
-            tau = 1. / sqrt(
+            tau_ufl = 1. / sqrt(
                 (alpha * k)**2
                 + (2. / h)**2 * u_norm2
                 + (Cinv * mu / rho / h**2)**2
@@ -103,7 +122,7 @@ class SDParameter(LoggerBase):
         else:
             h = CellDiameter(self.mesh)
             u_norm2 = dot(u_conv_assigned, u_conv_assigned)
-            tau = 1. / sqrt(
+            tau_ufl = 1. / sqrt(
                 (alpha * k)**2
                 + (2. / h)**2 * u_norm2
                 + (Cinv * mu / rho / h**2)**2
@@ -112,13 +131,17 @@ class SDParameter(LoggerBase):
 
         self.logger.info('SD parameter: shakib\n\tlength scale: {ls}\n'
                          '\tC_inv: {c}'.format(ls=len_scale, c=float(np.asarray(Cinv.value).flat[0])))
-        return tau
+
+        if elem_const:
+            return self._make_element_constant_tau(tau_ufl)
+        return tau_ufl
 
     def tau_standard(self, u_conv, u_conv_assigned):
         opt = self.options['fem']['stabilization']['streamline_diffusion']
         rho = self.rho
         mu = self.mu
         eps = 1e-10
+        elem_const = bool(opt.get('parameter_element_constant', False))
 
         if opt['length_scale'] == 'metric':
             G = _metric_tensor(self.mesh)
@@ -126,23 +149,26 @@ class SDParameter(LoggerBase):
             u_norm2 = dot(u_conv_assigned, u_conv_assigned)
             Pe = u_norm2 / (u_inner_metric + eps) * rho / mu
             xi = conditional(lt(Pe, 3.), Pe / 3., ufl.as_ufl(1.))
-            tau = conditional(gt(u_inner_metric, eps),
-                              xi / (u_inner_metric + eps),
-                              ufl.as_ufl(0.))
+            tau_ufl = conditional(gt(u_inner_metric, eps),
+                                  xi / (u_inner_metric + eps),
+                                  ufl.as_ufl(0.))
             len_scale = 'metric'
         else:
             h = CellDiameter(self.mesh)
             u_norm = sqrt(dot(u_conv_assigned, u_conv_assigned))
             Pe = 0.5 * u_norm * h * rho / mu
             xi = conditional(lt(Pe, 3.), Pe / 3., ufl.as_ufl(1.))
-            tau = conditional(gt(u_norm, eps),
-                              0.5 * h / (u_norm + eps) * xi,
-                              ufl.as_ufl(0.))
+            tau_ufl = conditional(gt(u_norm, eps),
+                                  0.5 * h / (u_norm + eps) * xi,
+                                  ufl.as_ufl(0.))
             len_scale = 'average'
 
         self.logger.info('SD parameter: standard\n\tlength scale: {ls}'
                          .format(ls=len_scale))
-        return tau
+
+        if elem_const:
+            return self._make_element_constant_tau(tau_ufl)
+        return tau_ufl
 
     def tau_klr(self, u_conv, u_conv_assigned):
         h = CellDiameter(self.mesh)
