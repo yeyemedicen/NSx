@@ -231,6 +231,9 @@ class Solver(LoggerBase):
             self.d_s = problem.d_s
             self.v_s = problem.v_s
 
+        # FSI semi-implicit projection coupling data (see form_pressure)
+        self.v_si = getattr(problem, 'v_si', None)
+
     def _init_mat_vec_storage(self):
         ''' Initialize dicts for assembled matrices and vectors. '''
         self.mat = {}
@@ -1722,6 +1725,12 @@ class Solver(LoggerBase):
             cf = 1.
         bp = _mat_vec(self.mat['p']['rhs_u'], self.u.x.petsc_vec)
         bp.scale(cf)
+
+        if self.forms['p'].get('fsi_si_rhs') is not None:
+            # FSI semi-implicit projection coupling: Neumann data
+            # rho*k*(u_tent - v_si)·n on the interface (see form_pressure).
+            # v_si changes every FSI sub-iteration — assemble fresh.
+            bp.axpy(1.0, _assemble_vec(self.forms['p']['fsi_si_rhs']))
 
         if self.vec['p']['rhs_const']:
             bp.axpy(1.0, self.vec['p']['rhs_const'])

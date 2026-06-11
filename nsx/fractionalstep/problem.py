@@ -603,6 +603,28 @@ class Problem(LoggerBase):
             ['dirichlet_forms_p'],
         })
 
+        # FSI semi-implicit projection coupling (Fernandez-Gerbeau-Grandmont;
+        # driven by JellyFSI, see jellyfsi/solver.py::_timestep_semi_implicit).
+        # The projection sub-step imposes the SOLID's interface normal
+        # velocity on the end-of-step velocity:
+        #     rho*k*(u^{n+1} - u_tent) + grad(phi) = 0,   div(u^{n+1}) = 0,
+        #     u^{n+1}.n = v_si.n   on ds(id)
+        # which adds Neumann data  dphi/dn = rho*k*(u_tent - v_si).n  to the
+        # pressure Poisson, i.e. the RHS boundary term
+        #     += rho*k*(u_tent - v_si).n_def q ds(id),   n_def = J F^{-T} N.
+        # v_si (fem.Function on V) is updated by the coupler every FSI
+        # sub-iteration; u_tent is self.u (holds the tentative velocity at
+        # pressure-solve time). Assembled fresh each solve in
+        # Solver.build_rhs_pressure().
+        # YAML:  fem: fsi_semi_implicit: {enabled: true, id: 5}
+        si = self.options['fem'].get('fsi_semi_implicit')
+        if si and si.get('enabled'):
+            n_si = FacetNormal(self.mesh)
+            nans_si = J*inv(F).T*n_si
+            self.v_si = Function(self.V, name='fsi_si_velocity')
+            self.forms['p']['fsi_si_rhs'] = (
+                k*rho*dot(self.u - self.v_si, nans_si)*q*self.ds(si['id']))
+
 
         if self._using_mapdd:
             ds = self.ds
