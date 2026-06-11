@@ -516,6 +516,14 @@ class Problem(LoggerBase):
         a_diff = diff(ui)
         a_conv = conv(ui, u_conv)
 
+        # FSI Robin-Neumann interface: boundary impedance term on the LHS
+        # (component-independent, so it joins the shared a_conv form; the
+        # data-carrying RHS counterpart is per-component, registered below
+        # and assembled fresh each solve in build_rhs_tentative_velocity).
+        # See BoundaryConditions._fsi_robin_velocity for the construction.
+        if self.bc_dict['u'].get('fsi_robin'):
+            a_conv += self.bc_dict['u']['fsi_robin']['lhs']
+
         # [-p*vi.dx(i)*dx for i in range(self.ndim)]
         a_pres_lst = [-p*J0*dot(grad(vi), inv(F0))[i]*dx for i in range(self.ndim)]
 
@@ -542,6 +550,9 @@ class Problem(LoggerBase):
             'inflow_lhs': None,
             'navierslip': self.bc_dict['u']['navierslip'],
             'transpiration': self.bc_dict['u']['transpiration'],
+            'fsi_robin_rhs': (self.bc_dict['u']['fsi_robin']['rhs']
+                              if self.bc_dict['u'].get('fsi_robin')
+                              else None),
         })
 
         if 'inflow_lhs' in self.bc_dict['u']:
@@ -959,6 +970,10 @@ class BoundaryConditions(LoggerBase):
                                    + [('coef', []), ('id', [])]),
                 'transpiration': dict([(i, []) for i in range(self.ndim)]
                                       + [('coef', []), ('id', [])]),
+                # FSI Robin-Neumann interface (external coupling, JellyFSI):
+                # set by _fsi_robin_velocity(), consumed in
+                # form_velocity_tentative() and build_rhs_tentative_velocity()
+                'fsi_robin': None,
                 'dbc_expressions': {},
                 'dbc_functions': {},
                 # same_dbc_boundaries is used in
@@ -1065,6 +1080,9 @@ class BoundaryConditions(LoggerBase):
                 self._mapdd(bc)
             elif bc['type'] == 'parable':
                 self._parable(bc)
+            elif bc['type'] == 'fsi_robin':
+                self._fsi_robin_velocity(bc)
+                # pressure: Neumann zero, do-nothing (same as dirichlet)
             else:
                 raise Exception('Unknown velocity BC at boundary {}'.
                                 format(bc['id']))
@@ -1344,6 +1362,73 @@ class BoundaryConditions(LoggerBase):
             bc (dict):  dict describing one boundary condition
         '''
         pass
+
+    # =========================================================================
+    # FSI Robin-Neumann interface BC  (external partitioned coupling)
+    # =========================================================================
+
+    def _fsi_robin_velocity(self, bc):
+        ''' FSI Robin-Neumann interface condition (Badia-Nobile-Vergara).
+
+        Replaces the interface velocity Dirichlet BC (u = v_s) with the
+        Robin closure of the momentum boundary term:
+
+            sigma(u,p)·n = alpha*(v_rb - u) + t_rb      on ds(bc['id'])
+
+        v_rb : solid interface velocity   (fem.Function on V)
+        t_rb : previous fluid-traction estimate sigma·n (fem.Function on V)
+        Both are updated by the external coupler (JellyFSI, see
+        jellyfsi/robin.py) every FSI sub-iteration.
+
+        Substituting into -∫(sigma·n)·w ds of the momentum residual:
+
+            LHS += alpha * u_i * w * js * ds(id)          [consumed in
+                                                  form_velocity_tentative()]
+            RHS += (alpha*v_rb_i + t_rb_i) * w * js * ds(id)   [consumed in
+                                              build_rhs_tentative_velocity()]
+
+        js = J*||F^-T·N|| is the Nanson surface scaling (deformed boundary
+        area), the same geometric factor used in _neumann_velocity.
+
+        alpha ~ rho_s*h_s/dt gives the fluid the solid's inertial surface
+        impedance, removing the added-mass instability of plain
+        Dirichlet-Neumann iterations. As alpha -> inf this recovers the
+        Dirichlet BC; alpha -> 0 a pure Neumann BC with traction t_rb.
+
+        YAML:
+            -   id: 5
+                type: 'fsi_robin'
+                parameters:
+                    alpha: 2.0e4    # ~ rho_s*h_s/dt
+
+        Args:
+            bc (dict):  dict describing the boundary condition
+        '''
+        ui = TrialFunction(self.Vi)
+        vi = TestFunction(self.Vi)
+        n = FacetNormal(self.mesh)
+        nans = self.J*inv(self.F).T*n
+        js = sqrt(dot(nans, nans))
+
+        alpha = self._C(bc['parameters']['alpha'])
+        v_rb = Function(self.V, name='fsi_robin_velocity')
+        t_rb = Function(self.V, name='fsi_robin_traction')
+
+        lhs = alpha*ui*vi*js*self.ds(bc['id'])
+        rhs = {i: (alpha*v_rb[i] + t_rb[i])*vi*js*self.ds(bc['id'])
+               for i in range(self.ndim)}
+
+        self.bc_dict['u']['fsi_robin'] = {
+            'id': bc['id'],
+            'alpha': alpha,
+            'v_rb': v_rb,
+            't_rb': t_rb,
+            'lhs': lhs,
+            'rhs': rhs,
+        }
+        self.logger.info('FSI Robin-Neumann interface at boundary {} '
+                         '(alpha={})'.format(bc['id'],
+                                             bc['parameters']['alpha']))
 
     # =========================================================================
     # Inflow BCs

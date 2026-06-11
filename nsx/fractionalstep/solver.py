@@ -1550,6 +1550,11 @@ class Solver(LoggerBase):
             self.vec['u']['fnv'][i] = _assemble_vec(self.forms['u']['fnv'][i][1])
             bu_i.axpy(1.0, self.vec['u']['fnv'][i])
 
+        if self.forms['u'].get('fsi_robin_rhs'):
+            # FSI Robin-Neumann interface data (alpha*v_rb + t_rb)*w*js*ds:
+            # v_rb/t_rb are updated by the coupler every sub-iteration and
+            # js depends on the ALE deformation — reassemble each solve.
+            bu_i.axpy(1.0, _assemble_vec(self.forms['u']['fsi_robin_rhs'][i]))
 
         return bu_i
 
@@ -1749,6 +1754,13 @@ class Solver(LoggerBase):
             _assemble_mat(self.forms['p']['laplacian'], mat=A)
             _apply_dbc_to_mat(A, self.bc_dict['p']['dirichlet'])
 
+            # The divergence RHS operator div(J*F^{-1}*u) depends on the ALE
+            # deformation d through J and F — it must track the same geometry
+            # as the Laplacian, otherwise the projection enforces div(u)=0 on
+            # a stale mesh and the mismatch acts as a spurious mass source
+            # scaled by k=1/dt.
+            _assemble_mat(self.forms['p']['rhs_u'], mat=self.mat['p']['rhs_u'])
+
             if self._using_wk:
                 if not self.wk['implicit']:
                     _apply_dbc_to_mat(A, self.bc_dict['p']['windkessel']['dirichlet'])
@@ -1897,8 +1909,18 @@ class Solver(LoggerBase):
                 u_i.x.array[:] = self.upd_lst[i].x.array
                 u_i.x.scatter_forward()
 
-            # [bc.apply(u_i.vector()) for bc in
-            #  self.bc_dict['u']['dirichlet'][i]]
+                # Re-impose velocity Dirichlet BCs on the corrected velocity:
+                # the update solve has no Dirichlet rows, so
+                # du = -(1/(rho*k))*M^{-1}*G*phi is nonzero on Dirichlet
+                # boundaries wherever grad(phi) != 0 there. Any pressure
+                # boundary layer/spike (e.g. at a moving-wall corner) then
+                # overwrites the wall velocity BC, and the polluted u feeds
+                # the convection history and FSI traction.
+                set_bc(u_i.x.petsc_vec, self.bc_dict['u']['dirichlet'][i])
+                set_bc(self.upd_lst[i].x.petsc_vec,
+                       self.bc_dict['u']['dirichlet'][i])
+                u_i.x.scatter_forward()
+                self.upd_lst[i].x.scatter_forward()
 
             if self.solver_u_upd.conv_reason < 0:
                 self.logger.error('Solver u_upd {} DIVERGED ({})'.
@@ -1979,13 +2001,19 @@ class Solver(LoggerBase):
             
         if self.ale['type'] == 'external':
             self.logger.debug('Using external velocity for dbc')
-            # XXX DBF1 ? 
+            # XXX DBF1 ?
             with Timer('Z assign'):
                 self.transfer_velocity(self.v_s, self.v_bc) # in -> out
                 self._split_vec_to_lst(self.v_bc, self.v_lst_bc)
                 for bc, dict_ in self.bc_dict['u']['dbc_functions'].items():
                     func, i = dict_['function'], dict_['i']
                     func.x.array[:] = self.v_lst_bc[i].x.array
+                # FSI Robin-Neumann: the interface velocity enters as Robin
+                # RHS data (v_rb) instead of a Dirichlet function
+                if self.bc_dict['u'].get('fsi_robin'):
+                    rb = self.bc_dict['u']['fsi_robin']
+                    rb['v_rb'].x.array[:] = self.v_bc.x.array
+                    rb['v_rb'].x.scatter_forward()
 
     # =========================================================================
     # Windkessel
