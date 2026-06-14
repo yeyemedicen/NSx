@@ -1406,7 +1406,14 @@ class Solver(LoggerBase):
             A = self.mat['d']['diff'] # copy ?
             A.axpy(1., self.mat['d']['div'])
             for i in range(self.ndim):
-                _apply_dbc_to_mat(A, self.bc_dict['d']['dirichlet'][i])
+                # Rows-only elimination: zeroing columns too (the old
+                # _apply_dbc_to_mat) decouples the interior block from the
+                # boundary data, and build_rhs_displacement has no
+                # apply_lifting to compensate — the lifting solve then
+                # returns d=0 everywhere off the interface and the ALE mesh
+                # never follows the flag (cells collapse at ~one-layer
+                # displacement).
+                _apply_dbc_rows_to_mat(A, self.bc_dict['d']['dirichlet'][i])
 
             self.solver_d.set_operator(A)
             self._assembled_d = True
@@ -1438,6 +1445,29 @@ class Solver(LoggerBase):
 
         self.iterations_ksp['d'].append(self.solver_d.iterations)
         self.residuals_ksp['d'].append(self.solver_d.residuals)
+
+        # ALE mesh-quality guard: min deformed/reference cell area (det of
+        # the ALE deformation gradient, DG0). A "successful" lifting solve
+        # can still be wrong (the 2026-06 frozen-interior bug stayed silent
+        # for weeks because nothing watched the cells) — print, don't trust.
+        if not hasattr(self, '_alej_func'):
+            from dolfinx.fem import functionspace as _fs, Function as _F, \
+                Expression as _E
+            V0 = _fs(self.d.function_space.mesh, ('DG', 0))
+            Id = ufl.Identity(self.ndim)
+            J = ufl.det(Id + ufl.grad(self.d))
+            self._alej_func = _F(V0)
+            self._alej_expr = _E(J, V0.element.interpolation_points)
+        self._alej_func.interpolate(self._alej_expr)
+        jmin = self.d.function_space.mesh.comm.allreduce(
+            self._alej_func.x.array.min(), op=MPI.MIN)
+        if jmin < 0.05:
+            print('    [ale-guard] min cell area ratio = {:.3f} — mesh '
+                  'near-degenerate, fields at the interface are garbage'
+                  .format(jmin), flush=True)
+        elif jmin < 0.2:
+            print('    [ale-guard] min cell area ratio = {:.3f}'
+                  .format(jmin), flush=True)
 
         timer.stop()
 
@@ -2376,6 +2406,11 @@ class Solver(LoggerBase):
             self._xdmf_u.write_mesh(mesh)
             self._xdmf_p = XDMFFile(comm, write_path + '/p.xdmf', 'w')
             self._xdmf_p.write_mesh(self.p.function_space.mesh)
+            # ALE mesh displacement in its own file: ParaView's Warp By
+            # Vector misbehaves when two fields share one XDMF block.
+            if self._using_ale:
+                self._xdmf_d = XDMFFile(comm, write_path + '/d_ale.xdmf', 'w')
+                self._xdmf_d.write_mesh(mesh)
 
             # For velocity elements of degree > 1, ParaView requires P1
             # interpolation — XDMF stores data at geometry (P1) nodes only.
@@ -2396,7 +2431,7 @@ class Solver(LoggerBase):
                     functionspace(mesh, ('Lagrange', 1)), name='p')
 
         if self._using_ale:
-            self._xdmf_u.write_function(self.d, float(t))
+            self._xdmf_d.write_function(self.d, float(t))
             self._xdmf_u.write_function(self.upd, float(t))
         else:
             u_write = self.u
