@@ -2362,9 +2362,16 @@ class Solver(LoggerBase):
 
             write_dt = self.options['timemarching']['write_dt']
 
-            if ((self.t > self._t_write + write_dt - tol)
+            if (self.t > self._t_write + tol) and (
+                    (self.t > self._t_write + write_dt - tol)
                     or (self.t >= T - tol)):
-                # if (time for write) or (first) or (last)
+                # if (time for write) or (first) or (last) — guarded by
+                # `self.t > self._t_write + tol` so that the "or last"
+                # branch fires at most ONCE per physical time, even though
+                # write_timestep() is called once per FSI sub-iteration
+                # (would otherwise append a duplicate <Grid Time=T> entry
+                # to the XDMF temporal collection for every sub-iteration
+                # of the final step)
                 self._t_write = self.t
                 writeout = 1
                 self.write_xdmf()
@@ -2372,9 +2379,11 @@ class Solver(LoggerBase):
         if self.options['io']['write_checkpoints']:
             checkpt_dt = self.options['timemarching']['checkpoint_dt']
 
-            if ((self.t > self._t_checkpt + checkpt_dt - tol)
+            if (self.t > self._t_checkpt + tol) and (
+                    (self.t > self._t_checkpt + checkpt_dt - tol)
                     or (self.t >= T - tol)):
-                # if (time for checkpoint) or (last)
+                # if (time for checkpoint) or (last) — same per-sub-iteration
+                # guard as above
 
                 self._t_checkpt = self.t
                 writeout += 2
