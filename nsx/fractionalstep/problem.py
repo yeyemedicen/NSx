@@ -55,6 +55,18 @@ def _compute_inlet_local_frame(inlet_coords):
     centered = inlet_coords - centroid
     _, _, Vt = np.linalg.svd(centered, full_matrices=False)
     t1, t2, n_hat = Vt[0], Vt[1], Vt[2]
+
+    # 2-D meshes: DOLFINx stores z=0 for all DOFs, so the SVD sees two
+    # near-zero singular values (x and z both have zero variance) and picks
+    # z=[0,0,1] as n_hat instead of the actual in-plane normal.
+    # Fix: if z-variance is negligible, compute n_hat as the in-plane
+    # perpendicular to t1 (rotate 90° in the x-y plane).
+    z_std = np.std(centered[:, 2])
+    xy_rms = np.sqrt(np.mean(centered[:, :2] ** 2)) + 1e-30
+    if z_std < 1e-8 * xy_rms:
+        n_hat = np.array([-t1[1], t1[0], 0.0])
+        n_hat /= np.linalg.norm(n_hat)
+
     s1 = centered @ t1
     s2 = centered @ t2
     R1 = (s1.max() - s1.min()) / 2.0
@@ -1067,16 +1079,33 @@ class BoundaryConditions(LoggerBase):
         if self._using_ale:
             if self.ale['lifting']['type'] in ('harmonic', 'elastic',
                                                 'elastic_element'):
-                for bc in self.ale['deformations']:
-                    if not ('id' in bc and 'type' in bc):
-                        raise Exception('bc dict needs keys id & value')
-                    elif bc['type'] == 'dirichlet':
-                        self._dirichlet_displacement(bc)
-                    elif bc['type'] == 'neumann':
-                        self._neumann_displacement(bc)
-                    else:
-                        raise Exception('Unknown velocity BC at '
-                                        'boundary {}'.format(bc['id']))
+                deformations = self.ale.get('deformations', [])
+                if deformations:
+                    # Explicit list — process as declared
+                    for bc in deformations:
+                        if not ('id' in bc and 'type' in bc):
+                            raise Exception('bc dict needs keys id & type')
+                        elif bc['type'] == 'dirichlet':
+                            self._dirichlet_displacement(bc)
+                        elif bc['type'] == 'neumann':
+                            self._neumann_displacement(bc)
+                        else:
+                            raise Exception('Unknown ALE deformation BC type '
+                                            'at boundary {}'.format(bc['id']))
+                else:
+                    # Auto-zero: apply zero displacement to every boundary tag
+                    # except FSI interface(s) (handled by type: fsi velocity BCs).
+                    fsi_tags = {bc['id'] for bc in self.bcs
+                                if bc.get('type') == 'fsi'}
+                    import numpy as _np
+                    all_tags = set(int(v) for v in _np.unique(
+                        self.facet_tags.values))
+                    zero = [0.0] * self.ndim
+                    for tag in sorted(all_tags - fsi_tags):
+                        self._dirichlet_displacement(
+                            {'id': tag, 'type': 'dirichlet', 'value': zero})
+                        self.logger.debug(
+                            'ALE auto-zero displacement at boundary %d', tag)
             else:
                 raise Exception('lifting: {} unknown'
                                 .format(self.ale['lifting']['type']))
@@ -1105,6 +1134,13 @@ class BoundaryConditions(LoggerBase):
             elif bc['type'] == 'fsi_robin':
                 self._fsi_robin_velocity(bc)
                 # pressure: Neumann zero, do-nothing (same as dirichlet)
+            elif bc['type'] == 'fsi':
+                # FSI interface velocity (v_s) + ALE displacement (d_s) in one entry.
+                # No 'value' key — _dirichlet_velocity creates an external Function
+                # from v_s when ale.type == 'external'; same for displacement.
+                self._dirichlet_velocity(bc)
+                if self._using_ale and self.ale['type'] == 'external':
+                    self._dirichlet_displacement({'id': bc['id'], 'type': 'dirichlet'})
             else:
                 raise Exception('Unknown velocity BC at boundary {}'.
                                 format(bc['id']))
@@ -1728,6 +1764,7 @@ class BoundaryConditions(LoggerBase):
                     'sin': np.sin,  'cos': np.cos,  'tan': np.tan,
                     'exp': np.exp,  'log': np.log,  'sqrt': np.sqrt,
                     'abs': np.abs,  'tanh': np.tanh, 'pi': np.pi,
+                    'min': min,     'max': max,
                 }
                 def scale_func(t, _e=_expr_str, _p=extra, _m=_math_ns):
                     ns = {'t': float(t)}
@@ -1738,6 +1775,27 @@ class BoundaryConditions(LoggerBase):
                 self.logger.info(
                     'Parabolic BC bid={}: expression waveform "{}", '
                     'params={}'.format(bc['id'], waveform, extra))
+
+        # --- period / cycles: repeat scale_func over a fixed T_cycle ---
+        # Two equivalent ways to declare a repeating waveform (BC top level):
+        #   period: 0.5          T_cycle = 0.5 s (explicit; preferred — stable
+        #                        if timemarching.T changes)
+        #   cycles: 2            T_cycle = timemarching.T / 2  (derived)
+        # period takes priority. Effective time: t_eff = t % T_cycle.
+        _period  = bc.get('period', None)
+        _ncycles = max(1, int(bc.get('cycles', 1)))
+        if _period is not None:
+            T_cycle = float(_period)
+        elif _ncycles > 1:
+            T_cycle = float(self.options['timemarching']['T']) / _ncycles
+        else:
+            T_cycle = None
+
+        if T_cycle is not None and scale_func is not None:
+            _orig = scale_func
+            scale_func = lambda t, _f=_orig, _tc=T_cycle: _f(t % _tc)
+            self.logger.info(
+                'Parabolic BC bid={}: T_cycle={:.4g}s'.format(bc['id'], T_cycle))
 
         t0_scale = scale_func(0.0) if scale_func is not None else 1.0
 
