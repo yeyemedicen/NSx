@@ -385,18 +385,39 @@ class Solver(LoggerBase):
                 'ALE checkpoint not found: {}'.format(restart_path / 'd.h5'))
 
         import h5py
+        comm = self.u.function_space.mesh.comm
         w_file = restart_path / 'w.h5'
-        with h5py.File(str(w_file), 'r') as f:
-            self.u.x.array[:] = f['u'][:]
-            self.p.x.array[:] = f['p'][:]
-            t_u = float(f.attrs.get('t', 0.0))
-        self.u.x.scatter_forward()
-        self.p.x.scatter_forward()
+
+        def _scatter_full(fn, full_arr):
+            idx = fn.function_space.dofmap.index_map
+            start, end = idx.local_range
+            fn.x.array[:idx.size_local] = full_arr[start:end]
+            fn.x.scatter_forward()
+
+        if comm.rank == 0:
+            with h5py.File(str(w_file), 'r') as f:
+                u_full = np.array(f['u'])
+                p_full = np.array(f['p'])
+                t_u = float(f.attrs.get('t', 0.0))
+        else:
+            u_full = None
+            p_full = None
+            t_u = 0.0
+        u_full = comm.bcast(u_full, root=0)
+        p_full = comm.bcast(p_full, root=0)
+        t_u = comm.bcast(t_u, root=0)
+
+        _scatter_full(self.u, u_full)
+        _scatter_full(self.p, p_full)
 
         if self._using_ale:
-            with h5py.File(str(restart_path / 'd.h5'), 'r') as f:
-                self.d.x.array[:] = f['d'][:]
-            self.d.x.scatter_forward()
+            if comm.rank == 0:
+                with h5py.File(str(restart_path / 'd.h5'), 'r') as f:
+                    d_full = np.array(f['d'])
+            else:
+                d_full = None
+            d_full = comm.bcast(d_full, root=0)
+            _scatter_full(self.d, d_full)
 
         assert np.allclose(t_u, io['restart']['time'])
 
@@ -1101,8 +1122,11 @@ class Solver(LoggerBase):
             self.mat['u']['gradp'] = [_assemble_mat(a) for a in
                                       self.forms['u']['gradp']]
 
-        # init convection matrix (sparsity pattern)
-        self.mat['u']['conv'] = self.mat['u']['mass'].copy()
+        # init convection matrix with its own sparsity pattern (NOT mass.copy()).
+        # The conv form (with SUPG) requires ghost DOFs that the mass form does
+        # not; copying mass would give an incomplete ghost set and trigger PETSc
+        # "Argument out of range" on the first step with non-zero velocity.
+        self.mat['u']['conv'] = create_matrix(fem_form(self.forms['u']['conv']))
 
         # assembling inflow matrices
         if self.forms['u']['inflow_lhs']:
@@ -1496,8 +1520,13 @@ class Solver(LoggerBase):
         if self._sd_param is not None:
             self._sd_param.update_tau()
 
+        # In ALE mode: recreate conv matrix each step (pre-allocated ghost set
+        # becomes invalid after mesh deformation → PETSc "Argument out of range").
+        if self._using_ale:
+            self.mat['u']['conv'] = _assemble_mat(self.forms['u']['conv'])
+        else:
+            _assemble_mat(self.forms['u']['conv'], mat=self.mat['u']['conv'])
         A = self.mat['u']['conv']
-        _assemble_mat(self.forms['u']['conv'], mat=A)
 
         if (self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS'
                 and self.t > self.options['timemarching']['dt'] + 1e-14):
@@ -1511,8 +1540,8 @@ class Solver(LoggerBase):
             # mat['u']['rhs'] changes over time when using ALE
             self.mat['u']['rhs'] = self.mat['u']['mass'].copy()
 
-        A.axpy(cf, self.mat['u']['mass'])
-        A.axpy(1., self.mat['u']['diff'])
+        A.axpy(cf, self.mat['u']['mass'], structure=PETSc.Mat.Structure.DIFFERENT_NONZERO_PATTERN)
+        A.axpy(1., self.mat['u']['diff'], structure=PETSc.Mat.Structure.DIFFERENT_NONZERO_PATTERN)
 
         if self.mat['u']['inflow']:
             # adding inflow lhs term if defined
@@ -2495,20 +2524,36 @@ class Solver(LoggerBase):
             return
 
         import h5py, os
+        comm = self.u.function_space.mesh.comm
         path = self.options['io']['write_path'] + '/checkpoint/{i}/'.format(i=i)
-        os.makedirs(path, exist_ok=True)
+
+        if comm.rank == 0:
+            os.makedirs(path, exist_ok=True)
+        comm.Barrier()
 
         u_out = (self.upd if (self._using_ale and update) else self.u)
 
-        with h5py.File(path + 'w.h5', 'w') as f:
-            f.create_dataset('u', data=u_out.x.array)
-            f.create_dataset('p', data=self.p.x.array)
-            f.attrs['t'] = float(self.t)
+        def _gather_full(fn):
+            idx = fn.function_space.dofmap.index_map
+            local_arr = fn.x.array[:idx.size_local].copy()
+            gathered = comm.gather(local_arr, root=0)
+            return np.concatenate(gathered) if comm.rank == 0 else None
+
+        u_full = _gather_full(u_out)
+        p_full = _gather_full(self.p)
+
+        if comm.rank == 0:
+            with h5py.File(path + 'w.h5', 'w') as f:
+                f.create_dataset('u', data=u_full)
+                f.create_dataset('p', data=p_full)
+                f.attrs['t'] = float(self.t)
 
         if self._using_ale:
-            with h5py.File(path + 'd.h5', 'w') as f:
-                f.create_dataset('d', data=self.d.x.array)
-                f.attrs['t'] = float(self.t)
+            d_full = _gather_full(self.d)
+            if comm.rank == 0:
+                with h5py.File(path + 'd.h5', 'w') as f:
+                    f.create_dataset('d', data=d_full)
+                    f.attrs['t'] = float(self.t)
 
         if self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS':
             self.logger.warn('Checkpointing for IPCS experimental!')
@@ -3260,8 +3305,8 @@ class SolverCoupled(Solver):
         if self.forms['u']['gradp']:
             self.mat['u']['gradp'] = _assemble_mat(self.forms['u']['gradp'])
 
-        # init convection matrix (sparsity pattern)
-        self.mat['u']['conv'] = self.mat['u']['mass'].copy()
+        # init convection matrix with its own sparsity (NOT mass.copy())
+        self.mat['u']['conv'] = create_matrix(fem_form(self.forms['u']['conv']))
 
         # assembling inflow matrices
         if self.forms['u']['inflow_lhs']:
@@ -3485,8 +3530,13 @@ class SolverCoupled(Solver):
                 with Timer('Z assign conv'):
                     self.u_conv_assigned.x.array[:] = 2*self.u.x.array - self.u0.x.array
 
+        # In ALE mode: recreate conv matrix each step (pre-allocated ghost set
+        # becomes invalid after mesh deformation → PETSc "Argument out of range").
+        if self._using_ale:
+            self.mat['u']['conv'] = _assemble_mat(self.forms['u']['conv'])
+        else:
+            _assemble_mat(self.forms['u']['conv'], mat=self.mat['u']['conv'])
         A = self.mat['u']['conv']
-        _assemble_mat(self.forms['u']['conv'], mat=A)
 
         if (self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS'
                 and self.t > self.options['timemarching']['dt'] + 1e-14):
@@ -3500,8 +3550,8 @@ class SolverCoupled(Solver):
             # mat['u']['rhs'] changes over time when using ALE
             self.mat['u']['rhs'] = self.mat['u']['mass'].copy()
 
-        A.axpy(cf, self.mat['u']['mass'])
-        A.axpy(1., self.mat['u']['diff'])
+        A.axpy(cf, self.mat['u']['mass'], structure=PETSc.Mat.Structure.DIFFERENT_NONZERO_PATTERN)
+        A.axpy(1., self.mat['u']['diff'], structure=PETSc.Mat.Structure.DIFFERENT_NONZERO_PATTERN)
         # adding inflow lhs term if defined
         if self.mat['u']['inflow_lhs']:
             A.axpy(1., self.mat['u']['inflow_lhs'])
