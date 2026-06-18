@@ -3898,12 +3898,13 @@ class PETScSolver(LoggerBase):
             PETSc.Options().setValue('d_ksp_rtol', 1.0e-6)
             
             # BiCGSTAB/Jacobi + CG/GAMG
-            PETSc.Options().setValue('u_ten_ksp_type', 'bcgs')
+            PETSc.Options().setValue('u_ten_ksp_type', 'gmres')
             # PETSc.Options().setValue('u_ten_ksp_converged_reason')
             # PETSc.Options().setValue('u_ten_ksp_monitor_true_residual')
             PETSc.Options().setValue('u_ten_ksp_rtol', 1.0e-6)
-            PETSc.Options().setValue('u_ten_ksp_initial_guess_nonzero')
-            PETSc.Options().setValue('u_ten_pc_type', 'jacobi')
+            PETSc.Options().setValue('u_ten_ksp_gmres_restart', '200')
+            PETSc.Options().setValue('u_ten_ksp_initial_guess_nonzero', 'true')
+            PETSc.Options().setValue('u_ten_pc_type', 'bjacobi')
             # PETSc.Options().setValue('u_ten_pc_type', 'gamg')
             # PETSc.Options().setValue('u_ten_pc_gamg_type', 'agg')
             # PETSc.Options().setValue('u_ten_pc_gamg_threshold', 0.03)
@@ -3921,7 +3922,7 @@ class PETScSolver(LoggerBase):
             PETSc.Options().setValue('p_pc_gamg_type', 'agg')
             PETSc.Options().setValue('p_pc_gamg_threshold', 0.03)
             PETSc.Options().setValue('p_pc_gamg_square_graph', 10)
-            PETSc.Options().setValue('p_pc_gamg_sym_graph')     # needed for parallel
+            PETSc.Options().setValue('p_pc_gamg_sym_graph', 'true')     # needed for parallel
             PETSc.Options().setValue('p_mg_levels_ksp_type', 'richardson')
             PETSc.Options().setValue('p_mg_levels_pc_type', 'sor')
 
@@ -3945,14 +3946,14 @@ class PETScSolver(LoggerBase):
             # PETSc.Options().setValue('u_upd_ksp_converged_reason')
             # PETSc.Options().setValue('u_upd_ksp_monitor_true_residual')
             PETSc.Options().setValue('u_upd_ksp_rtol', 1.0e-8)
-            PETSc.Options().setValue('u_upd_ksp_initial_guess_nonzero')
+            PETSc.Options().setValue('u_upd_ksp_initial_guess_nonzero', 'true')
             PETSc.Options().setValue('u_upd_pc_type', 'jacobi')
 
             PETSc.Options().setValue('p_mass_ksp_type', 'cg')
             # PETSc.Options().setValue('p_mass_ksp_converged_reason')
             # PETSc.Options().setValue('p_mass_ksp_monitor_true_residual')
             PETSc.Options().setValue('p_mass_ksp_rtol', 1.0e-8)
-            PETSc.Options().setValue('p_mass_ksp_initial_guess_nonzero')
+            PETSc.Options().setValue('p_mass_ksp_initial_guess_nonzero', 'true')
             PETSc.Options().setValue('p_mass_pc_type', 'jacobi')
 
         else:

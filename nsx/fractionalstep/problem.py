@@ -1098,8 +1098,17 @@ class BoundaryConditions(LoggerBase):
                     fsi_tags = {bc['id'] for bc in self.bcs
                                 if bc.get('type') == 'fsi'}
                     import numpy as _np
-                    all_tags = set(int(v) for v in _np.unique(
-                        self.facet_tags.values))
+                    # Boundary tags must be gathered GLOBALLY: on a
+                    # partitioned mesh a rank may own no facets of a given
+                    # tag (e.g. a localized inlet/outlet), so a local
+                    # unique() yields a different tag set per rank. Since
+                    # _dirichlet_displacement below calls the COLLECTIVE
+                    # locate_dofs_topological, an uneven per-rank tag set
+                    # desyncs the collectives and the run deadlocks (all
+                    # ranks busy-spin). Allgather the tag set first.
+                    _local_tags = _np.unique(self.facet_tags.values)
+                    _gathered = self.mesh.comm.allgather(_local_tags)
+                    all_tags = set(int(v) for _a in _gathered for v in _a)
                     zero = [0.0] * self.ndim
                     for tag in sorted(all_tags - fsi_tags):
                         self._dirichlet_displacement(
@@ -1669,17 +1678,31 @@ class BoundaryConditions(LoggerBase):
         # --- inlet DOF coordinates ---
         all_coords = self.Vi.tabulate_dof_coordinates()   # (total_dofs, 3)
         dofs_Vi = locate_dofs_topological(self.Vi, fdim, facets)
-        inlet_coords = all_coords[dofs_Vi]                # (N_inlet, 3)
-        if len(inlet_coords) == 0:
+        inlet_coords = all_coords[dofs_Vi]                # (N_inlet, 3) LOCAL
+
+        # The SVD frame (centroid, in-plane axes, radii) and the inward-
+        # normal test must come from the GLOBAL inlet point cloud: on a
+        # partitioned mesh the inlet usually lives on only a few ranks, so
+        # a per-rank frame would be inconsistent (or undefined on ranks
+        # owning no inlet dofs, which previously raised here). Gather the
+        # inlet coords and the mesh-dof centroid across all ranks.
+        comm = self.mesh.comm
+        _parts = [a for a in comm.allgather(inlet_coords) if len(a)]
+        global_inlet = (np.concatenate(_parts, axis=0)
+                        if _parts else inlet_coords[:0])
+        if len(global_inlet) == 0:
             raise RuntimeError(
                 'Parabolic BC: no DOFs found on boundary id={}'.format(bc['id']))
+        _gsum = comm.allreduce(all_coords.sum(axis=0), op=MPI.SUM)
+        _gcnt = comm.allreduce(len(all_coords), op=MPI.SUM)
+        mesh_centroid = _gsum / max(_gcnt, 1)
 
-        # --- SVD local frame ---
+        # --- SVD frame from the GLOBAL inlet cloud ---
         centroid, t1, t2, n_hat, R1, R2 = \
-            _compute_inlet_local_frame(inlet_coords)
+            _compute_inlet_local_frame(global_inlet)
 
-        # orient normal inward (towards mesh interior)
-        if np.dot(all_coords.mean(axis=0) - centroid, n_hat) < 0:
+        # orient normal inward (towards mesh interior), global centroid
+        if np.dot(mesh_centroid - centroid, n_hat) < 0:
             n_hat = -n_hat
 
         self.logger.info(
