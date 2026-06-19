@@ -3894,8 +3894,9 @@ class PETScSolver(LoggerBase):
             PETSc.Options().setValue('p_mass_pc_type', 'lu')
 
         elif meth.lower() == 'default':
-            PETSc.Options().setValue('d_ksp_type', 'cg') 
-            PETSc.Options().setValue('d_ksp_rtol', 1.0e-6)
+            PETSc.Options().setValue('d_ksp_type', 'preonly')   # FSI/ALE: cg+ilu DIVERGED(-4) on ill-cond elastic_element lifting -> mesh inversion; direct solve robust
+            PETSc.Options().setValue('d_pc_type', 'lu')
+            PETSc.Options().setValue('d_pc_factor_mat_solver_type', 'mumps')
             
             # BiCGSTAB/Jacobi + CG/GAMG
             PETSc.Options().setValue('u_ten_ksp_type', 'gmres')
