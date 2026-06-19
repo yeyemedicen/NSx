@@ -3913,8 +3913,7 @@ class PETScSolver(LoggerBase):
             # PETSc.Options().setValue('u_ten_mg_levels_ksp_type', 'richardson')
             # PETSc.Options().setValue('u_ten_mg_levels_pc_type', 'sor')
 
-            PETSc.Options().setValue('p_ksp_type', 'cg')
-            # gmres would remove nullspace automatically
+            PETSc.Options().setValue('p_ksp_type', 'gmres')   # FSI/ALE: gamg PC goes indefinite -> CG fails (-8); gmres tolerant + removes nullspace
             # PETSc.Options().setValue('p_ksp_converged_reason')
             # PETSc.Options().setValue('p_ksp_monitor_true_residual')
             PETSc.Options().setValue('p_ksp_rtol', 1.0e-8)
@@ -3922,7 +3921,7 @@ class PETScSolver(LoggerBase):
             PETSc.Options().setValue('p_pc_gamg_type', 'agg')
             PETSc.Options().setValue('p_pc_gamg_threshold', 0.03)
             PETSc.Options().setValue('p_pc_gamg_square_graph', 10)
-            PETSc.Options().setValue('p_pc_gamg_sym_graph', 'true')     # needed for parallel
+            PETSc.Options().setValue('p_pc_gamg_graph_symmetrize', 'true')   # PETSc>=3.25 name (was p_pc_gamg_sym_graph)
             PETSc.Options().setValue('p_mg_levels_ksp_type', 'richardson')
             PETSc.Options().setValue('p_mg_levels_pc_type', 'sor')
 
