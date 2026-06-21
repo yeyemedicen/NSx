@@ -2483,6 +2483,13 @@ class Solver(LoggerBase):
             self._p_vis.interpolate(self.p)
             p_write = self._p_vis
         self._xdmf_p.write_function(p_write, float(t))
+        # Flush HDF5 every step so the file stays readable mid-run and
+        # survives an MPI_ABORT (superblock+metadata persisted, not held
+        # in cache until close()). Cheap vs the solve. (FSI crash-safety)
+        for _xa in ('_xdmf_d', '_xdmf_u', '_xdmf_p'):
+            _xf = getattr(self, _xa, None)
+            if _xf is not None:
+                _xf.flush()
 
     def write_timeseries(self):
         ''' Write solution to HDF5 TimeSeries, initialize on first call.  '''
@@ -3154,6 +3161,13 @@ class Solver(LoggerBase):
             # a little hacky, I admit
             return
 
+        for attr in ('_xdmf_d', '_xdmf_u', '_xdmf_p', '_xdmf_du'):
+            _xf = getattr(self, attr, None)
+            if _xf is not None:
+                try:
+                    _xf.close()
+                except Exception:
+                    pass
         for attr in ('_xdmf_d', '_xdmf_u', '_xdmf_p', '_xdmf_du',
                      '_u_vis', '_p_vis'):
             if hasattr(self, attr):

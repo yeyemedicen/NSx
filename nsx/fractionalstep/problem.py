@@ -212,7 +212,7 @@ class Problem(LoggerBase):
     def setup_logger(self):
         ''' Create logging File Handler '''
         MPI.COMM_WORLD.Barrier()
-        path = Path(self.options['io']['write_path']).joinpath('run.log')
+        path = Path(self.options['io']['write_path']).joinpath('nsx_solver.log')
         if MPI.COMM_WORLD.rank == 0:
             utils.trymkdir(str(path.parent))
             try:
