@@ -298,10 +298,36 @@ class Solver(LoggerBase):
         self.init_assembly()
         self.init_solvers()
         self._initialized = True
+        self.init_windkessel_pressure()
         self.read_checkpoint()
         self.backup_restart()
 
         self.write_initial_condition()
+
+    def init_windkessel_pressure(self):
+        ''' Seed the fluid pressure field with the Windkessel reservoir
+        pressure P0 = alpha*pi0 (backward-Euler init, Q=0 at t=0), so the wall
+        starts pre-loaded and consistent with the WK BC instead of from p=0.
+
+        P0 == prm['Pl'] as set in problem._windkessel(). Implicit WK only;
+        called before read_checkpoint() so a restart overrides it. With more
+        than one WK boundary a single constant field is ambiguous -> skipped.
+        '''
+        if not (self._using_wk and self.wk['implicit']):
+            return
+        params = self.bc_dict['p']['windkessel']['params']
+        if len(params) != 1:
+            self.logger.warning(
+                'init_windkessel_pressure: {} WK boundaries -> constant '
+                'initial pressure ambiguous, leaving p=0.'.format(len(params)))
+            return
+        (bid, prm), = params.items()
+        P0 = float(prm['Pl'])
+        self.p.x.array[:] = P0
+        self.p.x.scatter_forward()
+        self.logger.info(
+            'Initialized fluid pressure to Windkessel P0 = alpha*pi0 = '
+            '{:.6g} (bid {})'.format(P0, bid))
 
     def write_initial_condition(self):
         ''' Write initial condition XDMF and HDF5 checkpoints '''
