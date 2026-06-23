@@ -2149,15 +2149,10 @@ class Solver(LoggerBase):
 
                 prm['pi'].value = float(pi_upd)
                 prm['pi0'].value = pi
+                # The Dirichlet BC was built with the Constant prm['Pl']
+                # (see problem._windkessel), so updating its value here is
+                # picked up directly by set_bc in solve_pressure.
                 prm['Pl'].value = Pl_upd
-                # updating the Dirichlet boundary condition
-                prms = self.bc_dict['p']['windkessel']['params']
-
-                for _, opts in self.bc_dict['p']['windkessel']['dbc_params'].items():
-                    expr, bid2 = opts['expr'], opts['bid']
-                    if bid2 == bid:
-                        expr.value = prms[bid]['Pl'].value
-                        break
 
             elif self.wk['implicit']:
                 if not flow and not restart:
