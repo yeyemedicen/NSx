@@ -3974,6 +3974,18 @@ class PETScSolver(LoggerBase):
             raise Exception('linear solver method set "{}" unknown'.
                             format(meth))
 
+        # YAML-driven per-field PETSc overrides, applied ON TOP of the method
+        # defaults above. Keys are full PETSc option names (e.g. p_ksp_type,
+        # d_pc_type, d_pc_factor_mat_solver_type). Absent -> defaults unchanged
+        # (existing inputfiles unaffected). Makes fluid solver selection
+        # reproducible from the inputfile.
+        overrides = self.options['linear_solver'].get('petsc_options') or {}
+        for _k, _v in overrides.items():
+            if isinstance(_v, bool):
+                _v = 'true' if _v else 'false'
+            PETSc.Options().setValue(str(_k), str(_v))
+            self.logger.info('  [yaml petsc override] {} = {}'.format(_k, _v))
+
     @rank0
     def dump_parameters(self, inputfile):
         ''' Write petsc inputfile to results directory. '''
