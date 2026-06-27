@@ -1405,6 +1405,12 @@ class Solver(LoggerBase):
                                     self._logging_filehandler,
                                     verbose=True)
 
+        # Pure-Neumann pressure (no Dirichlet rows) needs the constant near-null
+        # space or gamg's coarse solve is singular — see _p_nullspace(). Under
+        # ALE this is re-attached every step in assemble_pressure(); set it on
+        # the initial operator here for the non-ALE path (e.g. fluid_only).
+        self._attach_p_nullspace(self.mat['p']['laplacian'])
+
         if self._using_wk:
             if not self.wk['implicit']:
                 self.solver_p.set_operator(
@@ -1546,12 +1552,13 @@ class Solver(LoggerBase):
         if self._sd_param is not None:
             self._sd_param.update_tau()
 
-        # In ALE mode: recreate conv matrix each step (pre-allocated ghost set
-        # becomes invalid after mesh deformation → PETSc "Argument out of range").
-        if self._using_ale:
-            self.mat['u']['conv'] = _assemble_mat(self.forms['u']['conv'])
-        else:
-            _assemble_mat(self.forms['u']['conv'], mat=self.mat['u']['conv'])
+        # Recreate the conv matrix each step. In ALE mode the pre-allocated ghost
+        # set becomes invalid after mesh deformation; in the no-ALE segregated
+        # path create_matrix's own pattern can still miss an off-rank SUPG ghost
+        # coupling (-> PETSc error 63 "New nonzero ... caused a malloc" on the
+        # first non-zero-velocity assembly, e.g. fluid_only). Reassembling fresh
+        # yields the correct sparsity every step in both modes.
+        self.mat['u']['conv'] = _assemble_mat(self.forms['u']['conv'])
         A = self.mat['u']['conv']
 
         if (self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS'
@@ -1839,14 +1846,37 @@ class Solver(LoggerBase):
         # BCs are applied to Laplacian in init_assembly() !
         return bp
 
+    def _p_nullspace(self):
+        ''' Constant null space of the pressure Laplacian for the pure-Neumann
+        case (no pressure Dirichlet BC: implicit Windkessel / all-Neumann
+        outlets). Without it, gamg's coarse solve on the singular Laplacian is
+        garbage: the *preconditioned* residual blows up (~1e17) so gmres either
+        declares CONVERGED_RTOL after one iteration on the preconditioned norm
+        (true residual ~1e-4 -> flat pressure, no drain) or BREAKS DOWN (-5) at
+        higher velocity. Attaching it as the near-null space gives gamg a
+        consistent coarse space (NSx TODO at l.1447). '''
+        if getattr(self, '_p_const_nsp', None) is None:
+            comm = self.p.function_space.mesh.comm
+            self._p_const_nsp = PETSc.NullSpace().create(constant=True, comm=comm)
+        return self._p_const_nsp
+
+    def _attach_p_nullspace(self, A):
+        ''' Attach the constant near-null space to the pressure preconditioner
+        matrix A iff the pressure problem is pure-Neumann (no Dirichlet rows).
+        A pressure Dirichlet BC (fix_pressure, explicit-WK or stress-free
+        outlet) pins the level, so the constant is NOT a null mode there. '''
+        if not self.bc_dict['p']['dirichlet']:
+            A.setNearNullSpace(self._p_nullspace())
+
     def assemble_pressure(self):
         ''' Assemble matrix of pressure projection, in the case of variable
         coefficient Robin boundary conditions. '''
-        
+
         if self._using_ale or self._using_mapdd:
             A = self.mat['p']['laplacian'].copy()
             _assemble_mat(self.forms['p']['laplacian'], mat=A)
             _apply_dbc_to_mat(A, self.bc_dict['p']['dirichlet'])
+            self._attach_p_nullspace(A)
 
             # The divergence RHS operator div(J*F^{-1}*u) depends on the ALE
             # deformation d through J and F — it must track the same geometry
