@@ -663,6 +663,17 @@ class Problem(LoggerBase):
                 const = k*rho*prm['eps']
                 self.forms['p']['laplacian'] += const*inner(t_p, t_q)*ds(bid)
 
+            # Tangential pressure-gradient penalty g*(grad_t p, grad_t q)*ds:
+            # drives p -> const across the outlet face -> promotes normal (1D)
+            # flow, damping diastolic recirculation (a soft Windkessel
+            # condensation). Enable via windkessel: tangent_penalty:
+            # {enabled: true, gamma: G} (high G = stronger toward uniform p).
+            _tp = self.options.get('windkessel', {}).get('tangent_penalty', {})
+            if _tp.get('enabled', False):
+                _g = float(_tp.get('gamma', 0.0))
+                for bid, prm in self.bc_dict['p']['windkessel']['params'].items():
+                    self.forms['p']['laplacian'] += _g*inner(t_p, t_q)*ds(bid)
+
             if self.wk['implicit']:
                 sqrt_fac = sqrt(k*rho) # + 1e-14 
                 self.forms['p'].update({
