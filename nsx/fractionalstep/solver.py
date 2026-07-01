@@ -447,6 +447,41 @@ class Solver(LoggerBase):
 
         assert np.allclose(t_u, io['restart']['time'])
 
+        # Restore BDF2 history (u0_lst) + Windkessel reservoir state (pi only --
+        # Pl is the outlet-mean of p, recomputed from the restored pressure).
+        # Backward-compatible: missing fields in an old checkpoint warn + fall back.
+        if comm.rank == 0:
+            with h5py.File(str(w_file), 'r') as f:
+                u0_full = [np.array(f['u0_%d' % i]) for i in range(len(self.u0_lst))
+                           if ('u0_%d' % i) in f]
+                if self._using_wk:
+                    wk_pi = {b: f.attrs.get('wk_pi_%d' % b)
+                             for b in self.bc_dict['p']['windkessel']['params']}
+                else:
+                    wk_pi = {}
+        else:
+            u0_full, wk_pi = None, None
+        u0_full = comm.bcast(u0_full, root=0)
+        wk_pi = comm.bcast(wk_pi, root=0)
+        if u0_full and len(u0_full) == len(self.u0_lst):
+            for _c, _arr in zip(self.u0_lst, u0_full):
+                _scatter_full(_c, _arr)
+            self.logger.info('Restored BDF2 velocity history (u0_lst).')
+        else:
+            self.logger.warning('Checkpoint missing BDF2 history (u0_lst); '
+                                'first restart step degrades to BDF1.')
+        if self._using_wk:
+            for _bid, _prm in self.bc_dict['p']['windkessel']['params'].items():
+                if wk_pi.get(_bid) is not None:
+                    _prm['pi'].value = float(wk_pi[_bid])
+                    self.logger.info('Restored Windkessel reservoir state bid %d: '
+                                     'pi=%.6g (Pl recomputed from restored p).'
+                                     % (_bid, float(wk_pi[_bid])))
+                else:
+                    self.logger.warning('Checkpoint missing Windkessel pi for '
+                                        'bid %d; resets to p0 (restart may jump).'
+                                        % _bid)
+
         # self.t is time of first computed time step
         t0 = io['restart']['time']
         self.t = t0
@@ -2599,11 +2634,25 @@ class Solver(LoggerBase):
 
         u_full = _gather_full(u_out)
         p_full = _gather_full(self.p)
+        # BDF2 previous-step velocity history (collective gather, outside the
+        # rank-0 guard) so a restart has the correct du/dt on its first step.
+        u0_full = [_gather_full(c) for c in self.u0_lst]
 
         if comm.rank == 0:
             with h5py.File(path + 'w.h5', 'w') as f:
                 f.create_dataset('u', data=u_full)
                 f.create_dataset('p', data=p_full)
+                for _i, _arr in enumerate(u0_full):
+                    f.create_dataset('u0_%d' % _i, data=_arr)
+                # Windkessel reservoir state (pi integrates flow over time; Pl
+                # is the outlet pressure). Without these a restart resets pi to
+                # p0 -> systolic pressure discontinuity -> blow-up.
+                if self._using_wk:
+                    # pi is the ONLY irreducible WK state (integrates flow across
+                    # steps). Pl is the outlet-mean of p, recomputed from the
+                    # restored pressure on restart -> not stored.
+                    for _bid, _prm in self.bc_dict['p']['windkessel']['params'].items():
+                        f.attrs['wk_pi_%d' % _bid] = float(_prm['pi'].value)
                 f.attrs['t'] = float(self.t)
 
         if self._using_ale:
