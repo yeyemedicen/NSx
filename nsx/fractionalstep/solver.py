@@ -440,10 +440,18 @@ class Solver(LoggerBase):
             if comm.rank == 0:
                 with h5py.File(str(restart_path / 'd.h5'), 'r') as f:
                     d_full = np.array(f['d'])
+                    d0_full = np.array(f['d0']) if 'd0' in f else None
             else:
                 d_full = None
+                d0_full = None
             d_full = comm.bcast(d_full, root=0)
+            d0_full = comm.bcast(d0_full, root=0)
             _scatter_full(self.d, d_full)
+            if d0_full is not None:
+                _scatter_full(self.d0, d0_full)
+            else:
+                self.d0.x.array[:] = self.d.x.array
+                self.d0.x.scatter_forward()
 
         assert np.allclose(t_u, io['restart']['time'])
 
@@ -1305,6 +1313,113 @@ class Solver(LoggerBase):
             A, U, vec, U
         )
 
+    def _wk_condense_assemble(self, A):
+        ''' Condensed implicit Windkessel (Bertoglio 2013, eq 3.13): enforce
+        p=const on each outlet Gamma_l by DOF-condensation.  Z collapses all
+        outlet pressure DOFs to ONE reduced DOF Pl per outlet; the reduced
+        operator  A_c = Z^T A Z  is COERCIVE (unlike the rank-1 MEAN penalty,
+        which leaves the non-mean outlet modes on the singular Neumann
+        Laplacian and loses coercivity under diastolic mesh distortion).  The
+        WK impedance delta_l*(Z^T u_l)^2 is added on the Pl diagonal (the same
+        coefficients as the LRC, Galerkin-projected). Stores _wk_Z/_wk_Ac/
+        _wk_Pl_gids/_wk_pred/_wk_outlet_owned. '''
+        from mpi4py import MPI as _MPI
+        from dolfinx.fem import locate_dofs_topological as _ldt
+        Q = self.p.function_space
+        imap = Q.dofmap.index_map
+        nloc = imap.size_local
+        N = imap.size_global
+        first = imap.local_range[0]
+        comm = Q.mesh.comm
+        rk = comm.rank
+        fdim = Q.mesh.topology.dim - 1
+
+        print('[condensed-WK] assemble START nloc=%d N=%d'%(nloc,N), flush=True) if comm.rank==0 else None
+        bids = list(self.bc_dict['p']['windkessel']['params'].keys())
+        is_out = np.zeros(nloc, dtype=bool)
+        dof_bid = -np.ones(nloc, dtype=np.int64)
+        outlet_owned = {}
+        for j, bid in enumerate(bids):
+            facets = self.bnds.find(bid)
+            dofs = _ldt(Q, fdim, facets)
+            owned = np.array([d for d in dofs if d < nloc], dtype=np.int64)
+            outlet_owned[bid] = owned
+            is_out[owned] = True
+            dof_bid[owned] = j
+        n_out = [comm.allreduce(int((dof_bid == j).sum()), op=_MPI.SUM)
+                 for j in range(len(bids))]
+
+        # reduced global numbering: interior DOFs compacted per rank, then one
+        # Pl DOF per outlet appended (all owned by rank 0).
+        n_int_owned = nloc - int(is_out.sum())
+        offs = comm.allgather(n_int_owned)
+        my_int_start = int(np.sum(offs[:rk]))
+        M_int = int(np.sum(offs))
+        Pl_gids = [M_int + j for j in range(len(bids))]
+        red = np.empty(nloc, dtype=np.int64)
+        ii = my_int_start
+        for d in range(nloc):
+            if is_out[d]:
+                red[d] = Pl_gids[int(dof_bid[d])]
+            else:
+                red[d] = ii
+                ii += 1
+        m_loc = n_int_owned + (len(bids) if rk == 0 else 0)
+        M = M_int + len(bids)
+
+        Z = PETSc.Mat().createAIJ(((nloc, N), (m_loc, M)), comm=comm)
+        Z.setUp()
+        for d in range(nloc):
+            Z.setValue(first + d, int(red[d]), 1.0)
+        Z.assemble()
+
+        print('[condensed-WK] Z built M=%d doing ptap...'%M, flush=True) if comm.rank==0 else None
+        Ac = A.ptap(Z)
+        print('[condensed-WK] ptap done', flush=True) if comm.rank==0 else None
+        for j, bid in enumerate(bids):
+            prm = self.bc_dict['p']['windkessel']['params'][bid]
+            u_l = _assemble_vec(self.forms['p']['windkessel_lhs'][bid])
+            u_arr = u_l.getArray()
+            sval = comm.allreduce(float(u_arr[outlet_owned[bid]].sum()),
+                                  op=_MPI.SUM)
+            delta = float(prm['delta_l'])
+            if rk == 0:
+                Ac.setValue(Pl_gids[j], Pl_gids[j], delta * sval * sval,
+                            addv=PETSc.InsertMode.ADD_VALUES)
+        Ac.assemble()
+        print('[condensed-WK] penalty+assemble done', flush=True) if comm.rank == 0 else None
+        # Direct solver for the condensed operator: gamg chokes on the
+        # single dense Pl row (huge degree from the collapsed outlet).
+        _ksp = self.solver_p.ksp
+        _ksp.setType('preonly'); _ksp.getPC().setType('lu')
+        _ksp.getPC().setFactorSolverType('mumps')
+        self._wk_Z = Z
+        self._wk_Ac = Ac
+        self._wk_Pl_gids = Pl_gids
+        self._wk_pred = Ac.createVecRight()
+        self._wk_outlet_owned = outlet_owned
+        if not getattr(self, '_wk_cond_logged', False):
+            self.logger.info('condensed WK: %d outlet(s), reduced DOFs %d '
+                             '(from %d), outlet DOFs %s', len(bids), M, N, n_out)
+            self._wk_cond_logged = True
+
+    def _wk_condense_check(self):
+        ''' Sanity check: after the condensed solve, p must be numerically
+        CONSTANT on each outlet.  Logged the first few steps. '''
+        if getattr(self, '_wk_check_count', 0) >= 3:
+            return
+        from mpi4py import MPI as _MPI
+        comm = self.p.function_space.mesh.comm
+        parr = self.phi.x.array
+        for bid, owned in self._wk_outlet_owned.items():
+            vmin = float(parr[owned].min()) if len(owned) else 1e30
+            vmax = float(parr[owned].max()) if len(owned) else -1e30
+            gmin = comm.allreduce(vmin, op=_MPI.MIN)
+            gmax = comm.allreduce(vmax, op=_MPI.MAX)
+            self.logger.info('  [condensed-WK] bid %d: outlet p spread=%.3e '
+                             'Pl=%.6g', bid, gmax - gmin, gmax)
+        self._wk_check_count = getattr(self, '_wk_check_count', 0) + 1
+
     def init_assembly_robin(self):
         ''' Initialize and assemble matrices related to Robin BCs
         (Navierslip/Transpiration) '''
@@ -1924,6 +2039,9 @@ class Solver(LoggerBase):
                 if not self.wk['implicit']:
                     _apply_dbc_to_mat(A, self.bc_dict['p']['windkessel']['dirichlet'])
                     self.solver_p.set_operator(A)
+                elif self.wk.get('condensed'):
+                    self._wk_condense_assemble(A)
+                    self.solver_p.set_operator(self._wk_Ac)
                 else:
                     self.assembly_windkessel(A)
                     self.update_windkessel_LRC()
@@ -1982,7 +2100,24 @@ class Solver(LoggerBase):
         bp = self.build_rhs_pressure()
         # self.logger.info('|bp|2: {}'.format(np.linalg.norm(bp.get_local())))
 
-        self.solver_p.solve(self.phi.x.petsc_vec, bp)
+        if self._using_wk and self.wk.get('condensed'):
+            # reduced RHS b_c = Z^T bp; solve coercive A_c; prolong p = Z p_red
+            _bc = self._wk_Ac.createVecRight()
+            self._wk_Z.multTranspose(bp, _bc)
+            # call the KSP directly: PETScSolver.solve does x.ghostUpdate,
+            # which errors on the ghost-less reduced vector _wk_pred. The
+            # prolonged full-space phi gets its ghosts via scatter_forward below.
+            self.solver_p.ksp.solve(_bc, self._wk_pred)
+            self.solver_p.conv_reason = self.solver_p.ksp.getConvergedReason()
+            self.solver_p.iterations = self.solver_p.ksp.getIterationNumber()
+            print('[condensed-WK] solve done (reason=%d it=%d)'
+                  % (self.solver_p.conv_reason, self.solver_p.iterations),
+                  flush=True) if self.p.function_space.mesh.comm.rank == 0 else None
+            self._wk_Z.mult(self._wk_pred, self.phi.x.petsc_vec)
+            self.phi.x.scatter_forward()
+            self._wk_condense_check()
+        else:
+            self.solver_p.solve(self.phi.x.petsc_vec, bp)
         # self.logger.info('|p|2: {}'.format(np.linalg.norm(self.phi.x.array)))
         # self.logger.debug(f"|p| = {norm(self.phi)}")
 
@@ -2657,9 +2792,11 @@ class Solver(LoggerBase):
 
         if self._using_ale:
             d_full = _gather_full(self.d)
+            d0_full = _gather_full(self.d0)   # prev ALE mesh: w=(d-d0)/dt. Restart fix.
             if comm.rank == 0:
                 with h5py.File(path + 'd.h5', 'w') as f:
                     f.create_dataset('d', data=d_full)
+                    f.create_dataset('d0', data=d0_full)
                     f.attrs['t'] = float(self.t)
 
         if self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS':

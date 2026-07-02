@@ -1000,6 +1000,7 @@ class BoundaryConditions(LoggerBase):
             if bc['type'] == 'windkessel':
                 self._using_wk = True
                 self.wk['implicit'] = self.options['windkessel']['implicit']
+                self.wk['condensed'] = self.options['windkessel'].get('condensed', False)
                 if not self.wk['implicit']:
                     self.wk['explicit'] = True
 
