@@ -370,12 +370,13 @@ class Solver(LoggerBase):
             if MPI.COMM_WORLD.rank == 0:
                 checkpoint_path.rename(backup_path)
                 pth = Path(io['write_path'])
-                files = ('u.xdmf', 'u.h5', 'p.xdmf', 'p.h5')
+                files = ['u.xdmf', 'u.h5', 'p.xdmf', 'p.h5']
                 if self._using_ale:
-                    # FIXME add upd separately?
-                    files.update(('d.xdmf', 'd.h5'))
+                    files += ['d.xdmf', 'd.h5']
                 for f in files:
-                    pth.joinpath(f).replace(backup_path.joinpath(f))
+                    src = pth.joinpath(f)
+                    if src.exists():
+                        src.replace(backup_path.joinpath(f))
 
                 for g in ('stats.*.dat', 'timings.*'):
                     [f.rename(backup_path.joinpath(f.name)) for f in
@@ -416,9 +417,18 @@ class Solver(LoggerBase):
 
         def _scatter_full(fn, full_arr):
             idx = fn.function_space.dofmap.index_map
+            bs = fn.function_space.dofmap.index_map_bs
+            expected = idx.size_global * bs
+            if full_arr is None or full_arr.size != expected:
+                self.logger.warning(
+                    'Checkpoint field size %s != expected %d (bs=%d); likely an '
+                    'OLD pre-blocksize-fix checkpoint -- skipping this field.'
+                    % (None if full_arr is None else full_arr.size, expected, bs))
+                return False
             start, end = idx.local_range
-            fn.x.array[:idx.size_local] = full_arr[start:end]
+            fn.x.array[:idx.size_local * bs] = full_arr[start * bs:end * bs]
             fn.x.scatter_forward()
+            return True
 
         if comm.rank == 0:
             with h5py.File(str(w_file), 'r') as f:
@@ -462,14 +472,17 @@ class Solver(LoggerBase):
             with h5py.File(str(w_file), 'r') as f:
                 u0_full = [np.array(f['u0_%d' % i]) for i in range(len(self.u0_lst))
                            if ('u0_%d' % i) in f]
+                upd_full = [np.array(f['upd_%d' % i]) for i in range(len(self.upd_lst))
+                            if ('upd_%d' % i) in f]
                 if self._using_wk:
                     wk_pi = {b: f.attrs.get('wk_pi_%d' % b)
                              for b in self.bc_dict['p']['windkessel']['params']}
                 else:
                     wk_pi = {}
         else:
-            u0_full, wk_pi = None, None
+            u0_full, upd_full, wk_pi = None, None, None
         u0_full = comm.bcast(u0_full, root=0)
+        upd_full = comm.bcast(upd_full, root=0)
         wk_pi = comm.bcast(wk_pi, root=0)
         if u0_full and len(u0_full) == len(self.u0_lst):
             for _c, _arr in zip(self.u0_lst, u0_full):
@@ -478,6 +491,16 @@ class Solver(LoggerBase):
         else:
             self.logger.warning('Checkpoint missing BDF2 history (u0_lst); '
                                 'first restart step degrades to BDF1.')
+        if self._using_ale:
+            if upd_full and len(upd_full) == len(self.upd_lst):
+                for _c, _arr in zip(self.upd_lst, upd_full):
+                    _scatter_full(_c, _arr)
+                self._merge_lst_to_vec(self.upd_lst, self.upd)
+                self.logger.info('Restored CT+ALE convection velocity (upd_lst).')
+            else:
+                self.logger.warning('Checkpoint missing upd_lst (CT+ALE convection);'
+                                    ' first restart tentative velocity WRONG -> spike.'
+                                    ' Re-run with the blocksize+upd_lst checkpoint fix.')
         if self._using_wk:
             for _bid, _prm in self.bc_dict['p']['windkessel']['params'].items():
                 if wk_pi.get(_bid) is not None:
@@ -2763,7 +2786,8 @@ class Solver(LoggerBase):
 
         def _gather_full(fn):
             idx = fn.function_space.dofmap.index_map
-            local_arr = fn.x.array[:idx.size_local].copy()
+            bs = fn.function_space.dofmap.index_map_bs
+            local_arr = fn.x.array[:idx.size_local * bs].copy()
             gathered = comm.gather(local_arr, root=0)
             return np.concatenate(gathered) if comm.rank == 0 else None
 
@@ -2772,6 +2796,12 @@ class Solver(LoggerBase):
         # BDF2 previous-step velocity history (collective gather, outside the
         # rank-0 guard) so a restart has the correct du/dt on its first step.
         u0_full = [_gather_full(c) for c in self.u0_lst]
+        # upd_lst = CT+ALE convection + tentative-RHS velocity (u_conv =
+        # as_vector(upd_lst)). Cold-init ZERO + only written in the velocity
+        # update -> WITHOUT restoring it a restart's first tentative solve uses
+        # upd_lst=0 -> |u_t| collapse -> pressure spike -> blow-up (fix 2026-07-02).
+        upd_full = ([_gather_full(c) for c in self.upd_lst]
+                    if self._using_ale else [])
 
         if comm.rank == 0:
             with h5py.File(path + 'w.h5', 'w') as f:
@@ -2779,6 +2809,8 @@ class Solver(LoggerBase):
                 f.create_dataset('p', data=p_full)
                 for _i, _arr in enumerate(u0_full):
                     f.create_dataset('u0_%d' % _i, data=_arr)
+                for _i, _arr in enumerate(upd_full):
+                    f.create_dataset('upd_%d' % _i, data=_arr)
                 # Windkessel reservoir state (pi integrates flow over time; Pl
                 # is the outlet pressure). Without these a restart resets pi to
                 # p0 -> systolic pressure discontinuity -> blow-up.
