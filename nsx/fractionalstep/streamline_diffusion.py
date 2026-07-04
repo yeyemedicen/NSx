@@ -9,7 +9,7 @@ import dolfinx.fem as fem
 import ufl
 from ufl import (
     CellDiameter, JacobianInverse,
-    sqrt, inner, dot, transpose,
+    sqrt, inner, dot, transpose, inv,
     conditional, lt, gt,
 )
 from petsc4py import PETSc
@@ -22,9 +22,15 @@ def _C(mesh, val):
     return fem.Constant(mesh, np.array(val, dtype=PETSc.ScalarType))
 
 
-def _metric_tensor(mesh):
+def _metric_tensor(mesh, F=None):
+    # Covariant metric G=(dxi/dx)^T(dxi/dx). Fixed mesh: dxi/dx=Jinv. Under ALE
+    # x=X+d so dxi/dx=Jinv.F^-1 and the DEFORMED metric is F^-T (Jinv^T Jinv) F^-1.
     Jinv = JacobianInverse(mesh)
-    return transpose(Jinv) * Jinv
+    G = transpose(Jinv) * Jinv
+    if F is not None:
+        Finv = inv(F)
+        G = transpose(Finv) * G * Finv
+    return G
 
 
 class SDParameter(LoggerBase):
@@ -58,7 +64,7 @@ class SDParameter(LoggerBase):
         self.update_tau()
         return self._tau_func
 
-    def stabilization_parameter(self, u_conv, u_conv_assigned=None):
+    def stabilization_parameter(self, u_conv, u_conv_assigned=None, F=None, w=None):
         ''' SD stabilization parameter.
 
         Args:
@@ -77,7 +83,7 @@ class SDParameter(LoggerBase):
             u_conv_assigned = u_conv
 
         if parameter == 'shakib':
-            tau = self.tau_shakib(u_conv, u_conv_assigned)
+            tau = self.tau_shakib(u_conv, u_conv_assigned, F, w)
         elif parameter in ('standard', 'default'):
             tau = self.tau_standard(u_conv, u_conv_assigned)
         elif parameter == 'klr':
@@ -90,7 +96,7 @@ class SDParameter(LoggerBase):
 
         return tau
 
-    def tau_shakib(self, u_conv, u_conv_assigned):
+    def tau_shakib(self, u_conv, u_conv_assigned, F=None, w=None):
         opt = self.options['fem']['stabilization']['streamline_diffusion']
         alpha = _C(self.mesh, 2.)
         rho = self.rho
@@ -102,11 +108,13 @@ class SDParameter(LoggerBase):
         Cinv = _C(self.mesh, opt['Cinv']) if isinstance(opt['Cinv'], (int, float)) \
             else _C(self.mesh, cinv_default)
 
+        # ALE: convect by mesh-relative velocity (u-w) + deformed metric F^-T G F^-1
+        uc = u_conv_assigned if w is None else (u_conv_assigned - w)
         if opt['length_scale'] == 'metric':
-            G = _metric_tensor(self.mesh)
+            G = _metric_tensor(self.mesh, F)
             tau_ufl = 1. / sqrt(
                 (alpha * k)**2
-                + dot(u_conv_assigned, G * u_conv_assigned)
+                + dot(uc, G * uc)
                 + Cinv * (mu / rho)**2 * inner(G, G)
             )
             len_scale = 'metric'

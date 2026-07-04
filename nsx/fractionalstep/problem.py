@@ -889,12 +889,26 @@ class Problem(LoggerBase):
 
         sd = SDParameter(self.options, self.mesh, mu, rho, k,
                          self._logging_filehandler)
-        tau = sd.stabilization_parameter(u_conv, self.u_conv_assigned)
+        if self._using_ale:
+            w_conv = self.k*(self.d - self.d0)
+            tau = sd.stabilization_parameter(u_conv, self.u_conv_assigned,
+                                             F=self.F, w=w_conv)
+        else:
+            w_conv = None
+            tau = sd.stabilization_parameter(u_conv, self.u_conv_assigned)
         self._sd_param = sd   # stored so solver can call sd.update_tau() each step
 
         ui = TrialFunction(self.Vi)
         vi = TestFunction(self.Vi)
-        residual_convdiff = rho*dot(u_conv, grad(ui))
+        # ALE-consistent SUPG: relative velocity (u-w), deformed spatial gradient
+        # F^-T grad, deformed volume measure J*dx. Fixed-mesh form otherwise.
+        if self._using_ale:
+            _Finv = inv(self.F)
+            _c = u_conv - w_conv
+            _gx = lambda _f: dot(grad(_f), _Finv)
+            residual_convdiff = rho*dot(_c, _gx(ui))
+        else:
+            residual_convdiff = rho*dot(u_conv, grad(ui))
 
         if 'consistent' in opt and opt['consistent']:
             raise Exception('Consistent SUPG not implemented because dp/dxi'
@@ -911,7 +925,13 @@ class Problem(LoggerBase):
 
         self.logger.info('SD/SUPG residual: {r}'.format(r=res_str))
 
-        a_supg_convdiff = tau*dot(u_conv, grad(vi))*residual_convdiff*dx
+        if self._using_ale:
+            # cap quadrature: the ALE SUPG integrand has inv(F)/J (rational) →
+            # UFL auto-degree explodes when summed into the conv form (FFCx hang).
+            _dx_supg = dx(metadata={'quadrature_degree': 6})
+            a_supg_convdiff = tau*dot(_c, _gx(vi))*residual_convdiff*self.J*_dx_supg
+        else:
+            a_supg_convdiff = tau*dot(u_conv, grad(vi))*residual_convdiff*dx
 
         return {'supg_convdiff': a_supg_convdiff, 'supg_time': a_supg_time}
 
