@@ -2041,37 +2041,56 @@ class Solver(LoggerBase):
         if not self.bc_dict['p']['dirichlet']:
             A.setNearNullSpace(self._p_nullspace())
 
+    def _wk_ac_mesh_changed(self):
+        ''' True if the ALE mesh (self.d) changed since A_c was last built.
+        FGG freezes the mesh within a step -> False across sub-iters -> reuse
+        the cached condensed operator + its MUMPS factorization. '''
+        cur = self.d.x.array
+        cached = getattr(self, '_wk_ac_d_cached', None)
+        return (cached is None or cached.shape != cur.shape
+                or not np.array_equal(cached, cur))
+
+    def _wk_ac_cache_mesh(self):
+        self._wk_ac_d_cached = self.d.x.array.copy()
+
     def assemble_pressure(self):
         ''' Assemble matrix of pressure projection, in the case of variable
         coefficient Robin boundary conditions. '''
 
         if self._using_ale or self._using_mapdd:
-            A = self.mat['p']['laplacian'].copy()
-            _assemble_mat(self.forms['p']['laplacian'], mat=A)
-            _apply_dbc_to_mat(A, self.bc_dict['p']['dirichlet'])
-            self._attach_p_nullspace(A)
-
-            # The divergence RHS operator div(J*F^{-1}*u) depends on the ALE
-            # deformation d through J and F — it must track the same geometry
-            # as the Laplacian, otherwise the projection enforces div(u)=0 on
-            # a stale mesh and the mismatch acts as a spurious mass source
-            # scaled by k=1/dt.
-            _assemble_mat(self.forms['p']['rhs_u'], mat=self.mat['p']['rhs_u'])
-
-            if self._using_wk:
-                if not self.wk['implicit']:
-                    _apply_dbc_to_mat(A, self.bc_dict['p']['windkessel']['dirichlet'])
-                    self.solver_p.set_operator(A)
-                elif self.wk.get('condensed'):
-                    self._wk_condense_assemble(A)
-                    self.solver_p.set_operator(self._wk_Ac)
-                else:
-                    self.assembly_windkessel(A)
-                    self.update_windkessel_LRC()
-                    self.solver_p.set_operator(
-                        self.mat['p']['windkessel_lhs_lrc'], A)
+            _cond = self._using_wk and self.wk.get('condensed')
+            if _cond and not self._wk_ac_mesh_changed():
+                # A_c-CACHE (FGG): the mesh is FROZEN within a step, so the
+                # Laplacian A, rhs_u, the Z projection and A_c (+ its MUMPS
+                # factorization) are IDENTICAL across the ~20+ FSI sub-iters.
+                # Reuse them (skip rebuild + refactorization); only the RHS
+                # vector is rebuilt per sub-iter in the caller. ~4-5x. 2026-07-05.
+                pass
             else:
-                self.solver_p.set_operator(A)
+                A = self.mat['p']['laplacian'].copy()
+                _assemble_mat(self.forms['p']['laplacian'], mat=A)
+                _apply_dbc_to_mat(A, self.bc_dict['p']['dirichlet'])
+                self._attach_p_nullspace(A)
+
+                # rhs_u = div(J*F^{-1}*u) must track the same geometry as the
+                # Laplacian (else the projection enforces div=0 on a stale mesh).
+                _assemble_mat(self.forms['p']['rhs_u'], mat=self.mat['p']['rhs_u'])
+
+                if self._using_wk:
+                    if not self.wk['implicit']:
+                        _apply_dbc_to_mat(A, self.bc_dict['p']['windkessel']['dirichlet'])
+                        self.solver_p.set_operator(A)
+                    elif self.wk.get('condensed'):
+                        self._wk_condense_assemble(A)
+                        self.solver_p.set_operator(self._wk_Ac)
+                        self._wk_ac_cache_mesh()
+                    else:
+                        self.assembly_windkessel(A)
+                        self.update_windkessel_LRC()
+                        self.solver_p.set_operator(
+                            self.mat['p']['windkessel_lhs_lrc'], A)
+                else:
+                    self.solver_p.set_operator(A)
 
 
         if self._optimize_robin and not self._using_ale:
