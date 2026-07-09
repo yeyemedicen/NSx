@@ -85,11 +85,11 @@ class SDParameter(LoggerBase):
         if parameter == 'shakib':
             tau = self.tau_shakib(u_conv, u_conv_assigned, F, w)
         elif parameter in ('standard', 'default'):
-            tau = self.tau_standard(u_conv, u_conv_assigned)
+            tau = self.tau_standard(u_conv, u_conv_assigned, F, w)
         elif parameter == 'klr':
-            tau = self.tau_klr(u_conv, u_conv_assigned)
+            tau = self.tau_klr(u_conv, u_conv_assigned, F, w)
         elif parameter == 'codina':
-            tau = self.tau_codina(u_conv, u_conv_assigned)
+            tau = self.tau_codina(u_conv, u_conv_assigned, F, w)
         else:
             raise Exception('streamline diffusion parameter unknown: {}'.
                             format(parameter))
@@ -144,17 +144,19 @@ class SDParameter(LoggerBase):
             return self._make_element_constant_tau(tau_ufl)
         return tau_ufl
 
-    def tau_standard(self, u_conv, u_conv_assigned):
+    def tau_standard(self, u_conv, u_conv_assigned, F=None, w=None):
         opt = self.options['fem']['stabilization']['streamline_diffusion']
         rho = self.rho
         mu = self.mu
         eps = 1e-10
         elem_const = bool(opt.get('parameter_element_constant', False))
 
+        # ALE: convect by mesh-relative velocity (u-w); deform the length scale
+        uc = u_conv_assigned if w is None else (u_conv_assigned - w)
         if opt['length_scale'] == 'metric':
-            G = _metric_tensor(self.mesh)
-            u_inner_metric = sqrt(dot(u_conv_assigned, G * u_conv_assigned))
-            u_norm2 = dot(u_conv_assigned, u_conv_assigned)
+            G = _metric_tensor(self.mesh, F)
+            u_inner_metric = sqrt(dot(uc, G * uc))
+            u_norm2 = dot(uc, uc)
             Pe = u_norm2 / (u_inner_metric + eps) * rho / mu
             xi = conditional(lt(Pe, 3.), Pe / 3., ufl.as_ufl(1.))
             tau_ufl = conditional(gt(u_inner_metric, eps),
@@ -163,7 +165,9 @@ class SDParameter(LoggerBase):
             len_scale = 'metric'
         else:
             h = CellDiameter(self.mesh)
-            u_norm = sqrt(dot(u_conv_assigned, u_conv_assigned))
+            if F is not None:
+                h = h * ufl.det(F)**(1.0 / self.mesh.geometry.dim)
+            u_norm = sqrt(dot(uc, uc))
             Pe = 0.5 * u_norm * h * rho / mu
             xi = conditional(lt(Pe, 3.), Pe / 3., ufl.as_ufl(1.))
             tau_ufl = conditional(gt(u_norm, eps),
@@ -178,8 +182,10 @@ class SDParameter(LoggerBase):
             return self._make_element_constant_tau(tau_ufl)
         return tau_ufl
 
-    def tau_klr(self, u_conv, u_conv_assigned):
+    def tau_klr(self, u_conv, u_conv_assigned, F=None, w=None):
         h = CellDiameter(self.mesh)
+        if F is not None:
+            h = h * ufl.det(F)**(1.0 / self.mesh.geometry.dim)
         mu = self.mu
         rho = self.rho
         k = self.k
@@ -187,7 +193,8 @@ class SDParameter(LoggerBase):
         pk_val = float(''.join(c for c in str(deg) if c.isdigit()) or '1') ** 2
         pk = _C(self.mesh, pk_val)
         eps = 1e-10
-        u_norm = sqrt(dot(u_conv_assigned, u_conv_assigned)) + eps
+        uc = u_conv_assigned if w is None else (u_conv_assigned - w)
+        u_norm = sqrt(dot(uc, uc)) + eps
         a = 0.5 * h / u_norm
         b = 2. / 3. / k
         c0 = h**2 / (pk * mu / rho)
@@ -198,12 +205,15 @@ class SDParameter(LoggerBase):
         self.logger.info('SD parameter: KLR')
         return tau
 
-    def tau_codina(self, u_conv, u_conv_assigned):
+    def tau_codina(self, u_conv, u_conv_assigned, F=None, w=None):
         h = CellDiameter(self.mesh)
+        if F is not None:
+            h = h * ufl.det(F)**(1.0 / self.mesh.geometry.dim)
         rho = self.rho
         mu = self.mu
         k = self.k
-        tau = 1. / (4 * mu / rho / h**2 + sqrt(inner(u_conv, u_conv)) / h + 1.5 * k)
+        uc = u_conv if w is None else (u_conv - w)
+        tau = 1. / (4 * mu / rho / h**2 + sqrt(inner(uc, uc)) / h + 1.5 * k)
 
         self.logger.info('SD parameter: Codina')
         return tau
