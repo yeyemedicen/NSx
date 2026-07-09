@@ -1969,6 +1969,7 @@ class Solver(LoggerBase):
             self.iterations_ksp['u_ten'][i].append(
                 self.solver_u_ten.iterations)
             self.residuals_ksp['u_ten'][i].append(self.solver_u_ten.residuals)
+            bu_i.destroy()   # per-sub-iter/component RHS -> free (petsc defers GC)
 
 
         timer.stop()
@@ -1995,15 +1996,22 @@ class Solver(LoggerBase):
             # FSI semi-implicit projection coupling: Neumann data
             # rho*k*(u_tent - v_si)·n on the interface (see form_pressure).
             # v_si changes every FSI sub-iteration — assemble fresh.
-            bp.axpy(1.0, _assemble_vec(self.forms['p']['fsi_si_rhs']))
+            _t_si = _assemble_vec(self.forms['p']['fsi_si_rhs'])
+            bp.axpy(1.0, _t_si)
+            _t_si.destroy()
 
         if self.vec['p']['rhs_const']:
             bp.axpy(1.0, self.vec['p']['rhs_const'])
         # check neumann form again for compatibility with FSI
         elif self.forms['p']['neumann'] and self.ale['type'] == 'external':
-            bp.axpy(1.0, _assemble_vec(self.forms['p']['neumann']))
+            _t_nm = _assemble_vec(self.forms['p']['neumann'])
+            bp.axpy(1.0, _t_nm)
+            _t_nm.destroy()
 
         if self._using_wk and self.wk['implicit']:
+            _old_wk = self.vec['p'].get('windkessel_rhs')
+            if hasattr(_old_wk, 'destroy'):
+                _old_wk.destroy()
             self.vec['p']['windkessel_rhs'] = _assemble_vec(self.forms['p']['windkessel_rhs'])
             bp.axpy(1.0, self.vec['p']['windkessel_rhs'])
 
@@ -2158,8 +2166,10 @@ class Solver(LoggerBase):
             self._wk_Z.mult(self._wk_pred, self.phi.x.petsc_vec)
             self.phi.x.scatter_forward()
             self._wk_condense_check()
+            _bc.destroy()
         else:
             self.solver_p.solve(self.phi.x.petsc_vec, bp)
+        bp.destroy()   # per-sub-iter RHS; petsc defers implicit GC -> leak
         # self.logger.info('|p|2: {}'.format(np.linalg.norm(self.phi.x.array)))
         # self.logger.debug(f"|p| = {norm(self.phi)}")
 
