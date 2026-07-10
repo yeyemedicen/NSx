@@ -1112,6 +1112,15 @@ class Solver(LoggerBase):
 
         self.u.x.array[:] = state[0].x.array
         self._split_vec_to_lst(self.u, self.u_lst)
+        if self._using_ale and self.state_velocity == 'update':
+            # upd_lst is the CT+ALE convection/tentative-RHS velocity. With
+            # state_velocity='update' it is only rewritten by
+            # solve_velocity_update, so a particle restart that skips the
+            # sync would run the fluid operator with the PREVIOUS particle's
+            # velocity -- the state perturbation never enters the forms and
+            # the ROUKF fluid sensitivities vanish.
+            self.upd.x.array[:] = state[0].x.array
+            self._split_vec_to_lst(self.upd, self.upd_lst)
         enum_wk = enumerate(self.bc_dict['p']['windkessel']['params'].items())
         for k, (bid, prm) in enum_wk:
             # adding wk pressure if C != 0
@@ -1824,6 +1833,11 @@ class Solver(LoggerBase):
             # js depends on the ALE deformation — reassemble each solve.
             bu_i.axpy(1.0, _assemble_vec(self.forms['u']['fsi_robin_rhs'][i]))
 
+        if self.forms['u'].get('fsi_nitsche_rhs'):
+            # FSI Nitsche interface data (-mu(grad v.F^-1).nans + gamma mu/h v)*v_rb:
+            # v_rb updated by the coupler each sub-iteration; ALE-dependent -> reassemble.
+            bu_i.axpy(1.0, _assemble_vec(self.forms['u']['fsi_nitsche_rhs'][i]))
+
         return bu_i
 
     def assemble_robin_tentative_velocity(self, A, bu_i, i):
@@ -2360,6 +2374,10 @@ class Solver(LoggerBase):
                     rb = self.bc_dict['u']['fsi_robin']
                     rb['v_rb'].x.array[:] = self.v_bc.x.array
                     rb['v_rb'].x.scatter_forward()
+                if self.bc_dict['u'].get('fsi_nitsche'):
+                    nt = self.bc_dict['u']['fsi_nitsche']
+                    nt['v_rb'].x.array[:] = self.v_bc.x.array
+                    nt['v_rb'].x.scatter_forward()
 
     # =========================================================================
     # Windkessel

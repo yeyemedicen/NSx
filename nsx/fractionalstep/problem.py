@@ -24,7 +24,7 @@ import ufl
 from ufl import (
     TrialFunction, TestFunction,
     as_vector, inner, sym, grad, dx, dot, div,
-    FacetNormal, Measure, Identity, inv, det, sqrt, CellVolume,
+    FacetNormal, Measure, Identity, inv, det, sqrt, CellVolume, CellDiameter,
 )
 import numpy as np
 from petsc4py import PETSc
@@ -535,6 +535,8 @@ class Problem(LoggerBase):
         # See BoundaryConditions._fsi_robin_velocity for the construction.
         if self.bc_dict['u'].get('fsi_robin'):
             a_conv += self.bc_dict['u']['fsi_robin']['lhs']
+        if self.bc_dict['u'].get('fsi_nitsche'):
+            a_conv += self.bc_dict['u']['fsi_nitsche']['lhs']
 
         # [-p*vi.dx(i)*dx for i in range(self.ndim)]
         a_pres_lst = [-p*J0*dot(grad(vi), inv(F0))[i]*dx for i in range(self.ndim)]
@@ -565,6 +567,9 @@ class Problem(LoggerBase):
             'fsi_robin_rhs': (self.bc_dict['u']['fsi_robin']['rhs']
                               if self.bc_dict['u'].get('fsi_robin')
                               else None),
+            'fsi_nitsche_rhs': (self.bc_dict['u']['fsi_nitsche']['rhs']
+                                if self.bc_dict['u'].get('fsi_nitsche')
+                                else None),
         })
 
         if 'inflow_lhs' in self.bc_dict['u']:
@@ -1040,6 +1045,7 @@ class BoundaryConditions(LoggerBase):
                 # set by _fsi_robin_velocity(), consumed in
                 # form_velocity_tentative() and build_rhs_tentative_velocity()
                 'fsi_robin': None,
+                'fsi_nitsche': None,
                 'dbc_expressions': {},
                 'dbc_functions': {},
                 # same_dbc_boundaries is used in
@@ -1174,6 +1180,9 @@ class BoundaryConditions(LoggerBase):
                 self._parable(bc)
             elif bc['type'] == 'fsi_robin':
                 self._fsi_robin_velocity(bc)
+                # pressure: Neumann zero, do-nothing (same as dirichlet)
+            elif bc['type'] == 'fsi_nitsche':
+                self._fsi_nitsche_velocity(bc)
                 # pressure: Neumann zero, do-nothing (same as dirichlet)
             elif bc['type'] == 'fsi':
                 # FSI interface velocity (v_s) + ALE displacement (d_s) in one entry.
@@ -1528,6 +1537,52 @@ class BoundaryConditions(LoggerBase):
         self.logger.info('FSI Robin-Neumann interface at boundary {} '
                          '(alpha={})'.format(bc['id'],
                                              bc['parameters']['alpha']))
+
+    def _fsi_nitsche_velocity(self, bc):
+        ''' FSI Nitsche weak imposition of the interface velocity u = v_rb
+        (Burman-Fernandez consistent-penalty). Replaces the strong interface
+        velocity Dirichlet BC by symmetric Nitsche terms on the tentative
+        velocity, matching the ALE viscous operator's boundary flux
+        mu*(grad(u).F^-1).nans (nans = J F^-T N, the Nanson vector):
+
+            LHS += ( -mu*(grad(u).F^-1).nans * v          consistency
+                     -mu*(grad(v).F^-1).nans * u          symmetry
+                     + gamma*mu/h * u * v * js ) ds        penalty
+            RHS += ( -mu*(grad(v).F^-1).nans * v_rb_i
+                     + gamma*mu/h * v_rb_i * v * js ) ds
+
+        Solid takes the standard Neumann traction (Nitsche-Dirichlet/Neumann).
+        v_rb (solid interface velocity) is set by update_velocity_bcs each
+        sub-iteration, exactly like the Robin path. gamma >= inverse-inequality
+        constant for coercivity (default 100 for P1). '''
+        if self.options['fem']['strain_symmetric']:
+            raise NotImplementedError(
+                'fsi_nitsche not implemented for strain_symmetric viscous form')
+        ui = TrialFunction(self.Vi)
+        vi = TestFunction(self.Vi)
+        n = FacetNormal(self.mesh)
+        nans = self.J*inv(self.F).T*n
+        js = sqrt(dot(nans, nans))
+        h = CellDiameter(self.mesh)
+        mu = self.mu
+        gamma = self._C(bc.get('parameters', {}).get('gamma', 100.0))
+        v_rb = Function(self.V, name='fsi_nitsche_velocity')
+
+        _gx = lambda f: dot(grad(f), inv(self.F))     # physical spatial grad
+        flux_u = mu*dot(_gx(ui), nans)                # mu (grad u . F^-1) . nans
+        flux_v = mu*dot(_gx(vi), nans)
+        lhs = (-flux_u*vi - flux_v*ui
+               + gamma*mu/h*ui*vi*js)*self.ds(bc['id'])
+        rhs = {i: (-flux_v*v_rb[i]
+                   + gamma*mu/h*v_rb[i]*vi*js)*self.ds(bc['id'])
+               for i in range(self.ndim)}
+        self.bc_dict['u']['fsi_nitsche'] = {
+            'id': bc['id'], 'gamma': gamma, 'v_rb': v_rb,
+            'lhs': lhs, 'rhs': rhs,
+        }
+        self.logger.info('FSI Nitsche interface at boundary {} (gamma={})'
+                         .format(bc['id'],
+                                 bc.get('parameters', {}).get('gamma', 100.0)))
 
     # =========================================================================
     # Inflow BCs
