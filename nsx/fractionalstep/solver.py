@@ -3465,7 +3465,7 @@ class Solver(LoggerBase):
 
         self.logger.warning(
             'State function spaces: {}'.format(
-                [W.ufl_element().family() for W in W_lst]
+                [str(W.ufl_element()) for W in W_lst]
             )
         )
 
