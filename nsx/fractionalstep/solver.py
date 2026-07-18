@@ -817,17 +817,44 @@ class Solver(LoggerBase):
             raise Exception('Unsupported measurement FE degree: {}'
                             .format(degree))
 
+        # Which observable each measurement carries. 'velocity' (default)
+        # observes the state directly; 'vorticity' applies curl to it, so the
+        # measurement is scalar in 2D and a vector in 3D (see observation()).
+        self._observation_kinds = [meas.get('observable', 'velocity')
+                                   for meas in measurement_lst]
+        for kind in self._observation_kinds:
+            if kind not in ('velocity', 'vorticity'):
+                raise Exception(
+                    "measurements: observable must be 'velocity' or "
+                    "'vorticity', got {!r}".format(kind))
+        if any(k == 'vorticity' for k in self._observation_kinds):
+            self.logger.info(
+                'Observation operator: %s',
+                ', '.join('#{} {}'.format(i, k) for i, k in
+                          enumerate(self._observation_kinds)))
+
         fun_lst = []
         fun_aux_lst = []
         V_aux = None
-        for meshfile in mesh_lst:
+        for meshfile, kind in zip(mesh_lst, self._observation_kinds):
             mesh, _, _ = inout.read_mesh(meshfile)
-            if all_scalar:
+            family = "Lagrange" if element_family == 'P' else "DG"
+            if kind == 'vorticity':
+                # curl u: scalar in 2D, vector in 3D. velocity_direction does
+                # not apply.
+                if self.ndim == 2:
+                    V = functionspace(mesh, (family, degree))
+                else:
+                    V = functionspace(mesh, (family, degree, (3,)))
+                fun_aux_lst.append(None)
+            elif all_scalar:
                 V = functionspace(mesh, ("Lagrange" if element_family == 'P' else "DG", degree))
                 V_aux = functionspace(mesh, ("Lagrange" if element_family == 'P' else "DG", degree, (self.ndim,)))
                 fun_aux_lst.append(Function(V_aux))
             else:
                 V = functionspace(mesh, ("Lagrange" if element_family == 'P' else "DG", degree, (self.ndim,)))
+                # keep fun_aux_lst index-aligned with the measurement list
+                fun_aux_lst.append(None)
             fun_lst.append(Function(V))
 
         self._observation_fun_aux_lst = fun_aux_lst
@@ -1074,9 +1101,50 @@ class Solver(LoggerBase):
         dest.interpolate_nonmatching(src, cells, interp_data)
         dest.x.scatter_forward()
 
+    def vorticity(self):
+        ''' Vorticity of the current velocity, curl(u), as a Function on the
+        FLUID mesh.
+
+        Computed here rather than on the measurement mesh because curl is a
+        derivative: it must be taken where the velocity actually lives. The
+        result is then interpolated onto the measurement mesh like any other
+        observable.
+
+        The gradient is the SPATIAL one, grad(u)*inv(F), so this stays correct
+        under ALE (F = I without ALE). For P1 velocity the curl is
+        element-wise constant, so DG0 represents it exactly -- no projection
+        and no solve, which matters because this runs once per sigma point
+        per time step.
+
+        Returns:
+            Function: scalar (2D) or 3-vector (3D) vorticity on the fluid mesh
+        '''
+        gu = ufl.dot(ufl.grad(self.u), ufl.inv(self.F))
+
+        if getattr(self, '_vort_fun', None) is None:
+            mesh = self.u.function_space.mesh
+            if self.ndim == 2:
+                W = functionspace(mesh, ('DG', 0))
+                expr = gu[1, 0] - gu[0, 1]
+            else:
+                W = functionspace(mesh, ('DG', 0, (3,)))
+                expr = ufl.as_vector((gu[2, 1] - gu[1, 2],
+                                      gu[0, 2] - gu[2, 0],
+                                      gu[1, 0] - gu[0, 1]))
+            self._vort_fun = Function(W, name='vorticity')
+            self._vort_expr = fem.Expression(
+                expr, W.element.interpolation_points)
+
+        self._vort_fun.interpolate(self._vort_expr)
+        self._vort_fun.x.scatter_forward()
+        return self._vort_fun
+
     def observation(self, Xobs_lst):
         ''' Compute observation by applying the observation operator to the
         state, H(X).
+
+        Each measurement's `observable` key selects the operator: 'velocity'
+        (default) reads the state directly, 'vorticity' applies curl to it.
 
         Args:
             Xobs_lst    list of receiving measurement functions
@@ -1086,9 +1154,14 @@ class Solver(LoggerBase):
         else:
             Xobs_aux_lst = self._observation_fun_aux_lst
 
+        kinds = getattr(self, '_observation_kinds', None) or \
+            ['velocity']*len(Xobs_lst)
+
         if not self._observation_res_lst:
             for i, (Xobs, Xobs_aux) in enumerate(zip(Xobs_lst, Xobs_aux_lst)):
-                if Xobs_aux:
+                if kinds[i] == 'vorticity':
+                    self._interpolate_observation(Xobs, self.vorticity())
+                elif Xobs_aux:
                     # Xobs is scalar, Xobs_aux vector
 
                     direction = (self.options['estimation']['measurements'][i]

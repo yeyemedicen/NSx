@@ -1518,6 +1518,8 @@ class BoundaryConditions(LoggerBase):
         if not ('id' in bc and 'value' in bc):
             raise KeyError('bc dict needs keys id & value')
 
+        self._check_pressure_bc_scheme(bc)
+
         facets = self.facet_tags.find(bc['id'])
         dofs = locate_dofs_topological(self.Q, self.mesh.topology.dim - 1, facets)
         # shares the Constant with the velocity traction for 'neumann' BCs,
@@ -1525,6 +1527,53 @@ class BoundaryConditions(LoggerBase):
         self.bc_dict['p']['dirichlet'].append(
             dirichletbc(self._bc_time_constant(bc), dofs, self.Q)
         )
+
+    def _check_pressure_bc_scheme(self, bc):
+        ''' Reject a NONZERO prescribed pressure under IPCS.
+
+        IPCS solves for a pressure INCREMENT phi (Solver.pressure_increment
+        does p += phi); CT solves for p itself (phi IS p). This Dirichlet
+        condition is imposed on whatever the projection step solves for, so
+        under IPCS a nonzero `value` is re-added to p on that boundary EVERY
+        step and the pressure grows without bound -- measured p on the
+        boundary for value=10, dt=0.005:
+
+            CT   : n=1 -> 10   n=5 -> 10   n=10 -> 10   n=40 -> 10   (correct)
+            IPCS : n=1 -> 10   n=5 -> 50   n=10 -> 100  n=40 -> 400  (n*value)
+
+        value = 0 (a stress-free / do-nothing outlet) is the common case and
+        is CORRECT under IPCS: phi = 0 leaves p untouched. That is why the
+        Turek FSI benchmarks run fine -- and accurately -- with IPCS.
+
+        Fixing this properly means imposing phi = value - p^n (so that p
+        lands on `value` after the increment) rather than phi = value; until
+        that is implemented, fail loudly instead of silently integrating a
+        ramp. Note the explicit-Windkessel pressure Dirichlet takes a
+        different code path and has the same limitation.
+
+        Args:
+            bc (dict):  dict describing one boundary condition
+
+        Raises:
+            NotImplementedError: nonzero pressure Dirichlet under IPCS
+        '''
+        tm = self.options.get('timemarching', {})
+        if tm.get('velocity_pressure_coupling') != 'fractionalstep':
+            return
+        if tm.get('fractionalstep', {}).get('scheme') != 'IPCS':
+            return
+
+        value = bc.get('value')
+        nonzero = isinstance(value, str) or (value is not None
+                                             and float(value) != 0.0)
+        if nonzero:
+            raise NotImplementedError(
+                'Boundary {}: a nonzero prescribed pressure (value = {!r}) is '
+                'not supported by the IPCS scheme -- the projection solves '
+                'for a pressure INCREMENT, so the value would be re-added to '
+                'the pressure every time step. Use scheme: \'CT\' for '
+                'pressure-driven flow, or value: 0 for a stress-free outlet '
+                '(which is correct under IPCS).'.format(bc['id'], value))
 
     def _neumann_velocity(self, bc):
         ''' Create weak form of Neumann boundary condition: adds +value*n to
