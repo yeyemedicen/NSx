@@ -822,6 +822,28 @@ class Solver(LoggerBase):
         # measurement is scalar in 2D and a vector in 3D (see observation()).
         self._observation_kinds = [meas.get('observable', 'velocity')
                                    for meas in measurement_lst]
+        # 'reference' (default): points are located on the undeformed mesh --
+        # correct for measurements generated from checkpoints on that same
+        # mesh. 'deformed': located after applying the ALE displacement --
+        # required for imaging data, which samples a grid fixed in PHYSICAL
+        # space (see _ale_deform_mesh for the measured difference).
+        self._observation_frames = [meas.get('frame', 'reference')
+                                    for meas in measurement_lst]
+        for fr in self._observation_frames:
+            if fr not in ('reference', 'deformed'):
+                raise Exception(
+                    "measurements: frame must be 'reference' or 'deformed', "
+                    "got {!r}".format(fr))
+        if any(fr == 'deformed' for fr in self._observation_frames):
+            if not self._using_ale:
+                raise Exception(
+                    "measurements: frame: 'deformed' requires an ALE run; "
+                    "without mesh motion the two configurations coincide, so "
+                    "use the default frame: 'reference'")
+            self.logger.info(
+                'Observation frames: %s',
+                ', '.join('#{} {}'.format(i, f) for i, f in
+                          enumerate(self._observation_frames)))
         for kind in self._observation_kinds:
             if kind not in ('velocity', 'vorticity'):
                 raise Exception(
@@ -1055,7 +1077,84 @@ class Solver(LoggerBase):
 
         return theta_arr, theta_sd_arr
 
-    def _interpolate_observation(self, dest, src):
+    def _geometry_node_of_dof(self, V):
+        ''' Permutation mapping each scalar node of the Lagrange space `V` to
+        its mesh-geometry node index.
+
+        Needed to move the mesh by an ALE displacement that lives on `V`: the
+        dofmap of `V` and the geometry dofmap describe the same nodes but not
+        necessarily in the same order, so `geometry.x += d.x.array` is an
+        assumption, not a fact. Both dofmaps list the nodes of each cell in the
+        same reference order, so pairing them cell-wise gives the exact map.
+
+        Args:
+            V (FunctionSpace):  Lagrange space of the same degree as the
+                mesh coordinate element
+
+        Returns:
+            numpy.ndarray:  geometry node index for each node of V
+        '''
+        cache = getattr(self, '_geom_perm_cache', None)
+        if cache is None:
+            cache = self._geom_perm_cache = {}
+        if id(V) in cache:
+            return cache[id(V)]
+
+        mesh = V.mesh
+        n_cells = mesh.topology.index_map(mesh.topology.dim).size_local + \
+            mesh.topology.index_map(mesh.topology.dim).num_ghosts
+
+        gdofs = mesh.geometry.dofmap.reshape(n_cells, -1)
+        vdofs = V.dofmap.list.reshape(n_cells, -1)
+        if gdofs.shape[1] != vdofs.shape[1]:
+            raise Exception(
+                'ALE displacement space has {} nodes per cell but the mesh '
+                'geometry has {}: cannot move the mesh with it (use a '
+                'displacement space of the coordinate-element degree)'
+                .format(vdofs.shape[1], gdofs.shape[1]))
+
+        perm = np.zeros(vdofs.max() + 1, dtype=np.int32)
+        perm[vdofs.ravel()] = gdofs.ravel()
+        cache[id(V)] = perm
+        return perm
+
+    def _ale_deform_mesh(self, sign=1.0):
+        ''' Move the fluid mesh geometry by (sign x) the ALE displacement.
+
+        NSx never moves its mesh -- it carries the deformation in F -- so the
+        stored velocity field lives on the REFERENCE configuration. An imaging
+        measurement, by contrast, samples a grid fixed in PHYSICAL space, so
+        the observation operator has to locate its points in the DEFORMED
+        configuration. Moving the geometry for the duration of the point
+        location is the cheapest way to do that; the inverse map x -> X would
+        otherwise need a nonlinear solve per point.
+
+        Measured on a compliant 3D tube (tube_wk2nd, max|d_ale| ~ 0.08 with
+        0.098 voxels), H(X) against a clean Doppler exam:
+            reference configuration : 7.7e-2 .. 1.3e-1 relative
+            deformed  configuration : 3.5e-6 .. 1.9e-5 relative
+        The error concentrates at the wall -- exactly where the wall-stiffness
+        information lives.
+
+        Args:
+            sign (float):  +1 to deform, -1 to restore
+        '''
+        d = getattr(self, 'd', None)
+        if d is None:
+            return
+
+        mesh = self.u.function_space.mesh
+        gdim = mesh.geometry.dim
+
+        Vd = d.function_space
+        if Vd.mesh is not mesh:
+            return
+
+        perm = self._geometry_node_of_dof(Vd)
+        vals = d.x.array.reshape(-1, gdim)
+        mesh.geometry.x[perm, :gdim] += sign*vals
+
+    def _interpolate_observation(self, dest, src, deformed=False):
         ''' Interpolate the state function `src` into the measurement-space
         function `dest`, handling NON-MATCHING meshes.
 
@@ -1067,16 +1166,29 @@ class Solver(LoggerBase):
         that exactly reproduces the data). The nonmatching API does the
         geometric point location instead.
 
+        With `deformed=False` (the default) the points are located in the
+        reference configuration, which is correct whenever the measurement was
+        produced on the same reference mesh -- e.g. every twin experiment fed
+        by gen_measurements_from_checkpoints.py. With `deformed=True` the
+        source mesh is moved by the ALE displacement first, which is what an
+        imaging measurement on a physically-fixed grid requires (see
+        _ale_deform_mesh).
+
         The interpolation data depends only on the two function spaces, so it
-        is built once per destination and cached.
+        is built once per destination and cached -- EXCEPT in the deformed
+        case, where the point location depends on the current mesh position and
+        must be rebuilt whenever the ALE displacement changes (it changes every
+        step, and every sigma point carries its own).
 
         Args:
             dest (Function):  receiving function on the measurement mesh
             src (Function):   state function on the simulation mesh
+            deformed (bool):  locate points in the ALE-deformed configuration
         '''
         V_to, V_from = dest.function_space, src.function_space
+        deformed = bool(deformed) and getattr(self, 'd', None) is not None
 
-        if V_to.mesh is V_from.mesh:
+        if V_to.mesh is V_from.mesh and not deformed:
             dest.interpolate(src)
             dest.x.scatter_forward()
             return
@@ -1085,21 +1197,35 @@ class Solver(LoggerBase):
         if cache is None:
             cache = self._obs_interp_cache = {}
 
-        key = (id(V_to), id(V_from))
-        if key not in cache:
-            mesh_to = V_to.mesh
-            imap = mesh_to.topology.index_map(mesh_to.topology.dim)
-            cells = np.arange(imap.size_local + imap.num_ghosts,
-                              dtype=np.int32)
-            cache[key] = (cells, fem.create_interpolation_data(
-                V_to, V_from, cells, padding=1e-8))
-            self.logger.info(
-                'observation: non-matching interpolation %s -> %s',
-                _dof_count_str(V_from), _dof_count_str(V_to))
+        key = (id(V_to), id(V_from), deformed)
 
-        cells, interp_data = cache[key]
-        dest.interpolate_nonmatching(src, cells, interp_data)
-        dest.x.scatter_forward()
+        if deformed:
+            self._ale_deform_mesh(+1.0)
+        try:
+            stale = key not in cache
+            if deformed and not stale:
+                stale = not np.array_equal(cache[key][2], self.d.x.array)
+
+            if stale:
+                mesh_to = V_to.mesh
+                imap = mesh_to.topology.index_map(mesh_to.topology.dim)
+                cells = np.arange(imap.size_local + imap.num_ghosts,
+                                  dtype=np.int32)
+                cache[key] = (cells,
+                              fem.create_interpolation_data(
+                                  V_to, V_from, cells, padding=1e-8),
+                              self.d.x.array.copy() if deformed else None)
+                if not deformed:
+                    self.logger.info(
+                        'observation: non-matching interpolation %s -> %s',
+                        _dof_count_str(V_from), _dof_count_str(V_to))
+
+            cells, interp_data = cache[key][0], cache[key][1]
+            dest.interpolate_nonmatching(src, cells, interp_data)
+            dest.x.scatter_forward()
+        finally:
+            if deformed:
+                self._ale_deform_mesh(-1.0)
 
     def vorticity(self):
         ''' Vorticity of the current velocity, curl(u), as a Function on the
@@ -1156,11 +1282,15 @@ class Solver(LoggerBase):
 
         kinds = getattr(self, '_observation_kinds', None) or \
             ['velocity']*len(Xobs_lst)
+        frames = getattr(self, '_observation_frames', None) or \
+            ['reference']*len(Xobs_lst)
 
         if not self._observation_res_lst:
             for i, (Xobs, Xobs_aux) in enumerate(zip(Xobs_lst, Xobs_aux_lst)):
+                warp = frames[i] == 'deformed'
                 if kinds[i] == 'vorticity':
-                    self._interpolate_observation(Xobs, self.vorticity())
+                    self._interpolate_observation(Xobs, self.vorticity(),
+                                                  deformed=warp)
                 elif Xobs_aux:
                     # Xobs is scalar, Xobs_aux vector
 
@@ -1170,7 +1300,8 @@ class Solver(LoggerBase):
                     # handle cartesian component selection manually for performance
                     if direction.count(0) == 2 and direction.count(1) == 1:
                         idx = direction.index(1)
-                        self._interpolate_observation(Xobs, self.u_lst[idx])
+                        self._interpolate_observation(Xobs, self.u_lst[idx],
+                                                      deformed=warp)
 
                     else:
                         assert not Xobs.value_shape(), 'Xobs is not a scalar'
@@ -1178,7 +1309,8 @@ class Solver(LoggerBase):
                         direction = np.array(direction, dtype=float)
                         direction /= np.sqrt(np.dot(direction, direction))
 
-                        self._interpolate_observation(Xobs_aux, self.u)
+                        self._interpolate_observation(Xobs_aux, self.u,
+                                                      deformed=warp)
 
                         bs = Xobs_aux.function_space.dofmap.index_map_bs
                         Xobs_aux_i = [Function(Xobs.function_space) for _ in
@@ -1191,7 +1323,7 @@ class Solver(LoggerBase):
                             if d:
                                 Xobs.x.array[:] += d * Xi.x.array
                 else:
-                    self._interpolate_observation(Xobs, self.u)
+                    self._interpolate_observation(Xobs, self.u, deformed=warp)
         else:
             assert type(Xobs_lst[0]) == np.ndarray
             for i, (Xobs, X_fun, Xobs_aux) in enumerate(zip(Xobs_lst, self._observation_np_aux_fun_lst, Xobs_aux_lst)):
