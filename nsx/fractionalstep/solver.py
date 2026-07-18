@@ -38,6 +38,14 @@ from packaging.version import Version as _V
 if _V(dolfinx.__version__) < _V('0.7'):
     raise Exception('DOLFINx version 0.7 or higher required!')
 
+def _dof_count_str(V):
+    ''' "<ncells> cells / <ndofs> dofs" for logging a function space. '''
+    mesh = V.mesh
+    return '{} cells / {} dofs'.format(
+        mesh.topology.index_map(mesh.topology.dim).size_global,
+        V.dofmap.index_map.size_global * V.dofmap.index_map_bs)
+
+
 def rank0(func):
     ''' Rank 0 decorator: decorated function "does nothing" if rank > 0 '''
     def inner(*args, **kwargs):
@@ -708,7 +716,26 @@ class Solver(LoggerBase):
 
 
         if self.wk['implicit']:
-            self.update_windkessel_LRC()
+            if self.wk.get('condensed'):
+                # ROUKF may have perturbed R_p/R_d/C: refresh the impedance
+                # coefficients and invalidate the cached condensed operator
+                # (its Pl diagonal bakes in delta_l). Under ALE the next
+                # assemble_pressure() rebuilds A_c; without ALE
+                # assemble_pressure() is a no-op, so rebuild here.
+                self._wk_update_deltas()
+                if not (self._using_ale or self._using_mapdd):
+                    # rigid mesh: A_c only depends on the impedance, so skip
+                    # the rebuild (and its MUMPS refactorization) whenever
+                    # this particle's R/C leave delta_l unchanged
+                    if (getattr(self, '_wk_Ac', None) is None or
+                            self._wk_ac_delta_cached != self._wk_ac_deltas()):
+                        self._wk_condense_assemble(self.mat['p']['laplacian'])
+                        self.solver_p.set_operator(self._wk_Ac)
+                        self._wk_ac_delta_cached = self._wk_ac_deltas()
+                else:
+                    self._wk_ac_d_cached = None
+            else:
+                self.update_windkessel_LRC()
 
         self.t = t0
 
@@ -1001,6 +1028,52 @@ class Solver(LoggerBase):
 
         return theta_arr, theta_sd_arr
 
+    def _interpolate_observation(self, dest, src):
+        ''' Interpolate the state function `src` into the measurement-space
+        function `dest`, handling NON-MATCHING meshes.
+
+        The measurement mesh is usually coarser than the state mesh. A plain
+        dest.interpolate(src) is only valid when both share a mesh: across
+        meshes DOLFINx interpolates by LOCAL CELL INDEX, silently producing a
+        field with roughly the right magnitude but scrambled values (the
+        innovation then stays ~50-100% of the measurement even for a particle
+        that exactly reproduces the data). The nonmatching API does the
+        geometric point location instead.
+
+        The interpolation data depends only on the two function spaces, so it
+        is built once per destination and cached.
+
+        Args:
+            dest (Function):  receiving function on the measurement mesh
+            src (Function):   state function on the simulation mesh
+        '''
+        V_to, V_from = dest.function_space, src.function_space
+
+        if V_to.mesh is V_from.mesh:
+            dest.interpolate(src)
+            dest.x.scatter_forward()
+            return
+
+        cache = getattr(self, '_obs_interp_cache', None)
+        if cache is None:
+            cache = self._obs_interp_cache = {}
+
+        key = (id(V_to), id(V_from))
+        if key not in cache:
+            mesh_to = V_to.mesh
+            imap = mesh_to.topology.index_map(mesh_to.topology.dim)
+            cells = np.arange(imap.size_local + imap.num_ghosts,
+                              dtype=np.int32)
+            cache[key] = (cells, fem.create_interpolation_data(
+                V_to, V_from, cells, padding=1e-8))
+            self.logger.info(
+                'observation: non-matching interpolation %s -> %s',
+                _dof_count_str(V_from), _dof_count_str(V_to))
+
+        cells, interp_data = cache[key]
+        dest.interpolate_nonmatching(src, cells, interp_data)
+        dest.x.scatter_forward()
+
     def observation(self, Xobs_lst):
         ''' Compute observation by applying the observation operator to the
         state, H(X).
@@ -1024,7 +1097,7 @@ class Solver(LoggerBase):
                     # handle cartesian component selection manually for performance
                     if direction.count(0) == 2 and direction.count(1) == 1:
                         idx = direction.index(1)
-                        Xobs.interpolate(self.u_lst[idx])
+                        self._interpolate_observation(Xobs, self.u_lst[idx])
 
                     else:
                         assert not Xobs.value_shape(), 'Xobs is not a scalar'
@@ -1032,7 +1105,7 @@ class Solver(LoggerBase):
                         direction = np.array(direction, dtype=float)
                         direction /= np.sqrt(np.dot(direction, direction))
 
-                        Xobs_aux.interpolate(self.u)
+                        self._interpolate_observation(Xobs_aux, self.u)
 
                         bs = Xobs_aux.function_space.dofmap.index_map_bs
                         Xobs_aux_i = [Function(Xobs.function_space) for _ in
@@ -1045,7 +1118,7 @@ class Solver(LoggerBase):
                             if d:
                                 Xobs.x.array[:] += d * Xi.x.array
                 else:
-                    Xobs.interpolate(self.u)
+                    self._interpolate_observation(Xobs, self.u)
         else:
             assert type(Xobs_lst[0]) == np.ndarray
             for i, (Xobs, X_fun, Xobs_aux) in enumerate(zip(Xobs_lst, self._observation_np_aux_fun_lst, Xobs_aux_lst)):
@@ -1125,33 +1198,18 @@ class Solver(LoggerBase):
         for k, (bid, prm) in enum_wk:
             # adding wk pressure if C != 0
             if abs(float(prm['C'])) > 1e-14:
-                value = state[k+1].x.array
+                # The wk state lives on the DG0 surrogate of the legacy 'Real'
+                # space: one dof per cell, all holding the SAME value
+                # (update_state/init_state write uniformly; ROUKF only takes
+                # linear combinations, which preserve uniformity). Read the
+                # local value and reduce for ranks that own no cells.
+                arr = state[k+1].x.array
                 mpi_comm = self.u.function_space.mesh.comm
+                local = float(arr[0]) if arr.size else -np.inf
+                value = mpi_comm.allreduce(local, op=MPI.MAX)
 
-                if mpi_comm.Get_size() > 1:
-                    # parallel -- maybe not the best solution, but works
-                    # we don't know which proc owns the single dof of the
-                    # windkessel state 'real' function space, so gather from
-                    # all procs on root=0 and filter
-                    value_gathered = mpi_comm.gather(value, root=0)
-                    # info(f'DBG: gathered: {value_gathered}')
-                    if mpi_comm.Get_rank() == 0:
-                        value = list(
-                            filter(lambda x: x.size > 0, value_gathered)
-                        )
-                        assert len(value) == 1
-                        value = value[0]
-                        # info(f'DBG: filtered: {value}')
-                    else:
-                        value = np.empty(1)
-
-                    mpi_comm.Bcast(value, root=0)
-                    # info(f'DBG: bcast: {value}')
-
-                prm['pi'].value = float(value)
-                prm['pi0'].value = float(value)
-                
-                # info(f"value = {value}, const = {prm['pi'].values()}")
+                prm['pi'].value = value
+                prm['pi0'].value = value
 
         if (self.options['timemarching']['fractionalstep']['scheme']
                 == 'IPCS'):
@@ -1366,7 +1424,7 @@ class Solver(LoggerBase):
         rk = comm.rank
         fdim = Q.mesh.topology.dim - 1
 
-        print('[condensed-WK] assemble START nloc=%d N=%d'%(nloc,N), flush=True) if comm.rank==0 else None
+        self.logger.debug('[condensed-WK] assemble START nloc=%d N=%d', nloc, N)
         bids = list(self.bc_dict['p']['windkessel']['params'].keys())
         is_out = np.zeros(nloc, dtype=bool)
         dof_bid = -np.ones(nloc, dtype=np.int64)
@@ -1399,15 +1457,27 @@ class Solver(LoggerBase):
         m_loc = n_int_owned + (len(bids) if rk == 0 else 0)
         M = M_int + len(bids)
 
+        # ROUKF rebuilds A_c once per sigma point per step (the Pl diagonal
+        # bakes in delta_l, which moves with R_p/R_d/C), so release the
+        # previous objects -- petsc4py defers collection. NOTE: _wk_Ac is
+        # deliberately NOT freed here: the KSP still holds it as its operator
+        # until the set_operator() that follows rebinds it, and destroying it
+        # first is a use-after-free (segfaults under MPI on the 2nd particle).
+        for _attr in ('_wk_Z', '_wk_pred'):
+            _old = getattr(self, _attr, None)
+            if _old is not None:
+                _old.destroy()
+                setattr(self, _attr, None)
+
         Z = PETSc.Mat().createAIJ(((nloc, N), (m_loc, M)), comm=comm)
         Z.setUp()
         for d in range(nloc):
             Z.setValue(first + d, int(red[d]), 1.0)
         Z.assemble()
 
-        print('[condensed-WK] Z built M=%d doing ptap...'%M, flush=True) if comm.rank==0 else None
+        self.logger.debug('[condensed-WK] Z built M=%d doing ptap...', M)
         Ac = A.ptap(Z)
-        print('[condensed-WK] ptap done', flush=True) if comm.rank==0 else None
+        self.logger.debug('[condensed-WK] ptap done')
         for j, bid in enumerate(bids):
             prm = self.bc_dict['p']['windkessel']['params'][bid]
             u_l = _assemble_vec(self.forms['p']['windkessel_lhs'][bid])
@@ -1419,7 +1489,7 @@ class Solver(LoggerBase):
                 Ac.setValue(Pl_gids[j], Pl_gids[j], delta * sval * sval,
                             addv=PETSc.InsertMode.ADD_VALUES)
         Ac.assemble()
-        print('[condensed-WK] penalty+assemble done', flush=True) if comm.rank == 0 else None
+        self.logger.debug('[condensed-WK] penalty+assemble done')
         # Direct solver for the condensed operator: gamg chokes on the
         # single dense Pl row (huge degree from the collapsed outlet).
         _ksp = self.solver_p.ksp
@@ -1597,6 +1667,13 @@ class Solver(LoggerBase):
             if not self.wk['implicit']:
                 self.solver_p.set_operator(
                         self.mat['p']['laplacian'])
+            elif self.wk.get('condensed'):
+                # non-ALE initial operator: condensed A_c built once here;
+                # under ALE assemble_pressure() rebuilds it per mesh change.
+                self._wk_update_deltas()
+                self._wk_condense_assemble(self.mat['p']['laplacian'])
+                self.solver_p.set_operator(self._wk_Ac)
+                self._wk_ac_delta_cached = self._wk_ac_deltas()
             else:
                 self.update_windkessel_LRC()
                 self.solver_p.set_operator(
@@ -2063,17 +2140,29 @@ class Solver(LoggerBase):
         if not self.bc_dict['p']['dirichlet']:
             A.setNearNullSpace(self._p_nullspace())
 
+    def _wk_ac_deltas(self):
+        ''' Current delta_l per outlet — part of the A_c cache key, since the
+        condensed operator bakes delta_l into its Pl diagonal and ROUKF
+        perturbs R/C between sigma points WITHOUT necessarily moving the
+        mesh. '''
+        return [float(prm['delta_l']) for prm in
+                self.bc_dict['p']['windkessel']['params'].values()]
+
     def _wk_ac_mesh_changed(self):
-        ''' True if the ALE mesh (self.d) changed since A_c was last built.
-        FGG freezes the mesh within a step -> False across sub-iters -> reuse
-        the cached condensed operator + its MUMPS factorization. '''
+        ''' True if the ALE mesh (self.d) or the Windkessel impedance
+        coefficients changed since A_c was last built.  FGG freezes the mesh
+        within a step -> False across sub-iters -> reuse the cached condensed
+        operator + its MUMPS factorization. '''
         cur = self.d.x.array
         cached = getattr(self, '_wk_ac_d_cached', None)
-        return (cached is None or cached.shape != cur.shape
-                or not np.array_equal(cached, cur))
+        if (cached is None or cached.shape != cur.shape
+                or not np.array_equal(cached, cur)):
+            return True
+        return getattr(self, '_wk_ac_delta_cached', None) != self._wk_ac_deltas()
 
     def _wk_ac_cache_mesh(self):
         self._wk_ac_d_cached = self.d.x.array.copy()
+        self._wk_ac_delta_cached = self._wk_ac_deltas()
 
     def assemble_pressure(self):
         ''' Assemble matrix of pressure projection, in the case of variable
@@ -2174,9 +2263,9 @@ class Solver(LoggerBase):
             self.solver_p.ksp.solve(_bc, self._wk_pred)
             self.solver_p.conv_reason = self.solver_p.ksp.getConvergedReason()
             self.solver_p.iterations = self.solver_p.ksp.getIterationNumber()
-            print('[condensed-WK] solve done (reason=%d it=%d)'
-                  % (self.solver_p.conv_reason, self.solver_p.iterations),
-                  flush=True) if self.p.function_space.mesh.comm.rank == 0 else None
+            self.logger.debug('[condensed-WK] solve done (reason=%d it=%d)',
+                              self.solver_p.conv_reason,
+                              self.solver_p.iterations)
             self._wk_Z.mult(self._wk_pred, self.phi.x.petsc_vec)
             self.phi.x.scatter_forward()
             self._wk_condense_check()
@@ -2325,8 +2414,31 @@ class Solver(LoggerBase):
                 func = dict_['function']
                 self.transfer_displacement(self.d_s, func) # in -> out
 
+    def update_neumann_bcs(self):
+        ''' Re-evaluate time-dependent 'neumann' BC waveforms at self.t.
+
+        The Constant is shared by the pressure Dirichlet and (outside CT) the
+        velocity traction, so updating it here drives both. The traction RHS
+        additionally needs re-assembly: vec['u']['rhs_const'] is otherwise
+        built ONCE in init_assembly(), so mutating the Constant alone would
+        not reach it. Under CT there is no traction form at all (a 'neumann'
+        BC is purely a prescribed pressure), so that step is skipped.
+        '''
+        nmn = self.bc_dict['u'].get('neumann_expressions', {})
+        if not nmn:
+            return
+
+        for bid, dict_ in nmn.items():
+            dict_['constant'].value = dict_['waveform'](float(self.t))
+
+        if any(self.forms['u']['neumann'].values()):
+            self.vec['u']['rhs_const'] = [
+                _assemble_vec(form) if form else None
+                for _key, form in self.forms['u']['neumann'].items()]
+
     def update_velocity_bcs(self):
         ''' Update time dependent boundary conditions. '''
+        self.update_neumann_bcs()
         for bc, dict_ in self.bc_dict['u']['dbc_expressions'].items():
             if 'expression' in dict_:
                 expr = dict_['expression']
@@ -2442,15 +2554,29 @@ class Solver(LoggerBase):
 
         if self.wk['implicit']:
             if restart:
-                self.update_windkessel_LRC(restart=True)
+                if self.wk.get('condensed'):
+                    self._wk_update_deltas(restart=True)
+                    if not (self._using_ale or self._using_mapdd):
+                        if (getattr(self, '_wk_Ac', None) is None or
+                                self._wk_ac_delta_cached != self._wk_ac_deltas()):
+                            self._wk_condense_assemble(self.mat['p']['laplacian'])
+                            self.solver_p.set_operator(self._wk_Ac)
+                            self._wk_ac_delta_cached = self._wk_ac_deltas()
+                    else:
+                        self._wk_ac_d_cached = None
+                else:
+                    self.update_windkessel_LRC(restart=True)
 
-    def update_windkessel_LRC(self, restart=False):
-        ''' Update Windkessel low rank correction (LRC) diagonal scaling D
-        in A + UDU'.
+    def _wk_update_deltas(self, restart=False):
+        ''' Recompute the Windkessel impedance coefficients delta_l/delta_r
+        from the CURRENT R_p/R_d/C Constants (which ROUKF may have perturbed
+        via assign_parameters) and update the fem.Constants in place.
 
         Args:
             restart (bool): restart with internal parameters
 
+        Returns:
+            list of the new delta_l values (one per outlet, insertion order)
         '''
         fac_l = []
         for bid, prm in self.bc_dict['p']['windkessel']['params'].items():
@@ -2475,13 +2601,22 @@ class Solver(LoggerBase):
                 delta_l = 1/gamma
                 delta_r = alpha/gamma
 
-            # info(f'R_d: {R_d}, at id {bid}')
-            # info(f'alpha: {alpha}')
-
             prm['delta_l'].value = delta_l
             prm['delta_r'].value = delta_r
 
             fac_l.append(delta_l)
+
+        return fac_l
+
+    def update_windkessel_LRC(self, restart=False):
+        ''' Update Windkessel low rank correction (LRC) diagonal scaling D
+        in A + UDU'.
+
+        Args:
+            restart (bool): restart with internal parameters
+
+        '''
+        fac_l = self._wk_update_deltas(restart=restart)
 
         coef_array = np.array(fac_l)
         self.vec['p']['windkessel_lhs_lrc_diag'].setArray(coef_array)

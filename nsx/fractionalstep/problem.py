@@ -90,6 +90,40 @@ def _project(expr, V):
     return problem.solve()
 
 
+_TIME_EXPR_NS = {
+    'sin': np.sin,  'cos': np.cos,  'tan': np.tan,
+    'exp': np.exp,  'log': np.log,  'sqrt': np.sqrt,
+    'abs': np.abs,  'tanh': np.tanh, 'pi': np.pi,
+    'min': min,     'max': max,
+}
+
+
+def _make_time_expression(expr_str, params):
+    ''' Compile a scalar waveform string in `t` into a float-valued
+    callable. `params` supplies named constants; the usual math functions
+    and `pi` are in scope. Booleans evaluate numerically, so
+    '(t<Th)' works as a gate.
+
+    Args:
+        expr_str (str):  e.g. 'P*sin(pi*t/Th)*(t<Th)'
+        params (dict):   named constants, e.g. {'P': 1e3, 'Th': 0.3}
+
+    Returns:
+        callable: f(t) -> float
+    '''
+    if 't' in params:
+        raise KeyError("'t' is reserved for simulation time and cannot be "
+                       "used as a waveform parameter")
+
+    def _f(t, _e=expr_str, _p=dict(params)):
+        ns = {'t': float(t)}
+        ns.update(_p)
+        ns.update(_TIME_EXPR_NS)
+        return float(eval(_e, {'__builtins__': {}}, ns))
+
+    return _f
+
+
 def rank0(func):
     ''' Rank 0 decorator: decorated function "does nothing" if rank > 0 '''
     def inner(*args, **kwargs):
@@ -1048,6 +1082,9 @@ class BoundaryConditions(LoggerBase):
                 'fsi_nitsche': None,
                 'dbc_expressions': {},
                 'dbc_functions': {},
+                # time-dependent Neumann tractions (see _neumann_velocity):
+                # {bid: {'constant', 'waveform', 'id'}}
+                'neumann_expressions': {},
                 # same_dbc_boundaries is used in
                 # Solver.solve_tentative_velocity() in order to check if DBCs
                 # have to be re-applied and the solver/pc set up for each
@@ -1166,8 +1203,21 @@ class BoundaryConditions(LoggerBase):
                 self._dirichlet_velocity(bc)
                 # pressure: Neumann zero, do-nothing
             elif bc['type'] == 'neumann':
-                self._neumann_velocity(bc)
-                self._dirichlet_pressure(bc)
+                # Chorin-Temam: the tentative step carries NO pressure term
+                # (form_velocity_tentative sets forms['u']['pres'] = None), so
+                # the prescribed pressure must enter through the projection
+                # ALONE. Adding the traction on top applies the same pressure
+                # a second time by an inconsistent route -- see
+                # _dirichlet_pressure for the measured numbers.
+                if self._ct_scheme():
+                    self._dirichlet_pressure(bc)
+                else:
+                    # IPCS / monolithic: the momentum form does contain the
+                    # pressure volume term, so the boundary traction is the
+                    # genuine natural condition. Left as-is (unverified: IPCS
+                    # is independently broken in this solver).
+                    self._neumann_velocity(bc)
+                    self._dirichlet_pressure(bc)
             elif bc['type'] == 'windkessel':
                 self._windkessel(bc)
             elif bc['type'] == 'inflow':
@@ -1436,6 +1486,32 @@ class BoundaryConditions(LoggerBase):
         ''' Create pressure Dirichlet boundary condition from options and add
         into :code:`self.bc_dict['p']['dirichlet']`.
 
+        Under Chorin-Temam a `type: 'neumann'` BC reduces to exactly this
+        Dirichlet condition, which alone is how a pressure is prescribed in
+        CT: the projection imposes p = value, and the velocity update
+        u^{n+1} = u* - (dt/rho)*grad(p) delivers the pressure-driven
+        acceleration. The tentative step must get nothing extra -- it has no
+        pressure term at all in CT (forms['u']['pres'] is None).
+
+        Adding the traction on top applies the same physical pressure twice,
+        by a route the projection cannot reconcile. Plane Poiseuille at true
+        steady state, as a fraction of the analytic Q = H^3*dp/(12*mu*L):
+
+            pressure Dirichlet alone .................  1.004   <- correct
+            + traction +value*n (old 'neumann') ......  0.122
+            + traction -value*n ...................... 15.969
+            traction +value*n with p = -value ........ -1.235
+
+        So this is NOT a sign error in the traction: flipping the sign makes
+        it 16x worse, and making the traction and the Dirichlet value refer
+        to the same pressure (last row) merely drives the flow backwards.
+        The traction term simply does not belong in the CT tentative step.
+
+        `value` may be a float or a waveform string in `t`, e.g.
+            type: 'neumann'
+            value: 'P0*sin(pi*t/Th)*(t < Th)'
+            parameters: {P0: 8.0e3, Th: 0.3}
+
         Args:
             bc (dict):  dict describing one boundary condition
         '''
@@ -1444,24 +1520,87 @@ class BoundaryConditions(LoggerBase):
 
         facets = self.facet_tags.find(bc['id'])
         dofs = locate_dofs_topological(self.Q, self.mesh.topology.dim - 1, facets)
+        # shares the Constant with the velocity traction for 'neumann' BCs,
+        # so a time-dependent waveform drives both consistently
         self.bc_dict['p']['dirichlet'].append(
-            dirichletbc(self._C(float(bc['value'])), dofs, self.Q)
+            dirichletbc(self._bc_time_constant(bc), dofs, self.Q)
         )
 
     def _neumann_velocity(self, bc):
-        ''' Create weak form of Neumann boundary condition.
+        ''' Create weak form of Neumann boundary condition: adds +value*n to
+        the momentum RHS.
+
+        NOT called under Chorin-Temam, where a 'neumann' BC reduces to its
+        pressure Dirichlet part -- see process_bcs and _dirichlet_pressure for
+        why (and for the measured Poiseuille errors). Still used by IPCS and
+        the monolithic solver, whose momentum forms do contain the pressure
+        volume term.
+
+        A float `value` gives a constant traction. A string `value` is a
+        waveform in `t` (plus any named constants from `parameters`), e.g.
+
+            type: 'neumann'
+            value: 'P*sin(pi*t/Th)*(t<Th)'
+            parameters: {P: 1.0e3, Th: 0.3}
+
+        Time-dependent tractions register the amplitude Constant in
+        `bc_dict['u']['neumann_expressions']`; the solver re-evaluates it and
+        re-assembles the Neumann RHS every step (see update_neumann_bcs).
 
         Args:
             bc (dict):  dict describing one boundary condition
         '''
         vi = TestFunction(self.Vi)
         n = FacetNormal(self.mesh)
-        val = self._C(bc['value'])
+
+        val = self._bc_time_constant(bc)
+
         val_ = val*self.J*inv(self.F).T*n
         for i in range(self.ndim):
             # a_bc = val*n[i]*vi*self.ds(bc['id'])
             a_bc = val_[i]*vi*self.ds(bc['id'])
             self.bc_dict['u']['neumann'][i].append(a_bc)
+
+    def _ct_scheme(self):
+        ''' True if this is the non-incremental Chorin-Temam fractional step,
+        whose tentative velocity step carries no pressure term. '''
+        tm = self.options.get('timemarching', {})
+        if tm.get('velocity_pressure_coupling') != 'fractionalstep':
+            return False
+        return tm.get('fractionalstep', {}).get('scheme') == 'CT'
+
+    def _bc_time_constant(self, bc):
+        ''' Resolve a BC `value` to the fem.Constant holding its current
+        magnitude, compiling a waveform string in `t` if given.
+
+        A 'neumann' entry sets BOTH the velocity traction and the pressure
+        Dirichlet value, so the two must share one Constant — otherwise a
+        time-dependent traction and its pressure BC drift apart. The first
+        caller creates and registers it; the second gets the same object.
+
+        Args:
+            bc (dict):  dict describing one boundary condition
+
+        Returns:
+            fem.Constant
+        '''
+        registry = self.bc_dict['u'].setdefault('neumann_expressions', {})
+
+        if bc['id'] in registry:
+            return registry[bc['id']]['constant']
+
+        if not isinstance(bc['value'], str):
+            return self._C(float(bc['value']))
+
+        params = {k: float(v) for k, v in bc.get('parameters', {}).items()
+                  if k != 't'}
+        wave = _make_time_expression(bc['value'], params)
+        val = self._C(wave(0.0))
+        registry[bc['id']] = {'constant': val, 'waveform': wave,
+                              'id': bc['id']}
+        self.logger.info('Neumann BC bid=%d: time-dependent traction "%s"',
+                         bc['id'], bc['value'])
+        return val
 
     def _neumann_pressure(self, bc):
         ''' Homogeneous Neumann BC for pressure: do nothing.
