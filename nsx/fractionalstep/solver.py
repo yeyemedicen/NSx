@@ -834,6 +834,17 @@ class Solver(LoggerBase):
                 raise Exception(
                     "measurements: frame must be 'reference' or 'deformed', "
                     "got {!r}".format(fr))
+        # Nyquist velocity per measurement set: wraps H(X) the way a pulsed
+        # Doppler scanner wraps its estimate (see _apply_nyquist). Absent or
+        # 0 = no aliasing.
+        self._observation_vnyq = [float(meas.get('nyquist_velocity', 0) or 0)
+                                  for meas in measurement_lst]
+        if any(self._observation_vnyq):
+            self.logger.info(
+                'Nyquist wrap: %s',
+                ', '.join('#{} v_nyq={:g}'.format(i, v) for i, v in
+                          enumerate(self._observation_vnyq) if v))
+
         if any(fr == 'deformed' for fr in self._observation_frames):
             if not self._using_ale:
                 raise Exception(
@@ -1265,6 +1276,40 @@ class Solver(LoggerBase):
         self._vort_fun.x.scatter_forward()
         return self._vort_fun
 
+    def _apply_nyquist(self, Xobs, i):
+        ''' Wrap an observation into [-v_nyq, +v_nyq), matching a pulsed-Doppler
+        acquisition.
+
+        A Doppler scanner measures a phase shift, so any velocity beyond the
+        Nyquist limit comes back ALIASED: the reported value is
+        ``((v + v_nyq) mod 2 v_nyq) - v_nyq``. Without applying the same wrap
+        here, H(X) returns the unwrapped velocity and the innovation is huge
+        and of the wrong sign exactly where the flow is fastest -- so those
+        voxels have to be thrown away instead of used. Wrapping makes the
+        operator match the instrument, and the fast core of the jet becomes
+        usable data.
+
+        The wrap is non-smooth at the wrap boundary. That is a genuine
+        property of the measurement, not an approximation: a sigma point on
+        the far side of the boundary from the mean legitimately observes a
+        wrapped value.
+
+        Enabled per measurement set with `nyquist_velocity: <v>` (absent or 0
+        = no aliasing, e.g. PC-MRI with VENC above the peak, or a synthetic
+        exam generated with a large v_nyq).
+
+        Args:
+            Xobs (Function):  scalar observation to wrap in place
+            i (int):          measurement index
+        '''
+        vnyq = (getattr(self, '_observation_vnyq', None) or [None]*(i + 1))[i]
+        if not vnyq:
+            return
+        span = 2.0*float(vnyq)
+        a = Xobs.x.array
+        a[:] = np.mod(a + float(vnyq), span) - float(vnyq)
+        Xobs.x.scatter_forward()
+
     def observation(self, Xobs_lst):
         ''' Compute observation by applying the observation operator to the
         state, H(X).
@@ -1324,6 +1369,8 @@ class Solver(LoggerBase):
                                 Xobs.x.array[:] += d * Xi.x.array
                 else:
                     self._interpolate_observation(Xobs, self.u, deformed=warp)
+
+                self._apply_nyquist(Xobs, i)
         else:
             assert type(Xobs_lst[0]) == np.ndarray
             for i, (Xobs, X_fun, Xobs_aux) in enumerate(zip(Xobs_lst, self._observation_np_aux_fun_lst, Xobs_aux_lst)):
