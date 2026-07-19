@@ -324,18 +324,29 @@ class Solver(LoggerBase):
         if not (self._using_wk and self.wk['implicit']):
             return
         params = self.bc_dict['p']['windkessel']['params']
-        if len(params) != 1:
-            self.logger.warning(
-                'init_windkessel_pressure: {} WK boundaries -> constant '
-                'initial pressure ambiguous, leaving p=0.'.format(len(params)))
-            return
-        (bid, prm), = params.items()
-        P0 = float(prm['Pl'])
+        # Multi-outlet: one constant field cannot match every outlet exactly,
+        # but LEAVING p=0 (the old behaviour) is strictly worse.  With MULF
+        # prestress the wall is preloaded to the diastolic pressure, so a p=0
+        # start step-loads the FSI interface: on the 2-outlet carotid this
+        # produced |traction|max ~178 mmHg on step 1 (vs a ~72 mmHg lumen
+        # pressure), decaying over one step.  The outlets of a single vessel
+        # sit within a few mmHg of each other, so seed their MEAN and log the
+        # per-outlet values so the approximation is visible.
+        Pls = {_b: float(_p['Pl']) for _b, _p in params.items()}
+        P0 = sum(Pls.values()) / len(Pls)
         self.p.x.array[:] = P0
         self.p.x.scatter_forward()
-        self.logger.info(
-            'Initialized fluid pressure to Windkessel P0 = alpha*pi0 = '
-            '{:.6g} (bid {})'.format(P0, bid))
+        if len(Pls) == 1:
+            self.logger.info(
+                'Initialized fluid pressure to Windkessel P0 = %.6g (bid %d)',
+                P0, next(iter(Pls)))
+        else:
+            self.logger.info(
+                'Initialized fluid pressure to the MEAN Windkessel P0 = %.6g '
+                'over %d outlets (%s); spread %.6g',
+                P0, len(Pls),
+                ', '.join('bid %d -> %.6g' % kv for kv in sorted(Pls.items())),
+                max(Pls.values()) - min(Pls.values()))
 
     def write_initial_condition(self):
         ''' Write initial condition XDMF and HDF5 checkpoints '''

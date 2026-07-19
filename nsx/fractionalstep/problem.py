@@ -2165,9 +2165,24 @@ class BoundaryConditions(LoggerBase):
         delta_r = alpha/gamma
         delta_l = 1/gamma
 
+        # ---------------------------------------------------------------
+        # p0 (YAML) == the RESERVOIR/CAPACITOR pressure at t=0, pi(0), for BOTH
+        # schemes.  What each scheme stores internally differs, and that used to
+        # be resolved by a SILENT OVERWRITE further down (the implicit branch
+        # re-assigned prm['pi'] = pi0 after this block had set alpha*pi0), so
+        # you could not tell from the YAML what pi(0) would actually be.
+        # Resolved explicitly here instead:
+        #   implicit: the pressure operator enforces Pl = gamma*Q + alpha*pi and
+        #             the update is pi <- alpha*pi + beta*Q, whose steady state
+        #             is pi = R_d*Q.  Hence pi(0) IS p0, used UNSCALED.
+        #   explicit: Pl = R_p*Q + pi, seeded by one backward-Euler step from
+        #             rest (Q=0), hence pi(0) = alpha*p0.
+        # => never pre-divide p0 by alpha in the YAML.  The resolved value is
+        #    logged below so the run record is unambiguous.
+        # ---------------------------------------------------------------
         pi0 = bc['parameters']['p0']
         P0 = alpha*pi0
-        pi = P0
+        pi = pi0 if self.wk.get('implicit') else P0
         
         self.bc_dict['p']['windkessel']['params'][bid] = {
             'eps': self._C(eps),
@@ -2188,6 +2203,14 @@ class BoundaryConditions(LoggerBase):
 
         prm = self.bc_dict['p']['windkessel']['params'][bid]
 
+        self.logger.info(
+            'Windkessel bid %d (%s): R_p=%.6g R_d=%.6g C=%.6g  '
+            'tau=R_d*C=%.4g s  alpha=%.8f  |  yaml p0=%.6g -> pi(0)=%.6g, '
+            'Pl(0)=%.6g [dyn/cm2]',
+            bid, 'implicit' if self.wk.get('implicit') else 'explicit',
+            R_p, R_d, C, R_d*C, alpha, pi0, float(prm['pi'].value),
+            float(prm['Pl'].value))
+
         if self.wk['explicit']:
             # Use prm['Pl'] directly as a fem.Constant; solver updates .value each step
             facets = self.facet_tags.find(bid)
@@ -2198,8 +2221,9 @@ class BoundaryConditions(LoggerBase):
             self.bc_dict['p']['windkessel']['dbc_params'][bc_key] = {
                     'Pl_const': prm['Pl'], 'bid': bid}
         elif self.wk['implicit']:
-            # initialize with correct value
-            prm['pi'].value = pi0
+            # prm['pi'] was already initialised to p0 in the block above (see
+            # the note there).  The scheme-dependent overwrite that used to sit
+            # here is gone -- pi(0) is now decided in exactly one place.
             prm['rhs_p'] = prm['Q'] + prm['delta_r']*prm['pi']
 
     # =========================================================================
