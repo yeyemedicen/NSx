@@ -3095,14 +3095,17 @@ class Solver(LoggerBase):
                 self.write_xdmf()
 
         if self.options['io']['write_checkpoints']:
+            dt = self.options['timemarching']['dt']
             checkpt_dt = self.options['timemarching']['checkpoint_dt']
-
-            if (self.t > self._t_checkpt + tol) and (
-                    (self.t > self._t_checkpt + checkpt_dt - tol)
-                    or (self.t >= T - tol)):
-                # if (time for checkpoint) or (last) — same per-sub-iteration
-                # guard as above
-
+            # INTEGER-STEP trigger (i = global step index). The old float test
+            # `self.t > _t_checkpt + checkpt_dt - tol` used tol=1e-8 here vs
+            # tol=1e-10 in Hyperelasticity; fp accumulation in t lands ~5e-10
+            # below a checkpt_dt multiple, so the looser fluid tol fired one
+            # step BEFORE the solid -> split checkpoint dirs (fluid N, solid
+            # N+1), only the final dir held both -> mid-cycle restart broke.
+            # Integer steps make fluid and solid fire on the SAME step. (DA fix)
+            n_ck = max(1, int(round(checkpt_dt / dt)))
+            if (i % n_ck == 0) or (self.t >= T - tol):
                 self._t_checkpt = self.t
                 writeout += 2
                 self.write_checkpoint(i, update=update)
