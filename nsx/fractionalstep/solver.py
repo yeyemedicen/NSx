@@ -633,9 +633,9 @@ class Solver(LoggerBase):
             # self.logger.debug('|d| = {:.4e}'.format(norm(self.d)))
 
         self.solve_tentative_velocity()
-        self._norm_u_tent = np.sqrt(
-            fem.assemble_scalar(fem.form(ufl.inner(self.u, self.u) * ufl.dx))
-        )
+        self._norm_u_tent = np.sqrt(self.u.function_space.mesh.comm.allreduce(
+            fem.assemble_scalar(fem.form(ufl.inner(self.u, self.u) * ufl.dx)),
+            op=MPI.SUM))
 
         if self._using_wk:
             self.solve_windkessel()
@@ -655,9 +655,9 @@ class Solver(LoggerBase):
 
         # post processing
         self.solve_pressure()
-        self._norm_p = np.sqrt(
-            fem.assemble_scalar(fem.form(self.p * self.p * ufl.dx))
-        )
+        self._norm_p = np.sqrt(self.p.function_space.mesh.comm.allreduce(
+            fem.assemble_scalar(fem.form(self.p * self.p * ufl.dx)),
+            op=MPI.SUM))
 
         if self.write_velocity == 'tentative':
             self.write_timestep(i)
@@ -673,9 +673,9 @@ class Solver(LoggerBase):
 
         self.solve_velocity_update()
         self.pressure_increment()
-        self._norm_u_upd = np.sqrt(
-            fem.assemble_scalar(fem.form(ufl.inner(self.u, self.u) * ufl.dx))
-        )
+        self._norm_u_upd = np.sqrt(self.u.function_space.mesh.comm.allreduce(
+            fem.assemble_scalar(fem.form(ufl.inner(self.u, self.u) * ufl.dx)),
+            op=MPI.SUM))
         if (state and (self.options['timemarching']['fractionalstep']
                        ['scheme'] == 'CT')):
             if self.state_velocity == 'update':
@@ -1090,6 +1090,29 @@ class Solver(LoggerBase):
                 opt_std = [bc['initial_stddev']]
                 theta_sd_lst.extend(opt_std)
 
+            elif bc['type'] == 'parable':
+                # Amplitude of a parabolic (SVD-frame) Dirichlet inlet, see
+                # problem.py::_parable. 'U' lives as a plain float inside
+                # bc_dict['u']['dbc_expressions'][('parable', bid)] rather
+                # than a fem.Constant, and is only re-read every step by
+                # update_velocity_bcs() if the BC was given a 'waveform'
+                # (constant/ramp/etc.) -- a static parable BC bakes U into its
+                # DirichletBC Function once at construction and can't be
+                # perturbed. Mirrors JellyFSI's inlet_amplitude adapter so a
+                # standalone (non-JellyFSI) ROUKF run can estimate it directly.
+                bid = bc['id']
+                key = ('parable', bid)
+                if key not in self.bc_dict['u']['dbc_expressions']:
+                    raise Exception(
+                        "Parable BC id={} has no registered time update -- add "
+                        "a 'waveform' to its parameters (even a constant/ramp "
+                        "one) so update_velocity_bcs() re-reads 'U' every step; "
+                        "a static parable BC cannot be estimated.".format(bid))
+                dict_ = self.bc_dict['u']['dbc_expressions'][key]
+                self.theta_internal.append({'parable_dict': dict_})
+                theta_arr.append(float(dict_['U']))
+                theta_sd_lst.append(bc['initial_stddev'])
+
             else:
                 raise NotImplementedError('BC type "{}" not yet supported for '
                                           'optimization'.format(bc['type']))
@@ -1416,6 +1439,12 @@ class Solver(LoggerBase):
 
             if isinstance(th_old, fem.Constant):
                 th_old.value = float(th_new)
+
+            elif isinstance(th_old, dict) and 'parable_dict' in th_old:
+                # parable inlet amplitude: mutate 'U' in place; the actual
+                # DirichletBC Function is re-interpolated from it by
+                # update_velocity_bcs() at the start of the next step.
+                th_old['parable_dict']['U'] = float(th_new)
 
             elif isinstance(th_old, dict):
                 # parameters are expression parameters
