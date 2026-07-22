@@ -867,10 +867,10 @@ class Solver(LoggerBase):
                 ', '.join('#{} {}'.format(i, f) for i, f in
                           enumerate(self._observation_frames)))
         for kind in self._observation_kinds:
-            if kind not in ('velocity', 'vorticity'):
+            if kind not in ('velocity', 'vorticity', 'pressure'):
                 raise Exception(
-                    "measurements: observable must be 'velocity' or "
-                    "'vorticity', got {!r}".format(kind))
+                    "measurements: observable must be 'velocity', 'vorticity' "
+                    "or 'pressure', got {!r}".format(kind))
         if any(k == 'vorticity' for k in self._observation_kinds):
             self.logger.info(
                 'Observation operator: %s',
@@ -890,6 +890,13 @@ class Solver(LoggerBase):
                     V = functionspace(mesh, (family, degree))
                 else:
                     V = functionspace(mesh, (family, degree, (3,)))
+                fun_aux_lst.append(None)
+            elif kind == 'pressure':
+                # scalar fluid pressure p sampled at the sensor location(s).
+                # Directly reflects the Windkessel (which sets the outlet
+                # pressure), so a single sensor near the outlet is far more
+                # informative for RCR than velocity. velocity_direction n/a.
+                V = functionspace(mesh, (family, degree))
                 fun_aux_lst.append(None)
             elif all_scalar:
                 V = functionspace(mesh, ("Lagrange" if element_family == 'P' else "DG", degree))
@@ -1370,6 +1377,12 @@ class Solver(LoggerBase):
                 if kinds[i] == 'vorticity':
                     self._interpolate_observation(Xobs, self.vorticity(),
                                                   deformed=warp)
+                elif kinds[i] == 'pressure':
+                    # H(X) for a pressure sensor: the fluid pressure field p
+                    # interpolated onto the sensor mesh. With
+                    # observation_operator: 'postprocessing' this runs AFTER
+                    # solve_pressure, so self.p is the current pressure.
+                    self._interpolate_observation(Xobs, self.p, deformed=warp)
                 elif Xobs_aux:
                     # Xobs is scalar, Xobs_aux vector
 
