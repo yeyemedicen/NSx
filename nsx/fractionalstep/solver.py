@@ -2303,6 +2303,21 @@ class Solver(LoggerBase):
     def solve_tentative_velocity(self):
         ''' Solve tentative velocity PDE '''
         timer = Timer('Z solve u_ten')
+        import os as _os
+        if _os.environ.get('RC_DEBUG'):
+            import numpy as _np
+            def _nn(f):
+                try:
+                    return float(_np.linalg.norm(f.x.array))
+                except Exception:
+                    return -1.0
+            _d = _nn(self.d) if getattr(self, 'd', None) is not None else -1.0
+            _up = _nn(self.upd) if getattr(self, 'upd', None) is not None else -1.0
+            _pi = [round(float(p['pi'].value), 3) for p in
+                   self.bc_dict['p']['windkessel']['params'].values()] \
+                if getattr(self, '_using_wk', False) else []
+            print('[rc-in] u=%.6e upd=%.6e d_ale=%.6e wk_pi=%s'
+                  % (_nn(self.u), _up, _d, _pi), flush=True)
         self.update_velocity_bcs()
 
         A = self.assemble_tentative_velocity()
@@ -4415,6 +4430,21 @@ class SolverCoupled(Solver):
     def solve_tentative_velocity(self):
         ''' Solve tentative velocity PDE '''
         timer = Timer('Z solve u_ten')
+        import os as _os
+        if _os.environ.get('RC_DEBUG'):
+            import numpy as _np
+            def _nn(f):
+                try:
+                    return float(_np.linalg.norm(f.x.array))
+                except Exception:
+                    return -1.0
+            _d = _nn(self.d) if getattr(self, 'd', None) is not None else -1.0
+            _up = _nn(self.upd) if getattr(self, 'upd', None) is not None else -1.0
+            _pi = [round(float(p['pi'].value), 3) for p in
+                   self.bc_dict['p']['windkessel']['params'].values()] \
+                if getattr(self, '_using_wk', False) else []
+            print('[rc-in] u=%.6e upd=%.6e d_ale=%.6e wk_pi=%s'
+                  % (_nn(self.u), _up, _d, _pi), flush=True)
         self.update_velocity_bcs()
 
         if self._using_mapdd:
