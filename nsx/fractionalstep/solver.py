@@ -3131,15 +3131,14 @@ class Solver(LoggerBase):
         T = self.options['timemarching']['T']
 
         # TODO: ADAPT ROUKF IN THE SAME WAY
+        dt = self.options['timemarching']['dt']
 
         if (self.options['io']['write_hdf5_timeseries']
                 or self.options['io']['write_xdmf']):
 
             write_dt = self.options['timemarching']['write_dt']
-
-            if (self.t > self._t_write + tol) and (
-                    (self.t > self._t_write + write_dt - tol)
-                    or (self.t >= T - tol)):
+            n_ck = max(1, int(round(write_dt/ dt)))
+            if (i % n_ck == 0) or (self.t >= T - tol):
                 # if (time for write) or (first) or (last) — guarded by
                 # `self.t > self._t_write + tol` so that the "or last"
                 # branch fires at most ONCE per physical time, even though
@@ -3152,7 +3151,6 @@ class Solver(LoggerBase):
                 self.write_xdmf()
 
         if self.options['io']['write_checkpoints']:
-            dt = self.options['timemarching']['dt']
             checkpt_dt = self.options['timemarching']['checkpoint_dt']
             # INTEGER-STEP trigger (i = global step index). The old float test
             # `self.t > _t_checkpt + checkpt_dt - tol` used tol=1e-8 here vs
