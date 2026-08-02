@@ -80,6 +80,31 @@ def _assemble_vec(form):
                        mode=PETSc.ScatterMode.REVERSE)
     return result
 
+def _orig_node_index(fn):
+    ''' ORIGINAL (input, pre-partition) global node index per owned block-dof,
+    or None if the space is not CG-1.
+
+    The partition-INVARIANT checkpoint key. DOLFINx assigns global dof numbers
+    while partitioning, so an array saved in that order is only readable at the
+    rank count that wrote it; `geometry.input_global_indices` labels each node
+    by its index in the mesh FILE, which no partition changes.
+    '''
+    V = fn.function_space
+    mesh = V.mesh
+    n_owned = V.dofmap.index_map.size_local
+    ig = np.asarray(mesh.geometry.input_global_indices)
+    gdof = np.asarray(mesh.geometry.dofmap)
+    fdof = np.asarray(V.dofmap.list)
+    if gdof.shape != fdof.shape:            # e.g. P2 velocity -> legacy path
+        return None
+    orig = np.full(n_owned, -1, dtype=np.int64)
+    fl = fdof.reshape(-1)
+    gl = gdof.reshape(-1)
+    m = fl < n_owned
+    orig[fl[m]] = ig[gl[m]]
+    return None if (orig < 0).any() else orig
+
+
 def _mat_vec(A, x):
     ''' Compute y = A * x, returning a new PETSc.Vec. '''
     y = A.createVecLeft()
@@ -434,6 +459,10 @@ class Solver(LoggerBase):
         comm = self.u.function_space.mesh.comm
         w_file = restart_path / 'w.h5'
 
+        # 'original' = the partition-independent 2026-07-31 format; 'rank' or a
+        # MISSING attribute = legacy, correct only at the writing rank count.
+        _order = {'v': 'rank'}
+
         def _scatter_full(fn, full_arr):
             idx = fn.function_space.dofmap.index_map
             bs = fn.function_space.dofmap.index_map_bs
@@ -444,8 +473,13 @@ class Solver(LoggerBase):
                     'OLD pre-blocksize-fix checkpoint -- skipping this field.'
                     % (None if full_arr is None else full_arr.size, expected, bs))
                 return False
-            start, end = idx.local_range
-            fn.x.array[:idx.size_local * bs] = full_arr[start * bs:end * bs]
+            orig = (_orig_node_index(fn) if _order['v'] == 'original' else None)
+            if orig is None:
+                start, end = idx.local_range
+                fn.x.array[:idx.size_local * bs] = full_arr[start * bs:end * bs]
+            else:
+                fn.x.array[:idx.size_local * bs] = \
+                    full_arr.reshape(idx.size_global, bs)[orig].reshape(-1)
             fn.x.scatter_forward()
             return True
 
@@ -454,10 +488,21 @@ class Solver(LoggerBase):
                 u_full = np.array(f['u'])
                 p_full = np.array(f['p'])
                 t_u = float(f.attrs.get('t', 0.0))
+                _ord = str(f.attrs.get('dof_order', 'rank'))
         else:
             u_full = None
             p_full = None
             t_u = 0.0
+            _ord = None
+
+        _order['v'] = comm.bcast(_ord, root=0)
+        if _order['v'] != 'original' and comm.size > 1:
+            self.logger.warning(
+                'Restart checkpoint is in the LEGACY rank-ordered format, valid '
+                'ONLY at the mpirun -n that wrote it (reading it at a different '
+                'rank count silently scrambles the state). Re-run the forward to '
+                'get a partition-independent checkpoint.')
+
         u_full = comm.bcast(u_full, root=0)
         p_full = comm.bcast(p_full, root=0)
         t_u = comm.bcast(t_u, root=0)
@@ -754,6 +799,150 @@ class Solver(LoggerBase):
     # ROUKF estimation interface
     # =========================================================================
 
+    def _roukf_functions(self):
+        """ Every dolfinx Function reachable from the solver, {name: Function}.
+
+        Enumerated rather than listed by hand -- INCLUDING the ones nested in
+        `bc_dict` -- see roukf.io.collect_functions for the two omissions that
+        forced this. Instance attributes only: `dir(type(self))` would also
+        evaluate properties, and a snapshot must never have side effects on
+        the run it is snapshotting.
+        """
+        from roukf import io as rio
+
+        return rio.collect_functions(self)
+
+    def _roukf_scalars(self):
+        ''' Non-field solver state a ROUKF restart must reproduce: EVERY
+        scalar Constant of every Windkessel boundary.
+
+        Not just `pi`/`pi0`. `Pl` (outlet mean pressure), `Q` (outlet flux) and
+        `area` (deformed outlet area) are state too, and on a RESTART step
+        `solve_windkessel` deliberately does NOT recompute them --
+
+            elif self.wk['implicit']:
+                if not flow and not restart:      # <- skipped when restarting
+                    prm['area'].value = area_new
+                    prm['Pl'].value  = Pl
+
+        -- because in an uninterrupted run they carry over from the previous
+        step. A resumed run that does not restore them therefore takes its
+        first step with Pl = 0, Q = 0 and the REFERENCE outlet area: a
+        different pressure boundary condition, i.e. a different PROBLEM rather
+        than a different numerical path. Measured on the 2D CCA at 6.362e-04,
+        and identical to four significant figures whether the coupling was
+        converged to 1e-4 or to 1e-10 -- the signature of a data error, not a
+        tolerance one. Enumerating the whole params entry instead of naming
+        fields stops this recurring if more state is added.
+
+        R/C are captured too; harmless, since `assign_parameters` rewrites them
+        per particle before every solve.
+        '''
+        if not self._using_wk:
+            return {}
+
+        out = {}
+        for bid, prm in self.bc_dict['p']['windkessel']['params'].items():
+            for key, val in sorted(prm.items()):
+                if not hasattr(val, 'value'):
+                    continue                     # config float, never mutated
+                try:
+                    out['wk_%s_%d' % (key, bid)] = float(val.value)
+                except (TypeError, ValueError):
+                    continue                     # non-scalar Constant
+        return out
+
+    def _restore_roukf_scalars(self, attrs):
+        ''' Inverse of `_roukf_scalars`. '''
+        if not self._using_wk:
+            return
+
+        for bid, prm in self.bc_dict['p']['windkessel']['params'].items():
+            seen = False
+            for key, val in prm.items():
+                k = 'wk_%s_%d' % (key, bid)
+                if k in attrs and hasattr(val, 'value'):
+                    val.value = float(attrs[k])
+                    seen = True
+            if not seen:
+                self.logger.warning(
+                    'restart bundle carries no Windkessel state for boundary '
+                    '%d; it keeps its initial value', bid)
+
+    def write_restart(self, path):
+        ''' ROUKF restart hook (see roukf.core.ROUKF.write_checkpoint).
+
+        Written through roukf.io's PARTITION-INDEPENDENT field format (keyed
+        by original, pre-partition node/cell index) rather than raw per-rank
+        arrays, so a bundle written at one `mpirun -n` can be resumed at
+        another. `roukf` is importable by construction here: this hook is only
+        ever called by ROUKF.
+
+        Args:
+            path (str):  restart bundle directory, created by ROUKF
+
+        Returns:
+            set:  dof orderings used; 'rank' in it means the bundle is
+              same-`-n` only (some space is not CG-1/DG-0)
+        '''
+        from roukf import io as rio
+
+        comm = self.u.function_space.mesh.comm
+
+        orders = rio.write_state_fields_h5(
+            comm, str(Path(path) / 'nsx_aux.h5'), self._roukf_functions(),
+            t=float(self.t), attrs=self._roukf_scalars())
+
+        self.logger.info('NSx auxiliary restart state written to %s (dof '
+                         'order: %s)', path, '/'.join(sorted(orders)))
+
+        return orders
+
+    def read_restart(self, path):
+        ''' ROUKF restart hook (see roukf.core.ROUKF.read_restart).
+
+        Args:
+            path (str):  restart bundle directory
+        '''
+        from roukf import io as rio
+
+        comm = self.u.function_space.mesh.comm
+        fn = Path(path) / 'nsx_aux.h5'
+
+        if not fn.exists():
+            raise FileNotFoundError(
+                'NSx auxiliary restart file missing: {}'.format(fn))
+
+        # The reader restores each field's OWNED dofs from the
+        # partition-independent data and then, when the bundle was written at
+        # this same rank count, overlays the exact ghost entries. That overlay
+        # matters: the velocity-component histories are NOT ghost-consistent
+        # (their ghost entries are not simply the owner's values), so relying
+        # on a scatter would overwrite genuine data with the owner value and
+        # the resumed run drifts. Measured on the 2D channel at mpirun -n 2:
+        # owned dofs matched exactly while ghosts were off by 5.7e-3 / 1.5e-1
+        # relative. A ghost set is a property of the partition, so resuming at
+        # a DIFFERENT rank count necessarily falls back to the scatter and is
+        # correct but not bit-identical.
+        t, attrs, missing, unknown = rio.read_state_fields_h5(
+            comm, str(fn), self._roukf_functions())
+
+        if missing or unknown:
+            self.logger.warning(
+                'restart bundle field mismatch (configuration changed since '
+                'it was written?): missing from bundle %s; unused in bundle '
+                '%s', missing or 'none', unknown or 'none')
+
+        if getattr(self, 'upd_lst', None) and hasattr(self, 'upd'):
+            self._merge_lst_to_vec(self.upd_lst, self.upd)
+
+        self._restore_roukf_scalars(attrs)
+
+        self.t = float(t)
+
+        self.logger.info('NSx auxiliary restart state restored from %s '
+                         '(t = %.4f)', path, self.t)
+
     def init_observations(self):
         ''' Initialize observations for ROUKF.
 
@@ -786,7 +975,15 @@ class Solver(LoggerBase):
         veldir_given = []
         numpy_given = []
         for meas in measurement_lst:
-            if 'velocity_direction' in meas:
+            # 'lumen_area' is a SCALAR functional (one number per frame), so it
+            # belongs on the scalar path even though it carries no
+            # velocity_direction -- that key selects a projected VELOCITY, which
+            # is meaningless here. Without this, mixing a cine set with a
+            # Doppler set trips the "no mixing" check below even though both
+            # are scalar.
+            if meas.get('observable') == 'lumen_area':
+                veldir_given.append(True)
+            elif 'velocity_direction' in meas:
                 direction = meas['velocity_direction']
                 if isinstance(direction, list):
                     if not all(isinstance(d, (int, float)) for d in direction):
@@ -867,10 +1064,31 @@ class Solver(LoggerBase):
                 ', '.join('#{} {}'.format(i, f) for i, f in
                           enumerate(self._observation_frames)))
         for kind in self._observation_kinds:
-            if kind not in ('velocity', 'vorticity', 'pressure'):
+            if kind not in ('velocity', 'vorticity', 'pressure', 'lumen_area'):
                 raise Exception(
-                    "measurements: observable must be 'velocity', 'vorticity' "
-                    "or 'pressure', got {!r}".format(kind))
+                    "measurements: observable must be 'velocity', 'vorticity', "
+                    "'pressure' or 'lumen_area', got {!r}".format(kind))
+        # 'lumen_area': a FUNCTIONAL of the state, not a field -- the area of
+        # the ALE-deformed fluid mesh cut by a fixed imaging plane, i.e. what a
+        # cine MRI actually measures. Evaluated by calling MeasureIt's OWN
+        # CineMRIExam.lumen_area, so H(X) and the data Z come from identical
+        # code (validated to 0.000% against observable/lumen_area_true,
+        # 2026-07-31). The measurement "mesh" is a single cell carrying one
+        # dof, so the rest of the ROUKF machinery (innovation, noise,
+        # interpolating_meas) needs no special case.
+        self._cine_exams = {}
+        for i, meas in enumerate(measurement_lst):
+            if self._observation_kinds[i] != 'lumen_area':
+                continue
+            exam_json = meas.get('exam_json')
+            if not exam_json:
+                raise Exception(
+                    "measurements: observable 'lumen_area' needs `exam_json:` "
+                    "-- the MeasureIt <stem>_exam.json that defines the "
+                    "imaging plane")
+            self._cine_exams[i] = self._init_lumen_area_exam(exam_json)
+            self.logger.info('Observation #%d: lumen_area from %s',
+                             i, exam_json)
         if any(k == 'vorticity' for k in self._observation_kinds):
             self.logger.info(
                 'Observation operator: %s',
@@ -896,6 +1114,13 @@ class Solver(LoggerBase):
                 # Directly reflects the Windkessel (which sets the outlet
                 # pressure), so a single sensor near the outlet is far more
                 # informative for RCR than velocity. velocity_direction n/a.
+                V = functionspace(mesh, (family, degree))
+                fun_aux_lst.append(None)
+            elif kind == 'lumen_area':
+                # A FUNCTIONAL of the state: one scalar (the deformed lumen
+                # cross-section on the exam's plane) living in the single dof of
+                # a one-cell mesh. No auxiliary vector -- velocity_direction
+                # does not apply, and _lumen_area writes the dof directly.
                 V = functionspace(mesh, (family, degree))
                 fun_aux_lst.append(None)
             elif all_scalar:
@@ -1256,7 +1481,13 @@ class Solver(LoggerBase):
         try:
             stale = key not in cache
             if deformed and not stale:
-                stale = not np.array_equal(cache[key][2], self.d.x.array)
+                # Same collective hazard as _wk_ac_mesh_changed: this predicate
+                # gates fem.create_interpolation_data, which communicates point
+                # ownership across ranks, but self.d.x.array is rank-LOCAL. A
+                # rank whose local ALE dofs did not move would skip the rebuild
+                # and deadlock the others. Reduce with LOR.
+                stale = bool(not np.array_equal(cache[key][2], self.d.x.array))
+                stale = V_from.mesh.comm.allreduce(stale, op=MPI.LOR)
 
             if stale:
                 mesh_to = V_to.mesh
@@ -1351,6 +1582,81 @@ class Solver(LoggerBase):
         a[:] = np.mod(a + float(vnyq), span) - float(vnyq)
         Xobs.x.scatter_forward()
 
+    # ------------------------------------------------------------------
+    # lumen_area: a FUNCTIONAL observation (cine MRI)
+    # ------------------------------------------------------------------
+    def _gather_mesh_original(self):
+        ''' (points, cells) of the fluid mesh on rank 0, in ORIGINAL
+        (mesh-file) node numbering -- partition-invariant, and the order the
+        gathered ALE displacement below uses. Cached. '''
+        if getattr(self, '_pv_mesh_cache', None) is not None:
+            return self._pv_mesh_cache
+        mesh = self.u.function_space.mesh
+        comm = mesh.comm
+        tdim = mesh.topology.dim
+        ig = np.asarray(mesh.geometry.input_global_indices)
+        n_nodes = mesh.geometry.x.shape[0]
+        n_cells = mesh.topology.index_map(tdim).size_local
+        cells_local = np.asarray(mesh.geometry.dofmap)[:n_cells]
+        pts = comm.gather((ig[:n_nodes], mesh.geometry.x[:n_nodes]), root=0)
+        cel = comm.gather(ig[cells_local], root=0)
+        out = (None, None)
+        if comm.rank == 0:
+            n_glob = max(int(o.max()) for o, _ in pts) + 1
+            P = np.zeros((n_glob, 3))
+            for o, v in pts:
+                P[o] = v
+            out = (P, np.vstack(cel))
+        self._pv_mesh_cache = out
+        return out
+
+    def _init_lumen_area_exam(self, exam_json):
+        ''' Rebuild a MeasureIt CineMRIExam from its exported header so the
+        observation operator IS the generator's own code. Returns the exam on
+        rank 0 (None elsewhere); the fluid mesh is passed in ORIGINAL node
+        order, which is also the order `_lumen_area` supplies d_ale in.
+        `lumen_area` is a purely GEOMETRIC functional, so only that internal
+        consistency matters -- not how MeasureIt's own reader would order it.
+        '''
+        import json
+
+        P, C = self._gather_mesh_original()
+        comm = self.u.function_space.mesh.comm
+        if comm.rank != 0:
+            return None
+        import pyvista as pv
+        from imaging import CineMRIExam, CineMRIExamParams
+
+        conn = np.hstack([np.full((C.shape[0], 1), C.shape[1], dtype=np.int64),
+                          C.astype(np.int64)]).ravel()
+        ctype = np.full(C.shape[0], pv.CellType.TETRA, dtype=np.uint8)
+        grid = pv.UnstructuredGrid(conn, ctype, np.asarray(P, dtype=float))
+        params = CineMRIExamParams(
+            **json.load(open(str(exam_json)))['Params'])
+        # lumen_area only touches the FLUID mesh; the solid argument is
+        # required by the constructor but unused here.
+        return CineMRIExam(grid, grid, params)
+
+    def _lumen_area(self, i):
+        ''' H(X) for measurement set `i`: the deformed-lumen cross-sectional
+        area on that exam's plane. Collective; returns the same float on
+        every rank. '''
+        comm = self.u.function_space.mesh.comm
+        d = self.d
+        imap = d.function_space.dofmap.index_map
+        bs = d.function_space.dofmap.index_map_bs
+        n_owned = imap.size_local
+        orig = _orig_node_index(d)
+        vals = d.x.array[:n_owned * bs].reshape(n_owned, bs)
+        packets = comm.gather((orig, vals), root=0)
+        area = 0.0
+        if comm.rank == 0:
+            D = np.zeros((imap.size_global, bs))
+            for o, v in packets:
+                D[o] = v
+            area = float(self._cine_exams[i].lumen_area(D))
+        return comm.bcast(area, root=0)
+
     def observation(self, Xobs_lst):
         ''' Compute observation by applying the observation operator to the
         state, H(X).
@@ -1374,7 +1680,11 @@ class Solver(LoggerBase):
         if not self._observation_res_lst:
             for i, (Xobs, Xobs_aux) in enumerate(zip(Xobs_lst, Xobs_aux_lst)):
                 warp = frames[i] == 'deformed'
-                if kinds[i] == 'vorticity':
+                if kinds[i] == 'lumen_area':
+                    # functional, not a field: one scalar into the single dof
+                    Xobs.x.array[:] = self._lumen_area(i)
+                    Xobs.x.scatter_forward()
+                elif kinds[i] == 'vorticity':
                     self._interpolate_observation(Xobs, self.vorticity(),
                                                   deformed=warp)
                 elif kinds[i] == 'pressure':
@@ -1396,7 +1706,13 @@ class Solver(LoggerBase):
                                                       deformed=warp)
 
                     else:
-                        assert not Xobs.value_shape(), 'Xobs is not a scalar'
+                        # dolfinx 0.10: value_shape lives on the FunctionSpace
+                        # and is a tuple, not a Function method. The old call
+                        # raised AttributeError, so this branch -- the general
+                        # (non-axis-aligned) projected-velocity path a real
+                        # Doppler beam takes -- had never actually run.
+                        assert not Xobs.function_space.value_shape, \
+                            'Xobs is not a scalar'
                         # normalize projection direction
                         direction = np.array(direction, dtype=float)
                         direction /= np.sqrt(np.dot(direction, direction))
@@ -2472,13 +2788,28 @@ class Solver(LoggerBase):
         ''' True if the ALE mesh (self.d) or the Windkessel impedance
         coefficients changed since A_c was last built.  FGG freezes the mesh
         within a step -> False across sub-iters -> reuse the cached condensed
-        operator + its MUMPS factorization. '''
+        operator + its MUMPS factorization.
+
+        The answer MUST be identical on every rank: it decides whether
+        `assemble_pressure` calls `_assemble_mat`, which goes through dolfinx's
+        `mpi_jit` -- a COLLECTIVE. `self.d.x.array` is only this rank's slice,
+        so a rank whose local ALE dofs happen not to move (a near-converged FSI
+        sub-iteration can leave far-field dofs bitwise unchanged while the
+        interface still moves) answers False, skips the assembly, and hangs
+        every rank that answered True inside the JIT broadcast. That is the
+        multi-particle ROUKF MPI deadlock (2026-07-30): rank 0 stuck in a
+        collective Mat.mult, all other ranks in mpi_jit. Reduce with LOR so the
+        ranks always rebuild together. '''
         cur = self.d.x.array
         cached = getattr(self, '_wk_ac_d_cached', None)
-        if (cached is None or cached.shape != cur.shape
-                or not np.array_equal(cached, cur)):
-            return True
-        return getattr(self, '_wk_ac_delta_cached', None) != self._wk_ac_deltas()
+        local = bool(cached is None or cached.shape != cur.shape
+                     or not np.array_equal(cached, cur))
+        if not local:
+            # delta_l lives in Constants (identical on every rank), but fold it
+            # in so there is exactly ONE collective answer per call
+            local = bool(getattr(self, '_wk_ac_delta_cached', None)
+                         != self._wk_ac_deltas())
+        return self.d.function_space.mesh.comm.allreduce(local, op=MPI.LOR)
 
     def _wk_ac_cache_mesh(self):
         self._wk_ac_d_cached = self.d.x.array.copy()
@@ -3287,12 +3618,43 @@ class Solver(LoggerBase):
 
         u_out = (self.upd if (self._using_ale and update) else self.u)
 
+        # PARTITION-INDEPENDENT checkpoints (2026-07-31): store by ORIGINAL node
+        # index so a checkpoint written at one `mpirun -n` restarts at any
+        # other. The legacy rank order silently required the same rank count --
+        # it is what pinned the 3D CCA estimation to NP=8 (reading an NP=8
+        # restart at NP=16 scrambled the state and folded the ALE mesh in 5
+        # steps). Falls back to rank order for non-CG-1 spaces (e.g. P2
+        # velocity); `attrs['dof_order']` records which was used so a reader
+        # never has to guess, and its ABSENCE means a pre-fix checkpoint.
+        # OPT-IN, DEFAULT OFF: the original-node format is implemented but NOT
+        # yet validated end to end -- a write@NP=4 / read@NP=8 round trip still
+        # disagreed (|p| 1.276e5 vs 6.480e4) on 2026-07-31, and
+        # gen_measurements_from_checkpoints.py still assumes the legacy key.
+        # Until both are fixed, keep writing the legacy format so nothing
+        # downstream is silently corrupted. Set CHECKPOINT_ORIGINAL_ORDER=1 to
+        # experiment. Readers auto-detect via attrs['dof_order'], so old and
+        # new files both load correctly whichever way this is set.
+        _use_orig = (os.environ.get('CHECKPOINT_ORIGINAL_ORDER') == '1'
+                     and all(_orig_node_index(f) is not None
+                             for f in (u_out, self.p)))
+
         def _gather_full(fn):
             idx = fn.function_space.dofmap.index_map
             bs = fn.function_space.dofmap.index_map_bs
-            local_arr = fn.x.array[:idx.size_local * bs].copy()
-            gathered = comm.gather(local_arr, root=0)
-            return np.concatenate(gathered) if comm.rank == 0 else None
+            n_owned = idx.size_local
+            if not _use_orig:
+                local_arr = fn.x.array[:n_owned * bs].copy()
+                gathered = comm.gather(local_arr, root=0)
+                return np.concatenate(gathered) if comm.rank == 0 else None
+            orig = _orig_node_index(fn)
+            vals = fn.x.array[:n_owned * bs].reshape(n_owned, bs)
+            packets = comm.gather((orig, vals), root=0)
+            if comm.rank != 0:
+                return None
+            full = np.zeros((idx.size_global, bs), dtype=vals.dtype)
+            for o, v in packets:
+                full[o] = v
+            return full.reshape(-1)
 
         u_full = _gather_full(u_out)
         p_full = _gather_full(self.p)
@@ -3324,6 +3686,7 @@ class Solver(LoggerBase):
                     for _bid, _prm in self.bc_dict['p']['windkessel']['params'].items():
                         f.attrs['wk_pi_%d' % _bid] = float(_prm['pi'].value)
                 f.attrs['t'] = float(self.t)
+                f.attrs['dof_order'] = 'original' if _use_orig else 'rank'
 
         if self._using_ale:
             d_full = _gather_full(self.d)
@@ -3333,6 +3696,7 @@ class Solver(LoggerBase):
                     f.create_dataset('d', data=d_full)
                     f.create_dataset('d0', data=d0_full)
                     f.attrs['t'] = float(self.t)
+                    f.attrs['dof_order'] = 'original' if _use_orig else 'rank'
 
         if self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS':
             self.logger.warn('Checkpointing for IPCS experimental!')
