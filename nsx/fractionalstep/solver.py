@@ -1002,15 +1002,26 @@ class Solver(LoggerBase):
             else:
                 numpy_given.append(False)
 
-        all_scalar = all([flag is True for flag in veldir_given])
-        all_vector = all([flag is False for flag in veldir_given])
+        # The scalar/vector consistency only constrains sets that use the
+        # PLAIN 'velocity' observable, because only those take their shape from
+        # velocity_direction. 'vorticity', 'pressure' and 'lumen_area' each
+        # build their OWN space below and do not participate -- so the old
+        # blanket check needlessly forbade e.g. PIV velocity (a 3-vector)
+        # alongside a lumen_area scalar, which is exactly the cross-subsystem
+        # pairing the design rule calls for. Narrowed 2026-08-02.
+        _kinds = [m.get('observable', 'velocity') for m in measurement_lst]
+        _vel = [f for f, k in zip(veldir_given, _kinds) if k == 'velocity']
+
+        all_scalar = bool(_vel) and all(f is True for f in _vel)
+        all_vector = (not _vel) or all(f is False for f in _vel)
         all_numpy = all([flag is True for flag in numpy_given])
         all_fenics = all([flag is False for flag in numpy_given])
 
-        if not (all_scalar or all_vector):
-            raise Exception('All measurements need to be given as 3D (no '
-                            'velocity_direction) or 1D, mixing is not '
-                            'supported')
+        if _vel and not (all_scalar or all_vector):
+            raise Exception('All VELOCITY measurements need to be given as 3D '
+                            '(no velocity_direction) or 1D, mixing is not '
+                            'supported. Non-velocity observables '
+                            '(vorticity/pressure/lumen_area) are unaffected.')
 
         if not (all_numpy or all_fenics):
             raise Exception('All measurements need to be given either '
@@ -1086,7 +1097,8 @@ class Solver(LoggerBase):
                     "measurements: observable 'lumen_area' needs `exam_json:` "
                     "-- the MeasureIt <stem>_exam.json that defines the "
                     "imaging plane")
-            self._cine_exams[i] = self._init_lumen_area_exam(exam_json)
+            self._cine_exams[i] = self._init_lumen_area_exam(
+                exam_json, meas.get('clip_bounds'))
             self.logger.info('Observation #%d: lumen_area from %s',
                              i, exam_json)
         if any(k == 'vorticity' for k in self._observation_kinds):
@@ -1610,7 +1622,7 @@ class Solver(LoggerBase):
         self._pv_mesh_cache = out
         return out
 
-    def _init_lumen_area_exam(self, exam_json):
+    def _init_lumen_area_exam(self, exam_json, clip_bounds=None):
         ''' Rebuild a MeasureIt CineMRIExam from its exported header so the
         observation operator IS the generator's own code. Returns the exam on
         rank 0 (None elsewhere); the fluid mesh is passed in ORIGINAL node
@@ -1631,11 +1643,47 @@ class Solver(LoggerBase):
                           C.astype(np.int64)]).ravel()
         ctype = np.full(C.shape[0], pv.CellType.TETRA, dtype=np.uint8)
         grid = pv.UnstructuredGrid(conn, ctype, np.asarray(P, dtype=float))
+        # OPTIONAL AXIAL WINDOW. `lumen_area` cuts the WHOLE fluid domain, so
+        # on a branching vessel the observable integrates the bifurcation too.
+        # Measured on the 3D CCA with the PIV plane: over the full cut, Z/H
+        # drifts 4% across the cycle against a 5% signal -- the branch regions
+        # appear and vanish across the sheet and swamp it. Restricted to a
+        # single-vessel window the SAME measurement drifts 0.58% against 3.91%.
+        # Clipping the grid here restricts H(X) to the same window Z was taken
+        # over; without it the two integrate different geometry.
+        pt_ids = None
+        if clip_bounds is not None:
+            b = [float(v) for v in clip_bounds]
+            if len(b) != 6:
+                raise Exception('measurements: clip_bounds must be '
+                                '[xmin,xmax,ymin,ymax,zmin,zmax], got %r'
+                                % (clip_bounds,))
+            # extract_cells, NOT clip_box: clip_box re-indexes the points, so
+            # the ALE displacement array silently stops matching and the exam
+            # warps by nothing (it then reports a CONSTANT area -- caught in
+            # testing). extract_cells keeps vtkOriginalPointIds, so the
+            # displacement can be subset exactly.
+            ctr = np.asarray(grid.cell_centers().points)
+            sel = np.nonzero((ctr[:, 0] >= b[0]) & (ctr[:, 0] <= b[1]) &
+                             (ctr[:, 1] >= b[2]) & (ctr[:, 1] <= b[3]) &
+                             (ctr[:, 2] >= b[4]) & (ctr[:, 2] <= b[5]))[0]
+            if sel.size == 0:
+                raise Exception('measurements: clip_bounds %r leaves no fluid '
+                                'cells' % (clip_bounds,))
+            sub = grid.extract_cells(sel)
+            pt_ids = np.asarray(sub.point_data['vtkOriginalPointIds'])
+            grid = sub
+            self.logger.info(
+                'lumen_area window: %d of %d fluid cells kept',
+                sel.size, ctr.shape[0])
         params = CineMRIExamParams(
             **json.load(open(str(exam_json)))['Params'])
         # lumen_area only touches the FLUID mesh; the solid argument is
         # required by the constructor but unused here.
-        return CineMRIExam(grid, grid, params)
+        exam = CineMRIExam(grid, grid, params)
+        # remembered so _lumen_area can subset the displacement to the window
+        exam._roukf_pt_ids = pt_ids
+        return exam
 
     def _lumen_area(self, i):
         ''' H(X) for measurement set `i`: the deformed-lumen cross-sectional
@@ -1654,7 +1702,9 @@ class Solver(LoggerBase):
             D = np.zeros((imap.size_global, bs))
             for o, v in packets:
                 D[o] = v
-            area = float(self._cine_exams[i].lumen_area(D))
+            exam = self._cine_exams[i]
+            ids = getattr(exam, '_roukf_pt_ids', None)
+            area = float(exam.lumen_area(D if ids is None else D[ids]))
         return comm.bcast(area, root=0)
 
     def observation(self, Xobs_lst):
