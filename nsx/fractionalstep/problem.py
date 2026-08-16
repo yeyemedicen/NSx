@@ -98,6 +98,13 @@ _TIME_EXPR_NS = {
 }
 
 
+def _is_num(v):
+    try:
+        float(v); return True
+    except (TypeError, ValueError):
+        return False
+
+
 def _make_time_expression(expr_str, params):
     ''' Compile a scalar waveform string in `t` into a float-valued
     callable. `params` supplies named constants; the usual math functions
@@ -1645,10 +1652,41 @@ class BoundaryConditions(LoggerBase):
                   if k != 't'}
         wave = _make_time_expression(bc['value'], params)
         val = self._C(wave(0.0))
+        # OPTIONAL upstream/downstream IMPEDANCE (0D coupling).
+        #
+        # With `resistance: R` the boundary imposes
+        #       p = p_src(t) + R * Q ,        Q = int_Gamma u . n  (OUTWARD n)
+        # instead of the bare Dirichlet p = p_src(t). Q < 0 for inflow, so at an
+        # INLET the boundary pressure DROPS as inflow grows -- an upstream
+        # resistance -- and at an OUTLET it rises with outflow. One formula,
+        # correct sign at both ends.
+        #
+        # WHY THIS EXISTS. A prescribed pressure is the ZERO-impedance limit:
+        # the boundary supplies whatever normal flux the pressure difference
+        # demands, with nothing opposing it. On the compliant 3D carotid that
+        # is unstable -- measured 2026-08-15, a purely NORMAL jet at the inlet
+        # rim reaching 143 -> 684 -> 1075 cm/s in three steps, folding the ALE
+        # mesh (area ratio -7.7 -> -20.4) and killing the solid SNES at
+        # t = 0.004. Identical in serial, with condensed:false, and with the
+        # pressure ramped to zero initial mismatch, so it is neither an MPI nor
+        # a Windkessel nor a startup-shock problem: it is the BC formulation.
+        # R*Q opposes exactly the runaway quantity (the normal flux), which is
+        # why pinning TANGENTIAL velocity does not help -- the jet is 100 %
+        # normal at onset.
+        #
+        # A natural value is the characteristic impedance R = rho*c/A, the same
+        # quantity used for the Windkessel R_p.
+        R_in = float(bc.get('parameters', {}).get('resistance', 0.0))
         registry[bc['id']] = {'constant': val, 'waveform': wave,
-                              'id': bc['id']}
-        self.logger.info('Neumann BC bid=%d: time-dependent traction "%s"',
-                         bc['id'], bc['value'])
+                              'id': bc['id'], 'resistance': R_in}
+        if R_in:
+            self.logger.info(
+                'Neumann BC bid=%d: IMPEDANCE inlet, p = p_src(t) + %.4g*Q '
+                '(Q = int u.n, outward normal); p_src = "%s"',
+                bc['id'], R_in, bc['value'])
+        else:
+            self.logger.info('Neumann BC bid=%d: time-dependent traction "%s"',
+                             bc['id'], bc['value'])
         return val
 
     def _neumann_pressure(self, bc):
@@ -1999,7 +2037,11 @@ class BoundaryConditions(LoggerBase):
 
         # --- temporal waveform → unified scale_func(t) → float ---
         # Reserved parameters not treated as expression variables:
-        _reserved = {'U', 'waveform'}
+        # 'upstream_*' are the 0D-coupling keys: upstream_source is an
+        # EXPRESSION, not a numeric constant, so it must not reach the
+        # float() coercion below.
+        _reserved = {'U', 'waveform',
+                     'upstream_resistance', 'upstream_source'}
         scale_func = None   # None means constant (no update needed)
 
         if 'waveform' in bc['parameters']:
@@ -2122,7 +2164,7 @@ class BoundaryConditions(LoggerBase):
 
         # --- register for time updates (any time-dependent waveform) ---
         if scale_func is not None:
-            self.bc_dict['u']['dbc_expressions'][('parable', bc['id'])] = {
+            reg = {
                 'parable_funcs': parable_funcs,
                 'parable_scale_func': scale_func,
                 'centroid': centroid,
@@ -2130,6 +2172,36 @@ class BoundaryConditions(LoggerBase):
                 'R1': R1, 'R2': R2, 'U': U,
                 'id': bc['id'],
             }
+            # OPTIONAL 0D UPSTREAM COUPLING (opt-in). With
+            #     upstream_resistance: R_up      and    upstream_source: p(t)
+            # the amplitude U stops being prescribed and is solved each step
+            # from  Q = (p_src(t) - <p>_inlet)/R_up  (see
+            # solver.py::_update_0d_inlet). The BC remains a velocity Dirichlet
+            # -- so the inlet corner keeps the regularisation that makes a
+            # parabolic profile stable -- while the FLOW responds to pressure,
+            # which is what makes Windkessel/stiffness parameters observable.
+            # Absent these keys the BC behaves exactly as before.
+            _pr = bc.get('parameters', {})
+            if 'upstream_resistance' in _pr:
+                if 'upstream_source' not in _pr:
+                    raise KeyError(
+                        "parable BC id={}: 'upstream_resistance' requires "
+                        "'upstream_source' (the 0D source pressure, a "
+                        "float or an expression in t)".format(bc['id']))
+                _src = _pr['upstream_source']
+                _consts = {k: float(v) for k, v in _pr.items()
+                           if k not in ('upstream_source', 't')
+                           and isinstance(v, (int, float, str))
+                           and not isinstance(v, bool)
+                           and _is_num(v)}
+                reg['upstream_resistance'] = float(_pr['upstream_resistance'])
+                reg['upstream_source'] = (
+                    _make_time_expression(str(_src), _consts))
+                self.logger.info(
+                    'parable BC bid=%d: 0D UPSTREAM COUPLING, '
+                    'Q = (p_src - <p>_inlet)/%.4g, U solved each step',
+                    bc['id'], reg['upstream_resistance'])
+            self.bc_dict['u']['dbc_expressions'][('parable', bc['id'])] = reg
     
 
     def _windkessel(self, bc):

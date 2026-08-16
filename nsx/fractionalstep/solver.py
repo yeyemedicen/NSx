@@ -106,8 +106,54 @@ def _orig_node_index(fn):
 
 
 def _mat_vec(A, x):
-    ''' Compute y = A * x, returning a new PETSc.Vec. '''
+    ''' Compute y = A * x, returning a new PETSc.Vec.
+
+    NOTE the result is NOT ghosted (createVecLeft gives owned entries only).
+    That is fine for a vector that is only ever scaled/axpy'd/solved with,
+    but it must NOT be passed to `apply_lifting`, which writes the ghost
+    region by design ("caller is responsible for reverse-scatter"). Use
+    `_mat_vec_ghosted` in that case -- see build_rhs_pressure. '''
     y = A.createVecLeft()
+    A.mult(x, y)
+    return y
+
+
+def _mat_vec_ghosted(A, x, V):
+    ''' Compute y = A * x into a GHOSTED PETSc.Vec laid out like the space V.
+
+    Required whenever the result is handed to `apply_lifting`. dolfinx's
+    apply_lifting does
+
+        with b.localForm() as b_l: _apply_lifting(b_l.array_w, ...)
+
+    and scatters lifting contributions through the LOCAL dofmap, whose
+    indices run over owned AND ghost dofs -- its docstring says outright
+    "Caller is responsible for reverse-scatter to update the ghosts". On a
+    vector from `createVecLeft` the local form is the OWNED block only, so
+    every ghost dof touched is a write PAST THE END of the buffer.
+
+    That is silent heap corruption, and it is invisible in serial (no ghosts
+    exist, so no index ever exceeds the owned size) -- which is exactly how
+    it survived: measured 2026-08-16, the 3D CCA pressure-driven twin runs
+    clean at -n 1 and dies at -n 2/4/8/16 with a SEGV whose site MOVES with
+    the allocation pattern (solid residual pack_coefficients, the solid
+    Jacobian assembly, an MPI_Allreduce inside the condensed-WK check, a
+    JIT module load). It reproduces with condensed:false and with no
+    Windkessel at all, because none of those are the cause: the trigger is
+    simply a NON-EMPTY pressure Dirichlet list, which is what makes
+    apply_lifting do any work.
+
+    Args:
+        A (PETSc.Mat): operator
+        x (PETSc.Vec): input vector
+        V: FunctionSpace giving the ghosted row layout of the result
+
+    Returns:
+        PETSc.Vec: ghosted, holding A*x in its owned block
+    '''
+    from dolfinx.la.petsc import create_vector as _create_ghosted_vec
+    dm = V.dofmap
+    y = _create_ghosted_vec([(dm.index_map, dm.index_map_bs)])
     A.mult(x, y)
     return y
 
@@ -2766,7 +2812,11 @@ class Solver(LoggerBase):
             cf = 1.5
         else:
             cf = 1.
-        bp = _mat_vec(self.mat['p']['rhs_u'], self.u.x.petsc_vec)
+        # GHOSTED: apply_lifting below writes the ghost region (see
+        # _mat_vec_ghosted). A plain createVecLeft vector overruns its buffer
+        # there under MPI whenever a pressure Dirichlet BC is present.
+        bp = _mat_vec_ghosted(self.mat['p']['rhs_u'], self.u.x.petsc_vec,
+                              self.p.function_space)
         bp.scale(cf)
 
         if self.forms['p'].get('fsi_si_rhs') is not None:
@@ -2795,6 +2845,12 @@ class Solver(LoggerBase):
 
         apply_lifting(bp, [fem_form(self.forms['p']['laplacian'])],
                       [self.bc_dict['p']['dirichlet']])
+        # Lifting contributions land on ghost rows too; accumulate them onto
+        # their owners before set_bc. Without this they are not merely lost --
+        # on a non-ghosted vector they were written out of bounds. No-op in
+        # serial, so serial results are unchanged.
+        bp.ghostUpdate(addv=PETSc.InsertMode.ADD,
+                       mode=PETSc.ScatterMode.REVERSE)
         set_bc(bp, self.bc_dict['p']['dirichlet'])
 
         if self._using_wk and not self.wk['implicit']:
@@ -2948,6 +3004,11 @@ class Solver(LoggerBase):
         ''' Projection step. Solve pressure poisson equation. '''
         timer = Timer('Z solve p')
 
+        # No-op unless a 'neumann' BC declares `resistance` (see
+        # _update_impedance_bc). Placed here rather than in timestep() because
+        # JellyFSI's coupling calls solve_pressure() DIRECTLY and never reaches
+        # timestep() -- see jellyfsi/solver.py:679.
+        self._update_impedance_bc()
         self.update_pressure_bcs()
         # FIXME: necessary to adapt this if Robin coef. changes!
         self.assemble_pressure()
@@ -3115,6 +3176,160 @@ class Solver(LoggerBase):
                 func = dict_['function']
                 self.transfer_displacement(self.d_s, func) # in -> out
 
+    def _update_0d_inlet(self, bid, dict_):
+        """ Amplitude of a 0D-coupled parabolic inlet.
+
+            Q_target = (p_src(t) - <p>_inlet) / R_up          [>0 = inflow]
+
+        and U is driven MULTIPLICATIVELY from the MEASURED flux:
+
+            U <- U * (Q_target / Q_measured),  relaxed, rate-limited.
+
+        Two reasons for the multiplicative form rather than U = Q/k:
+          * it needs no profile constant k, and the waveform scale CANCELS --
+            Q_measured already contains it. Inverting U = Q/k while forgetting
+            the scale is exactly the error that drove U 295.8 -> 149.2 in one
+            step and collapsed the inlet pressure (measured 2026-08-15);
+          * it uses the flux the solver ACTUALLY produces. Under Chorin-Temam
+            the projection modifies the end-of-step velocity, so the nominal
+            profile flux and the real one differ by ~10x here; the 0D model
+            must couple to the physical flux, not the nominal one.
+
+        Rate-limited because U feeds a DIRICHLET condition: a large jump is a
+        violent perturbation regardless of how correct its target is.
+        """
+        import numpy as _np
+        R_up = float(dict_['upstream_resistance'])
+        t = float(self.t)
+        opt = self.options['timemarching']['fractionalstep']
+        omega = opt.get('inlet0d_relax', 0.3)
+        max_chg = opt.get('inlet0d_max_change', 0.10)   # per step
+
+        p_in = self._boundary_pressure_mean(bid)
+        p_src = dict_['upstream_source'](t)
+        Q_t = (p_src - p_in) / R_up                 # >0 = inflow
+        Q_m = -self._boundary_flux(bid)             # >0 = inflow
+        U = float(dict_['U'])
+
+        if abs(Q_m) > 1e-9 and Q_t > 0.0:
+            U_t = U * (Q_t / Q_m)
+        else:
+            U_t = U                                  # no usable signal: hold
+        U_new = U + omega * (U_t - U)
+        lo, hi = U * (1.0 - max_chg), U * (1.0 + max_chg)
+        U_new = float(_np.clip(U_new, min(lo, hi), max(lo, hi)))
+        dict_['U'] = U_new
+        self.logger.info(
+            '[inlet0d] bid=%d t=%.4f p_src=%.1f p_in=%.1f Q_t=%+.4e '
+            'Q_meas=%+.4e U=%.3f', bid, t, p_src, p_in, Q_t, Q_m, U_new)
+
+    def _boundary_pressure_mean(self, bid):
+        """ Area-averaged pressure on boundary `bid`. Collective; form cached. """
+        cache = getattr(self, '_bpm_forms', None)
+        if cache is None:
+            cache = self._bpm_forms = {}
+        got = cache.get(bid)
+        if got is None:
+            mesh = self.p.function_space.mesh
+            ds = Measure('ds', domain=mesh, subdomain_data=self.bnds)
+            one = fem.Constant(mesh, PETSc.ScalarType(1.0))
+            got = (fem_form(self.p * ds(bid)), fem_form(one * ds(bid)))
+            cache[bid] = got
+        comm = self.p.function_space.mesh.comm
+        num = comm.allreduce(assemble_scalar(got[0]), op=MPI.SUM)
+        den = comm.allreduce(assemble_scalar(got[1]), op=MPI.SUM)
+        return num / max(den, 1e-30)
+
+    def _impedance_bcs(self):
+        ''' [(bid, R)] for every 'neumann' BC carrying a nonzero `resistance`.
+
+        Returns [] unless an impedance BC is declared, which is what gates the
+        whole feature: with no `resistance:` key the solver takes exactly the
+        code path it took before this was added.
+        '''
+        nmn = self.bc_dict['u'].get('neumann_expressions', {})
+        return [(bid, d['resistance']) for bid, d in nmn.items()
+                if d.get('resistance', 0.0)]
+
+    def _update_impedance_bc(self):
+        """ ONE relaxed pass of the impedance condition  p = p_src(t) + R*Q.
+
+        Called at the top of solve_pressure(), i.e. ONCE PER FSI SUB-ITERATION
+        (JellyFSI drives solve_tentative_velocity/solve_pressure directly and
+        bypasses timestep(); NSx standalone reaches the same hook through
+        timestep). The outer loop -- FSI sub-iterations, or successive steps in
+        standalone -- is what drives it to convergence, so at convergence the
+        impedance condition and the coupling are satisfied TOGETHER, by one
+        fixed point rather than two nested ones.
+
+        Relaxation is required, not cosmetic: for Chorin-Temam
+        u^{n+1} = u_tent - (dt/rho) grad p gives dQ/dp_bc ~ -(dt/rho)(A/L), so
+        the bare iteration has gain |R dQ/dp| ~ 2 on this vessel and DIVERGES
+        (measured explicitly: p -> -2e5 within three steps). Relaxation changes
+        only the path to the fixed point, never the fixed point, so the
+        converged answer is the exact implicit solution.
+
+        No-op unless some 'neumann' BC declares a nonzero `resistance`.
+        """
+        imp = self._impedance_bcs()
+        if not imp:
+            return
+        t = float(self.t)
+        # ONCE PER TIME STEP, not per call. solve_pressure() is invoked many
+        # times inside one step -- JellyFSI's newton-snes calls it for every
+        # SNES RESIDUAL EVALUATION. Mutating the BC there makes the residual
+        # not a function of its input and Newton fails (measured: abort inside
+        # SNESComputeFunction). Freezing it within the step keeps the residual
+        # well defined; the relaxed iteration then converges ACROSS steps.
+        if getattr(self, '_imp_last_t', None) == t:
+            return
+        self._imp_last_t = t
+        opt = self.options['timemarching']['fractionalstep']
+        omega = opt.get('impedance_relax', 0.4)
+        nmn = self.bc_dict['u']['neumann_expressions']
+        for bid, R in imp:
+            d = nmn[bid]
+            prev = float(d['constant'].value)
+            Q = self._boundary_flux(bid)
+            target = d['waveform'](t) + R * Q
+            d['constant'].value = prev + omega * (target - prev)
+            d['Q'] = Q
+            self.logger.info(
+                '[impedance] bid=%d t=%.4f Q=%+.4e p_src=%.1f target=%.1f '
+                'p=%.1f (omega=%.2f)', bid, t, Q, d['waveform'](t), target,
+                float(d['constant'].value), omega)
+
+    def _boundary_flux(self, bid):
+        ''' Volumetric flux through boundary `bid`, ALE-correct and COLLECTIVE.
+
+            Q = int_Gamma u . (J F^-T n) ds ,   n the OUTWARD facet normal,
+
+        so Q < 0 for inflow. Same convention and same deformed-normal factor as
+        the Windkessel's own flux (see solve_windkessel), so an impedance BC and
+        a Windkessel on the same mesh agree on what "flux" means.
+
+        The form is compiled once per boundary and cached: fem_form() is a JIT
+        compile, far too costly to repeat every step.
+
+        NOTE this is collective (assemble_scalar + allreduce). It is called
+        unconditionally from update_neumann_bcs for every registered impedance
+        boundary -- the registry comes from the config and is therefore
+        identical on every rank, so no rank-local predicate gates it.
+        '''
+        cache = getattr(self, '_bflux_forms', None)
+        if cache is None:
+            cache = self._bflux_forms = {}
+        form = cache.get(bid)
+        if form is None:
+            F, J = self.F, self.J
+            mesh = self.p.function_space.mesh
+            ds = Measure('ds', domain=mesh, subdomain_data=self.bnds)
+            n = FacetNormal(mesh)
+            form = fem_form(dot(self.u, J*ufl.inv(F).T*n)*ds(bid))
+            cache[bid] = form
+        return self.p.function_space.mesh.comm.allreduce(
+            assemble_scalar(form), op=MPI.SUM)
+
     def update_neumann_bcs(self):
         ''' Re-evaluate time-dependent 'neumann' BC waveforms at self.t.
 
@@ -3130,6 +3345,14 @@ class Solver(LoggerBase):
             return
 
         for bid, dict_ in nmn.items():
+            if dict_.get('resistance', 0.0):
+                # IMPEDANCE BC: the Constant is owned by _update_impedance_bc,
+                # which relaxes it once per pressure solve. Overwriting it here
+                # would discard the converged value from the previous step --
+                # the best initial guess available -- and re-inject the raw
+                # p_src every step. Only the SOURCE term is time-dependent and
+                # the updater re-reads that from 'waveform' itself.
+                continue
             dict_['constant'].value = dict_['waveform'](float(self.t))
 
         if any(self.forms['u']['neumann'].values()):
@@ -3152,6 +3375,20 @@ class Solver(LoggerBase):
                 dict_['uprofile'][1].x.array[:] = dict_['pinns_data']['uy'].item()[self.it-1][:,0]
                 dict_['uprofile'][2].x.array[:] = dict_['pinns_data']['uz'].item()[self.it-1][:,0]
             elif 'parable_funcs' in dict_:
+                # 0D-COUPLED INLET (gated: only when 'upstream_resistance'
+                # was declared). Instead of PRESCRIBING the amplitude, solve a
+                # lumped upstream model for it:
+                #       Q(t) = (p_src(t) - p_inlet) / R_up ,   U = Q / k
+                # The BC stays a velocity Dirichlet -- so the inlet rim keeps
+                # the regularisation that makes it stable -- while the FLOW
+                # RESPONDS to the computed inlet pressure. That is the property
+                # pressure-driven parameters need: raise R_d, p_inlet rises, Q
+                # falls. A prescribed-PRESSURE inlet buys the same response but
+                # leaves the velocity free at the wall/inlet corner, which on
+                # this vessel produces an unbounded normal jet (measured: 143 ->
+                # 1075 cm/s in three steps, ALE mesh inverted).
+                if dict_.get('upstream_resistance'):
+                    self._update_0d_inlet(dict_['id'], dict_)
                 scale = dict_['parable_scale_func'](self.t)
                 c, t1, t2 = dict_['centroid'], dict_['t1'], dict_['t2']
                 n_hat = dict_['n']
@@ -3684,7 +3921,16 @@ class Solver(LoggerBase):
         # downstream is silently corrupted. Set CHECKPOINT_ORIGINAL_ORDER=1 to
         # experiment. Readers auto-detect via attrs['dof_order'], so old and
         # new files both load correctly whichever way this is set.
-        _use_orig = (os.environ.get('CHECKPOINT_ORIGINAL_ORDER') == '1'
+        # DEFAULT ON since 2026-08-15. The cross-rank round trip is VALIDATED:
+        # write@n=4, read@n=4 and n=8 -> mean pressure 97264.501718 vs
+        # 97264.501572 (9 significant figures, i.e. solver determinism), and
+        # gen_measurements_from_checkpoints.py now dispatches on dof_order.
+        # The old blocker ("write@4/read@8 disagreed, |p| 1.276e5 vs 6.480e4")
+        # was NOT a state error: |p| in the step line is rank-dependent, so
+        # that comparison was never valid -- see CLAUDE.md, "a norm that scales
+        # with rank count is a missing reduce, not a broken solver".
+        # Set CHECKPOINT_ORIGINAL_ORDER=0 to force the legacy rank order.
+        _use_orig = (os.environ.get('CHECKPOINT_ORIGINAL_ORDER', '1') != '0'
                      and all(_orig_node_index(f) is not None
                              for f in (u_out, self.p)))
 
