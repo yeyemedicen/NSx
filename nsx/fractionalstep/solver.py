@@ -582,8 +582,16 @@ class Solver(LoggerBase):
             with h5py.File(str(w_file), 'r') as f:
                 u0_full = [np.array(f['u0_%d' % i]) for i in range(len(self.u0_lst))
                            if ('u0_%d' % i) in f]
-                upd_full = [np.array(f['upd_%d' % i]) for i in range(len(self.upd_lst))
-                            if ('upd_%d' % i) in f]
+                # `upd_lst` exists on the SOLVER only under ALE
+                # (_init_ale_fields returns early otherwise), so guard the READ
+                # the same way the consumption below is guarded. Without this a
+                # NON-ALE restart raises AttributeError: 'Solver' object has no
+                # attribute 'upd_lst' -- i.e. rigid-wall (fluid_only) runs could
+                # never be restarted at all.
+                upd_full = ([np.array(f['upd_%d' % i])
+                             for i in range(len(getattr(self, 'upd_lst', [])))
+                             if ('upd_%d' % i) in f]
+                            if self._using_ale else [])
                 if self._using_wk:
                     wk_pi = {b: f.attrs.get('wk_pi_%d' % b)
                              for b in self.bc_dict['p']['windkessel']['params']}
@@ -699,13 +707,29 @@ class Solver(LoggerBase):
             observations (list):   list of Functions to save observations
         '''
         
-        if restart and i == 0:
-            self.init_state(state)
-
+        # ORDER MATTERS.  `init()` is what reads `io.restart` (read_checkpoint),
+        # and `init_state()` ZEROES the velocity -- so with the old order
+        # (init_state first) the checkpoint was loaded and then discarded one
+        # line below by restart_timestep -> assign_state(state), silently
+        # turning every restarted ROUKF estimation into a COLD START.  Proven
+        # by control 2026-08-23: two estimations whose restart checkpoints
+        # differed by 55 % in |u| gave bit-identical output (2.8e-14 at the
+        # first correction).  The missing log line was a red herring --
+        # ROUKF/run.py sets this solver's logger to WARNING.
         if not self._initialized:
-            #if restart:
-            #    self.update_state(state)
             self.init()
+
+        if restart and i == 0:
+            _rst = (self.options.get('io') or {}).get('restart') or {}
+            if _rst.get('path') and _rst.get('time'):
+                # A checkpoint IS configured and init() has just loaded it into
+                # the solver's own fields; seed the ROUKF state FROM them.
+                self.update_state(state)
+                self.logger.warning(
+                    'ROUKF state seeded from io.restart checkpoint %s (t=%s)',
+                    _rst['path'], _rst['time'])
+            else:
+                self.init_state(state)
 
         if t:
             self.t = t
@@ -1402,6 +1426,47 @@ class Solver(LoggerBase):
                 self.theta_internal.append({'parable_dict': dict_})
                 theta_arr.append(float(dict_['U']))
                 theta_sd_lst.append(bc['initial_stddev'])
+
+            elif bc['type'] == 'neumann':
+                # Inlet/outlet pressure waveform, split into a LEVEL and a
+                # PULSATILE scale about its own period average (see
+                # problem._bc_time_constant). Both are dimensionless and
+                # default to 1, so the estimated quantity is a correction
+                # factor on whatever waveform the config supplies -- which is
+                # what lets a pressure-driven run be posed without a measured
+                # inlet pressure. Under Chorin-Temam a 'neumann' BC IS the
+                # prescribed pressure, so this is the pressure inlet itself.
+                bid = bc['id']
+                reg = self.bc_dict['u'].get('neumann_expressions', {})
+                if bid not in reg:
+                    raise Exception(
+                        "Neumann BC id={} has no registered waveform -- its "
+                        "'value' must be a time expression (a constant value "
+                        "has no amplitude to estimate).".format(bid))
+                dict_ = reg[bid]
+                if dict_.get('w_mean') is None:
+                    raise Exception(
+                        "Neumann BC id={} has no period: add 'T' to its "
+                        "parameters so the level/pulsatile split is "
+                        "defined.".format(bid))
+                _alias = {'pressure_mean': 'mean_scale',
+                          'pressure_amplitude': 'amp_scale'}
+                opt_lst = bc['parameters']
+                if not isinstance(opt_lst, list):
+                    opt_lst = [opt_lst]
+                for prm in opt_lst:
+                    if prm not in _alias:
+                        raise Exception(
+                            "Neumann BC id={}: cannot estimate '{}'; choose "
+                            "from {}.".format(bid, prm, sorted(_alias)))
+                    self.theta_internal.append(dict_[_alias[prm]])
+                    theta_arr.append(float(self.theta_internal[-1]))
+                opt_std = bc['initial_stddev']
+                if not isinstance(opt_std, list):
+                    opt_std = [opt_std]
+                if len(opt_std) != len(opt_lst):
+                    raise Exception('Required more stddevs')
+                theta_sd_lst.extend(opt_std)
 
             else:
                 raise NotImplementedError('BC type "{}" not yet supported for '
@@ -3353,7 +3418,17 @@ class Solver(LoggerBase):
                 # p_src every step. Only the SOURCE term is time-dependent and
                 # the updater re-reads that from 'waveform' itself.
                 continue
-            dict_['constant'].value = dict_['waveform'](float(self.t))
+            _wm = dict_.get('w_mean')
+            _m = float(dict_['mean_scale'].value) if 'mean_scale' in dict_ else 1.0
+            _a = float(dict_['amp_scale'].value) if 'amp_scale' in dict_ else 1.0
+            if _wm is None or (_m == 1.0 and _a == 1.0):
+                # untouched default path -- BIT-IDENTICAL to the original
+                dict_['constant'].value = dict_['waveform'](float(self.t))
+            else:
+                # p(t) = m*<w> + a*(w(t) - <w>): level and pulsatility scaled
+                # independently (see problem._bc_time_constant)
+                _w = dict_['waveform'](float(self.t))
+                dict_['constant'].value = _m * _wm + _a * (_w - _wm)
 
         if any(self.forms['u']['neumann'].values()):
             self.vec['u']['rhs_const'] = [
@@ -3785,6 +3860,39 @@ class Solver(LoggerBase):
 
         self._writeout = writeout
 
+    def _init_vis_functions(self):
+        ''' Create the P1 visualisation proxies.
+
+        UNCONDITIONAL, i.e. NOT gated on io: write_xdmf. `write_restart`
+        snapshots every dolfinx Function by enumerating `vars(self)`, so a
+        solver built with the output flag off would write a restart bundle
+        MISSING `_u_vis`/`_p_vis` and stop being interchangeable with a
+        bundle from an ordinary run. Two small P1 Functions is a cheap price
+        for that guarantee; only the XDMFFile objects below stay gated.
+        '''
+        if hasattr(self, '_u_vis'):
+            return
+
+        mesh = self.u.function_space.mesh
+
+        # For velocity elements of degree > 1, ParaView requires P1
+        # interpolation - XDMF stores data at geometry (P1) nodes only.
+        vel_space = self.options['fem']['velocity_space'].lower().strip()
+        if vel_space == 'p1':
+            self._u_vis = None
+        else:
+            self._u_vis = Function(
+                functionspace(mesh, ('Lagrange', 1, (self.ndim,))),
+                name='u')
+
+        # Same for pressure spaces that are not nodal P1.
+        pres_space = self.options['fem']['pressure_space'].lower().strip()
+        if pres_space == 'p1':
+            self._p_vis = None
+        else:
+            self._p_vis = Function(
+                functionspace(mesh, ('Lagrange', 1)), name='p')
+
     def write_xdmf(self, t=None):
         ''' Write solution to XDMF files. If file objects have not been
         created, initialize. This works for steady and unsteady solvers with
@@ -3793,6 +3901,8 @@ class Solver(LoggerBase):
         Args:
             t       (optional) time of solution
         '''
+        self._init_vis_functions()
+
         if not self.options['io']['write_xdmf']:
             return
 
@@ -3814,24 +3924,6 @@ class Solver(LoggerBase):
             if self._using_ale:
                 self._xdmf_d = XDMFFile(comm, write_path + '/d_ale.xdmf', 'w')
                 self._xdmf_d.write_mesh(mesh)
-
-            # For velocity elements of degree > 1, ParaView requires P1
-            # interpolation — XDMF stores data at geometry (P1) nodes only.
-            vel_space = self.options['fem']['velocity_space'].lower().strip()
-            if vel_space == 'p1':
-                self._u_vis = None
-            else:
-                self._u_vis = Function(
-                    functionspace(mesh, ('Lagrange', 1, (self.ndim,))),
-                    name='u')
-
-            # Same for pressure spaces that are not nodal P1.
-            pres_space = self.options['fem']['pressure_space'].lower().strip()
-            if pres_space == 'p1':
-                self._p_vis = None
-            else:
-                self._p_vis = Function(
-                    functionspace(mesh, ('Lagrange', 1)), name='p')
 
         if self._using_ale:
             self._xdmf_d.write_function(self.d, float(t))
@@ -4574,10 +4666,7 @@ class Solver(LoggerBase):
             prms = bc.get('parameters', dict())
             C_ = prms['C'] if 'C' in prms else None
             if type_ == 'windkessel' and C_:
-                # DOLFINx: use DG0 as a surrogate for the legacy 'R' (real) space
-                # for the single-DOF windkessel state variable
-                R = functionspace(self.u.function_space.mesh, ("DG", 0))
-                W_lst.append(R)
+                W_lst.append(self._wk_state_functionspace())
 
         self.logger.warning(
             'State function spaces: {}'.format(
@@ -4586,6 +4675,53 @@ class Solver(LoggerBase):
         )
 
         return W_lst
+
+    # Cells in the auxiliary mesh that carries a single-DOF Windkessel state.
+    # FIXED (not a function of `mpirun -n`), so the state, its covariance
+    # factors and every restart bundle stay partition-independent -- a mesh
+    # sized by comm.size would change the stored dof count with the rank
+    # count. It must exceed any rank count the case will ever run at:
+    # ParMETIS cannot partition a mesh with fewer cells than ranks (a 1-cell
+    # mesh fails outright at n=2), and 64 covers every shape Bremstralung
+    # offers while costing 64 doubles per reservoir per frame.
+    _WK_STATE_CELLS = 64
+
+    def _wk_state_functionspace(self):
+        ''' Function space for ONE single-DOF Windkessel reservoir.
+
+        DOLFINx has no 'Real' space (`functionspace(mesh, ("Real", 0))` raises
+        `Unknown element family`), so a scalar state variable needs a
+        surrogate. Until 2026-08-27 that surrogate was DG0 over the WHOLE
+        FLUID MESH: `assign_state` reads `arr[0]` with an `MPI.MAX` allreduce
+        and `update_state` writes the value to every entry, so ~49 359 of
+        49 360 cells were padding -- 18.9 MB per reservoir per run in `X{i}.h5`
+        alone, plus the same padding in every `L_x` covariance field and every
+        restart bundle.
+
+        It is now DG0 on a small auxiliary interval mesh, shared by every
+        reservoir. The value is still replicated across its cells, which keeps
+        `assign_state`/`update_state` unchanged, but the padding is ~770x
+        smaller.
+
+        Legacy bundles remain readable: they store a UNIFORM field, which
+        `roukf/io.py::_legacy_uniform_fill` recognises by its uniformity and
+        broadcasts into the new space.
+        '''
+        if getattr(self, '_wk_state_V', None) is None:
+            from dolfinx.mesh import create_unit_interval
+            comm = self.u.function_space.mesh.comm
+            if comm.size > self._WK_STATE_CELLS:
+                raise Exception(
+                    'Windkessel state mesh has {} cells but the run uses {} '
+                    'ranks; raise Solver._WK_STATE_CELLS (a mesh with fewer '
+                    'cells than ranks cannot be partitioned).'
+                    .format(self._WK_STATE_CELLS, comm.size))
+            # kept on self so all reservoirs share one mesh, and so the mesh
+            # outlives the Functions built on it
+            self._wk_state_mesh = create_unit_interval(
+                comm, self._WK_STATE_CELLS)
+            self._wk_state_V = functionspace(self._wk_state_mesh, ("DG", 0))
+        return self._wk_state_V
 
     def close_xdmf(self) -> None:
         ''' close XDMF Files '''

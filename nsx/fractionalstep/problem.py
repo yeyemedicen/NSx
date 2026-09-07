@@ -253,13 +253,13 @@ class Problem(LoggerBase):
     def setup_logger(self):
         ''' Create logging File Handler '''
         MPI.COMM_WORLD.Barrier()
-        path = Path(self.options['io']['write_path']).joinpath('nsx_solver.log')
+        path = Path(self.options['io']['write_path']).joinpath('run.log')
         if MPI.COMM_WORLD.rank == 0:
             utils.trymkdir(str(path.parent))
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+            # UNIFIED LOG: every package now appends to <write_path>/run.log, so a
+            # per-package unlink() here would WIPE whatever the other solvers (and the
+            # launcher's stdout redirect) already wrote. Truncation is the LAUNCHER's
+            # job (': > run.log'); readers append. Never delete a log another writer owns.
         MPI.COMM_WORLD.Barrier()
         self.set_log_filehandler(str(path))
 
@@ -1677,8 +1677,38 @@ class BoundaryConditions(LoggerBase):
         # A natural value is the characteristic impedance R = rho*c/A, the same
         # quantity used for the Windkessel R_p.
         R_in = float(bc.get('parameters', {}).get('resistance', 0.0))
+
+        # ESTIMABLE INLET WAVEFORM (see solver.init_parameters, type 'neumann').
+        #
+        # The waveform is split into a LEVEL and a PULSATILE part about its own
+        # period average,
+        #     p(t) = m * <w>  +  a * ( w(t) - <w> ) ,
+        # with dimensionless m, a defaulting to 1 so an unestimated BC is
+        # untouched. The two are measurably separable over a full cycle (they
+        # are NOT separable within systole or diastole alone), which is what
+        # makes a pressure-driven protocol possible without a measured inlet
+        # waveform.
+        #
+        # <w> is averaged over ONE PERIOD PLACED AFTER THE RAMP, so a startup
+        # ramp in the expression does not bias it. It needs a period: without
+        # 'T' in the BC parameters the decomposition is disabled (w_mean=None)
+        # and update_neumann_bcs keeps its original single-expression path.
+        _prm = bc.get('parameters', {}) or {}
+        _T = float(_prm.get('T', 0.0))
+        _Tr = float(_prm.get('Tr', 0.0))
+        w_mean = None
+        if _T > 0.0:
+            _t0 = _Tr + _T
+            _ts = [_t0 + _T * k / 512.0 for k in range(512)]
+            w_mean = float(sum(wave(x) for x in _ts) / len(_ts))
+
         registry[bc['id']] = {'constant': val, 'waveform': wave,
-                              'id': bc['id'], 'resistance': R_in}
+                              'id': bc['id'], 'resistance': R_in,
+                              'w_mean': w_mean,
+                              'mean_scale': self._C(
+                                  float(_prm.get('pressure_mean', 1.0))),
+                              'amp_scale': self._C(
+                                  float(_prm.get('pressure_amplitude', 1.0)))}
         if R_in:
             self.logger.info(
                 'Neumann BC bid=%d: IMPEDANCE inlet, p = p_src(t) + %.4g*Q '

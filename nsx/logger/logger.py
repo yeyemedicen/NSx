@@ -17,7 +17,7 @@ class ParallelFilter(logging.Filter):
 ch = logging.StreamHandler()
 ch.setLevel(logging.WARNING)
 ch.addFilter(ParallelFilter())
-formatter = logging.Formatter('%(name)s:%(levelname)s: %(message)s')
+formatter = logging.Formatter('%(asctime)s %(name)s:%(levelname)s: %(message)s', datefmt='%H:%M:%S')
 ch.setFormatter(formatter)
 
 
@@ -62,7 +62,9 @@ class LoggerBase:
 
     def init_logging(self):
         ''' Create logger and handler '''
-        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger = logging.getLogger(
+            '{}.{}'.format(type(self).__module__.split('.')[0],
+                           type(self).__name__))
         self.logger.addHandler(ch)
         self._logging_filehandler = None
 
