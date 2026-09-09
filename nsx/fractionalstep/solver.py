@@ -556,6 +556,22 @@ class Solver(LoggerBase):
         _scatter_full(self.u, u_full)
         _scatter_full(self.p, p_full)
 
+        # u_lst is the PRIMARY per-component velocity storage: the CT timestep
+        # updates it in place (u_i.x.petsc_vec.axpy(1.0, du[i])) and `self.u`
+        # is only the merged copy that gets checkpointed. Restoring `u` alone
+        # therefore left u_lst at its cold ZERO, so the first restarted step
+        # convected with a zero velocity field.
+        # MEASURED on the rigid 2D CCA before this fix: state identical at the
+        # restart instant, then max|du|/max|u| = 4.2e-01 ONE step later and
+        # still 1.3e-01 0.85 s later, against the ~1e-11 the restart contract
+        # requires (CLAUDE.md Diagnostic #1). Found by snapshotting EVERY
+        # Function in vars(self) on a continuous run and on a restarted one and
+        # diffing -- u_lst[0], u_lst[1] were exactly 0.
+        # NOT an MPI or dof-ordering fault: this reproduces in SERIAL, and the
+        # stored fields themselves compare bit-identical at the restart time.
+        # 2026-09-03.
+        self._split_vec_to_lst(self.u, self.u_lst)
+
         if self._using_ale:
             if comm.rank == 0:
                 with h5py.File(str(restart_path / 'd.h5'), 'r') as f:
@@ -575,8 +591,9 @@ class Solver(LoggerBase):
 
         assert np.allclose(t_u, io['restart']['time'])
 
-        # Restore BDF2 history (u0_lst) + Windkessel reservoir state (pi only --
-        # Pl is the outlet-mean of p, recomputed from the restored pressure).
+        # Restore BDF2 history (u0_lst) + the FULL Windkessel scalar state
+        # (pi AND Pl/Q/area -- see _roukf_scalars for why the outlet mean is
+        # NOT recomputed on a restart step).
         # Backward-compatible: missing fields in an old checkpoint warn + fall back.
         if comm.rank == 0:
             with h5py.File(str(w_file), 'r') as f:
@@ -592,11 +609,10 @@ class Solver(LoggerBase):
                              for i in range(len(getattr(self, 'upd_lst', [])))
                              if ('upd_%d' % i) in f]
                             if self._using_ale else [])
-                if self._using_wk:
-                    wk_pi = {b: f.attrs.get('wk_pi_%d' % b)
-                             for b in self.bc_dict['p']['windkessel']['params']}
-                else:
-                    wk_pi = {}
+                # every wk_* attribute, so _restore_roukf_scalars can put back
+                # Pl/Q/area as well as pi (see write_checkpoint).
+                wk_pi = ({k: float(v) for k, v in f.attrs.items()
+                          if k.startswith('wk_')} if self._using_wk else {})
         else:
             u0_full, upd_full, wk_pi = None, None, None
         u0_full = comm.bcast(u0_full, root=0)
@@ -620,12 +636,14 @@ class Solver(LoggerBase):
                                     ' first restart tentative velocity WRONG -> spike.'
                                     ' Re-run with the blocksize+upd_lst checkpoint fix.')
         if self._using_wk:
+            self._restore_roukf_scalars(wk_pi)
             for _bid, _prm in self.bc_dict['p']['windkessel']['params'].items():
-                if wk_pi.get(_bid) is not None:
-                    _prm['pi'].value = float(wk_pi[_bid])
-                    self.logger.info('Restored Windkessel reservoir state bid %d: '
-                                     'pi=%.6g (Pl recomputed from restored p).'
-                                     % (_bid, float(wk_pi[_bid])))
+                if wk_pi.get('wk_pi_%d' % _bid) is not None:
+                    self.logger.info('Restored Windkessel state bid %d: %s'
+                                     % (_bid, ', '.join(
+                                         '%s=%.6g' % (k.rsplit('_', 1)[0][3:], v)
+                                         for k, v in sorted(wk_pi.items())
+                                         if k.endswith('_%d' % _bid))))
                 else:
                     self.logger.warning('Checkpoint missing Windkessel pi for '
                                         'bid %d; resets to p0 (restart may jump).'
@@ -4068,11 +4086,23 @@ class Solver(LoggerBase):
                 # is the outlet pressure). Without these a restart resets pi to
                 # p0 -> systolic pressure discontinuity -> blow-up.
                 if self._using_wk:
-                    # pi is the ONLY irreducible WK state (integrates flow across
-                    # steps). Pl is the outlet-mean of p, recomputed from the
-                    # restored pressure on restart -> not stored.
-                    for _bid, _prm in self.bc_dict['p']['windkessel']['params'].items():
-                        f.attrs['wk_pi_%d' % _bid] = float(_prm['pi'].value)
+                    # EVERY Windkessel scalar, not just pi. The previous comment
+                    # here claimed "Pl is the outlet-mean of p, recomputed from
+                    # the restored pressure on restart -> not stored". That is
+                    # FALSE, and _roukf_scalars' docstring says why: on a
+                    # RESTART step solve_windkessel deliberately SKIPS
+                    #     if not flow and not restart:
+                    #         prm['area'].value = area_new
+                    #         prm['Pl'].value   = Pl
+                    # so a restart took its first step with Pl=0, Q=0 and the
+                    # REFERENCE outlet area -- a different pressure BC, i.e. a
+                    # different PROBLEM. Fixed for the ROUKF bundle 2026-08-01;
+                    # this path was missed. MEASURED on the rigid 2D CCA before
+                    # the fix: fields identical at the restart instant, then
+                    # 42 % off ONE step later and still 13 % off 0.85 s later,
+                    # against the ~1e-11 the restart contract requires.
+                    # 2026-09-03.
+                    f.attrs.update(self._roukf_scalars())
                 f.attrs['t'] = float(self.t)
                 f.attrs['dof_order'] = 'original' if _use_orig else 'rank'
 
