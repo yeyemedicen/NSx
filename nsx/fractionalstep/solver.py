@@ -230,6 +230,11 @@ class Solver(LoggerBase):
 
         # Variational forms (assembled in init_assembly)
         self.forms = problem.forms
+        # Solver is NOT a subclass of Problem, so flags set while building the
+        # forms must be copied across explicitly. _turb_active tells the step
+        # loop that the viscous matrix is velocity-dependent and has to be
+        # refreshed (see assemble_tentative_velocity).
+        self._turb_active = getattr(problem, '_turb_active', False)
 
         # IPCS uses a separate correction pressure phi; CT reuses p
         if self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS':
@@ -2631,6 +2636,14 @@ class Solver(LoggerBase):
             _assemble_mat(self.forms['u']['diff'], mat=self.mat['u']['diff'])
             # mat['u']['rhs'] changes over time when using ALE
             self.mat['u']['rhs'] = self.mat['u']['mass'].copy()
+        elif getattr(self, '_turb_active', False):
+            # A subgrid eddy viscosity depends on the CONVECTING VELOCITY, so
+            # the viscous matrix is no longer constant even on a FIXED mesh.
+            # Without this refresh mu_t stays at its t=0 value (zero) and the
+            # turbulence model is silently inert -- the run is then
+            # bit-identical to the laminar one, which is exactly how this was
+            # found.
+            _assemble_mat(self.forms['u']['diff'], mat=self.mat['u']['diff'])
 
         A.axpy(cf, self.mat['u']['mass'], structure=PETSc.Mat.Structure.DIFFERENT_NONZERO_PATTERN)
         A.axpy(1., self.mat['u']['diff'], structure=PETSc.Mat.Structure.DIFFERENT_NONZERO_PATTERN)
@@ -3486,14 +3499,18 @@ class Solver(LoggerBase):
                 c, t1, t2 = dict_['centroid'], dict_['t1'], dict_['t2']
                 n_hat = dict_['n']
                 R1, R2, U = dict_['R1'], dict_['R2'], dict_['U']
+                _sp = dict_.get('shape_profile')   # custom (exponent / measured) shape, see problem._parable
                 _eps = 1e-12
                 for i, func_i in enumerate(dict_['parable_funcs']):
                     def _interp(x, _i=i, _c=c, _t1=t1, _t2=t2, _n=n_hat,
-                                _R1=R1, _R2=R2, _U=U, _s=scale, _e=_eps):
+                                _R1=R1, _R2=R2, _U=U, _s=scale, _e=_eps, _spf=_sp):
                         pts = x.T - _c
-                        profile = 1.0 - (pts @ _t1 / _R1) ** 2
-                        if _R2 > _e:
-                            profile -= (pts @ _t2 / _R2) ** 2
+                        if _spf is None:
+                            profile = 1.0 - (pts @ _t1 / _R1) ** 2
+                            if _R2 > _e:
+                                profile -= (pts @ _t2 / _R2) ** 2
+                        else:
+                            profile = _spf(x.T)
                         return _U * _s * np.clip(profile, 0.0, None) * _n[_i]
                     func_i.interpolate(_interp)
             else:

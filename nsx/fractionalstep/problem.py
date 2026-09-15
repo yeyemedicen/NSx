@@ -5,6 +5,7 @@ Date:
 '''
 
 from .streamline_diffusion import SDParameter
+from . import turbulence as _turb
 from ..logger.logger import LoggerBase
 from pathlib import Path
 from scipy.interpolate import interp1d
@@ -509,6 +510,8 @@ class Problem(LoggerBase):
             mu_ = self._C(params['mu'])/vol
         return lambda_, mu_
 
+    _turb_active = False        # set True when an eddy viscosity is active
+
     def form_velocity_tentative(self):
         ''' Definition of forms of tentative velocity step. '''
         rho = self.rho
@@ -564,6 +567,28 @@ class Problem(LoggerBase):
             else:
                 u_conv = as_vector(self.u_lst)
                 self.u_conv_assigned = self.u
+
+        # --- subgrid-scale turbulence: mu -> mu + mu_t -------------------
+        # Placed here because it needs u_conv, which is only defined above.
+        # Evaluated on the CONVECTING velocity so mu_t is a known coefficient
+        # and the tentative step stays LINEAR. Announced in the log: a
+        # silently-active closure is indistinguishable from a wrong molecular
+        # viscosity when the results are read back months later.
+        _topt = self.options['fem'].get('turbulence', None)
+        if _topt and _topt.get('enabled', False):
+            _mu_t = _turb.eddy_viscosity(
+                self.mesh, u_conv, rho, _topt,
+                F=(F if self._using_ale else None),
+                J=(J if self._using_ale else None))
+            if _mu_t is not None:
+                self.logger.info(_turb.describe(_topt))
+                mu = mu + _mu_t
+                # The viscous matrix is normally assembled ONCE (constant mu)
+                # and refreshed per step only under ALE. mu_t depends on the
+                # CONVECTING VELOCITY, so a frozen matrix would hold mu_t at
+                # its t=0 value -- i.e. ZERO -- and the model would be silently
+                # inert. This flag makes the solver refresh it every step.
+                self._turb_active = True
 
         a_mass = rho*J0*k*dot(ui, vi)*dx
         a_diff = diff(ui)
@@ -2052,16 +2077,72 @@ class BoundaryConditions(LoggerBase):
             'Parabolic BC bid={}: R1={:.4g}, R2={:.4g}, '
             'n=[{:.3g},{:.3g},{:.3g}]'.format(bc['id'], R1, R2, *n_hat))
 
+        # OPTIONAL BLUNT PROFILE (opt-in, parameters: exponent: m). The shape
+        # becomes 1 - rho^m, rho^2 = (x.t1/R1)^2 + (x.t2/R2)^2; m = 2 is the
+        # paraboloid. U is rescaled by the ratio of the unit-profile fluxes on
+        # the inlet facets, so the prescribed FLOW is unchanged and only the
+        # shape changes (m = 8 is plug-like, mean/peak ~0.8). Absent the key
+        # the original paraboloid code path runs, bit for bit.
+        _m_exp = float(bc['parameters'].get('exponent', 2.0))
+        # OPTIONAL MEASURED SHAPE (opt-in, bc key shape_file: <npz>). The npz
+        # holds a gridded, dimensionless shape on in-plane offsets s1, s2 [cm]
+        # along ITS OWN frame (c, t1, t2) -- stored with the fit, so an SVD sign
+        # flip here cannot mirror it. Evaluated bilinearly; zero outside the
+        # grid. Same flux-preserving U rescale as the exponent.
+        _shape_interp = None
+        if bc.get('shape_file'):
+            from scipy.interpolate import RegularGridInterpolator as _RGI
+            _sd = np.load(bc['shape_file'])
+            _shape_interp = (_RGI((_sd['s1'], _sd['s2']), _sd['shape'], bounds_error=False, fill_value=0.0),
+                             np.asarray(_sd['c'], float), np.asarray(_sd['t1'], float), np.asarray(_sd['t2'], float))
+            self.logger.info('Parabolic BC bid={}: MEASURED SHAPE from {}'.format(bc['id'], bc['shape_file']))
+
+        def _shape_profile(pts_abs, _c=centroid, _t1=t1, _t2=t2, _R1=R1, _R2=R2, _m=_m_exp, _si=_shape_interp):
+            # pts_abs: (N, 3) absolute coordinates -> dimensionless profile (N,)
+            if _si is not None:
+                f, sc, st1, st2 = _si
+                q = pts_abs - sc
+                return np.clip(f(np.c_[q @ st1, q @ st2]), 0.0, None)
+            pts = pts_abs - _c
+            rho2 = (pts @ _t1 / _R1) ** 2 + ((pts @ _t2 / _R2) ** 2 if _R2 > _eps else 0.0)
+            return np.clip(1.0 - np.clip(rho2, 0.0, None) ** (_m / 2.0), 0.0, None)
+
+        _custom = (_m_exp != 2.0) or (_shape_interp is not None)
+        if _custom:
+            _nf = FacetNormal(self.mesh)
+            def _unit(x, custom, _c=centroid, _t1=t1, _t2=t2, _n=n_hat, _R1=R1, _R2=R2, _nd=self.ndim):
+                if custom:
+                    prof = _shape_profile(x.T)
+                else:
+                    pts = x.T - _c
+                    rho2 = (pts @ _t1 / _R1) ** 2 + ((pts @ _t2 / _R2) ** 2 if _R2 > _eps else 0.0)
+                    prof = np.clip(1.0 - rho2, 0.0, None)
+                return np.array([prof * _n[k] for k in range(_nd)])
+            _flux = []
+            for _cu in (False, True):
+                _ut = Function(self.V); _ut.interpolate(lambda x, _cu=_cu: _unit(x, _cu))
+                _flux.append(abs(self.mesh.comm.allreduce(
+                    assemble_scalar(fem_form(dot(_ut, _nf) * self.ds(bc['id']))), op=MPI.SUM)))
+            _U_old = U; U = U * _flux[0] / _flux[1]
+            self.logger.info(
+                'Parabolic BC bid={}: CUSTOM profile ({}); U {:.4g} -> {:.4g} '
+                '(unit-profile flux ratio {:.4f}, flow preserved)'.format(
+                    bc['id'], 'shape_file' if _shape_interp is not None else 'exponent m=%g' % _m_exp,
+                    _U_old, U, _flux[0] / _flux[1]))
+
         # --- spatial profile factory (returns scalar callable for Vi) ---
         def _make_interp(comp, scale):
             _c, _t1, _t2 = centroid, t1, t2
             _n, _R1, _R2 = n_hat, R1, R2
-            _U, _s, _i = U, scale, comp
+            _U, _s, _i, _cu = U, scale, comp, _custom
             def _f(x):
                 pts = x.T - _c
-                profile = 1.0 - (pts @ _t1 / _R1) ** 2
-                if _R2 > _eps:
-                    profile -= (pts @ _t2 / _R2) ** 2
+                if not _cu:
+                    profile = 1.0 - (pts @ _t1 / _R1) ** 2
+                    if _R2 > _eps:
+                        profile -= (pts @ _t2 / _R2) ** 2
+                else:
+                    profile = _shape_profile(x.T)
                 return _U * _s * np.clip(profile, 0.0, None) * _n[_i]
             return _f
 
@@ -2070,7 +2151,7 @@ class BoundaryConditions(LoggerBase):
         # 'upstream_*' are the 0D-coupling keys: upstream_source is an
         # EXPRESSION, not a numeric constant, so it must not reach the
         # float() coercion below.
-        _reserved = {'U', 'waveform',
+        _reserved = {'U', 'waveform', 'exponent',
                      'upstream_resistance', 'upstream_source'}
         scale_func = None   # None means constant (no update needed)
 
@@ -2199,7 +2280,8 @@ class BoundaryConditions(LoggerBase):
                 'parable_scale_func': scale_func,
                 'centroid': centroid,
                 't1': t1, 't2': t2, 'n': n_hat,
-                'R1': R1, 'R2': R2, 'U': U,
+                'R1': R1, 'R2': R2, 'U': U, 'exponent': _m_exp,
+                'shape_profile': _shape_profile if _custom else None,
                 'id': bc['id'],
             }
             # OPTIONAL 0D UPSTREAM COUPLING (opt-in). With
