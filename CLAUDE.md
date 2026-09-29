@@ -1,5 +1,12 @@
 # NSx — Navier-Stokes DOLFINx Solver
 
+
+> **Working practice — shared by all six repos.** How to report, how to debug, how to
+> run and watchdog long MPI jobs, how to publish results, and the tooling-hygiene rules
+> (no hardcoded values; a constant measured on one dataset is a HYPOTHESIS for the next)
+> live in **`ROUKF/docs/agent_practice.md`**, with the rules in `ROUKF/CLAUDE.md` under
+> "WORKING PRACTICE". Read them before running anything.
+
 ## Project layout
 
 - `nsx/fractionalstep/solver.py` — main solver (`Solver`, `SolverCoupled`, `PETScSolver`)

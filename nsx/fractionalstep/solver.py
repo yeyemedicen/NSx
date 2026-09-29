@@ -1074,7 +1074,7 @@ class Solver(LoggerBase):
             # is meaningless here. Without this, mixing a cine set with a
             # Doppler set trips the "no mixing" check below even though both
             # are scalar.
-            if meas.get('observable') == 'lumen_area':
+            if meas.get('observable') in ('lumen_area', 'outlet_share', 'outlet_flux'):
                 veldir_given.append(True)
             elif 'velocity_direction' in meas:
                 direction = meas['velocity_direction']
@@ -1168,10 +1168,12 @@ class Solver(LoggerBase):
                 ', '.join('#{} {}'.format(i, f) for i, f in
                           enumerate(self._observation_frames)))
         for kind in self._observation_kinds:
-            if kind not in ('velocity', 'vorticity', 'pressure', 'lumen_area'):
+            if kind not in ('velocity', 'vorticity', 'pressure', 'lumen_area',
+                            'outlet_share', 'outlet_flux'):
                 raise Exception(
                     "measurements: observable must be 'velocity', 'vorticity', "
-                    "'pressure' or 'lumen_area', got {!r}".format(kind))
+                    "'pressure', 'lumen_area' or 'outlet_share', got "
+                    "{!r}".format(kind))
         # 'lumen_area': a FUNCTIONAL of the state, not a field -- the area of
         # the ALE-deformed fluid mesh cut by a fixed imaging plane, i.e. what a
         # cine MRI actually measures. Evaluated by calling MeasureIt's OWN
@@ -1226,6 +1228,27 @@ class Solver(LoggerBase):
                 # cross-section on the exam's plane) living in the single dof of
                 # a one-cell mesh. No auxiliary vector -- velocity_direction
                 # does not apply, and _lumen_area writes the dof directly.
+                V = functionspace(mesh, (family, degree))
+                fun_aux_lst.append(None)
+            elif kind == 'outlet_flux':
+                # SUM of the fluxes through `share_ids` [cm3/s]. Measured 2026-09-20: for branch
+                # compliance this is 3.3x more informative than the share (Fisher 16.9 vs 5.1 over
+                # the usable frames) and 12x more than the descending flux -- the branches are what
+                # C throttles. And unlike a ratio it stays conditioned when the outlet fluxes pass
+                # through zero in diastole, which is exactly where the share's sensitivity looked
+                # largest and its DATA became meaningless.
+                V = functionspace(mesh, (family, degree))
+                fun_aux_lst.append(None)
+            elif kind == 'outlet_share':
+                # A FUNCTIONAL: the fraction of outflow leaving through the
+                # FIRST of `share_ids`, i.e. Q_first / sum(Q). The Windkessel
+                # already computes each outlet's flux exactly and ALE-corrected
+                # (`prm['Q']`), so this costs nothing and needs no sensor mesh.
+                #
+                # WHY a RATIO and not the flux itself: the 4D-Flow cap fluxes do
+                # not conserve mass (measured, out/in 0.44-2.26), so their
+                # absolute scale is not trustworthy -- but the SHARE is, and it
+                # is what branch compliance moves (mean split is set by R_d).
                 V = functionspace(mesh, (family, degree))
                 fun_aux_lst.append(None)
             elif all_scalar:
@@ -1400,20 +1423,52 @@ class Solver(LoggerBase):
                 wk_dict = self.bc_dict['p']['windkessel']['params']
                 assert bid in wk_dict.keys(), 'BC id not in windkessel'
 
+                # OPTIONAL SHARED PARAMETER (opt-in, bc key `link_to: <id>`).
+                # With it, this BC's parameter does NOT get its own theta: its
+                # Constant is appended to the theta already created for the
+                # NAMED boundary's same parameter, so both move together by the
+                # same factor from their OWN initial values (theta is log2 and
+                # reparameterised). That is the knob the campaign actually
+                # bracketed -- one scale on the three supra-aortic compliances --
+                # and it keeps the measured flow split fixed while the estimator
+                # moves the level. Three separate thetas would spend particles on
+                # combinations these observables cannot separate.
+                _link = bc.get('link_to', None)
                 for prm in opt_lst:
                     assert prm in ('R_d', 'R_p', 'C'), f'prm {prm}'
+                    if _link is not None:
+                        assert _link in wk_dict, f'link_to id {_link} not a windkessel'
+                        _tgt = wk_dict[_link][prm]
+                        _at = next((k for k, th in enumerate(self.theta_internal)
+                                    if th is _tgt
+                                    or (isinstance(th, dict) and th.get('shared_first') is _tgt)), None)
+                        assert _at is not None, (
+                            f'link_to: boundary {_link} parameter {prm} must be '
+                            'declared BEFORE the boundaries that link to it')
+                        if isinstance(self.theta_internal[_at], dict):
+                            self.theta_internal[_at]['shared'].append(wk_dict[bid][prm])
+                        else:
+                            self.theta_internal[_at] = {
+                                'shared_first': _tgt,
+                                'shared': [_tgt, wk_dict[bid][prm]]}
+                        continue
                     self.theta_internal.append(wk_dict[bid][prm])
                     theta_arr.append(float(self.theta_internal[-1]))
 
-                if not isinstance(bc['initial_stddev'], list):
-                    opt_std = [bc['initial_stddev']]
+                # A LINKED bc carries no `initial_stddev` -- it adds no theta, so there is nothing
+                # to give a width to. Reading the key before this check raised KeyError and is why
+                # `link_to` had never actually run (measured 2026-09-20).
+                if _link is not None:
+                    pass
                 else:
-                    opt_std = bc['initial_stddev']
-
-                if len(opt_std) == len(opt_lst):
-                    theta_sd_lst.extend(opt_std)
-                else:
-                    raise Exception('Required more stddevs')
+                    if not isinstance(bc['initial_stddev'], list):
+                        opt_std = [bc['initial_stddev']]
+                    else:
+                        opt_std = bc['initial_stddev']
+                    if len(opt_std) == len(opt_lst):
+                        theta_sd_lst.extend(opt_std)
+                    else:
+                        raise Exception('Required more stddevs')
 
                 self._optimize_windkessel = True
                 
@@ -1868,6 +1923,23 @@ class Solver(LoggerBase):
                     # functional, not a field: one scalar into the single dof
                     Xobs.x.array[:] = self._lumen_area(i)
                     Xobs.x.scatter_forward()
+                elif kinds[i] == 'outlet_flux':
+                    ids = self.options['estimation']['measurements'][i].get('share_ids')
+                    if not ids:
+                        raise Exception("observable 'outlet_flux' requires 'share_ids'")
+                    prm = self.bc_dict['p']['windkessel']['params']
+                    Xobs.x.array[:] = sum(float(prm[int(b)]['Q'].value) for b in ids)
+                    Xobs.x.scatter_forward()
+                elif kinds[i] == 'outlet_share':
+                    ids = self.options['estimation']['measurements'][i].get('share_ids')
+                    if not ids:
+                        raise Exception("observable 'outlet_share' requires "
+                                        "'share_ids': [numerator, ...others]")
+                    prm = self.bc_dict['p']['windkessel']['params']
+                    q = [float(prm[int(b)]['Q'].value) for b in ids]
+                    tot = sum(q)
+                    Xobs.x.array[:] = q[0] / tot if abs(tot) > 1e-12 else 0.0
+                    Xobs.x.scatter_forward()
                 elif kinds[i] == 'vorticity':
                     self._interpolate_observation(Xobs, self.vorticity(),
                                                   deformed=warp)
@@ -1952,6 +2024,13 @@ class Solver(LoggerBase):
 
             if isinstance(th_old, fem.Constant):
                 th_old.value = float(th_new)
+
+            elif isinstance(th_old, dict) and 'shared' in th_old:
+                # one theta, several Constants (windkessel `link_to`): they were
+                # equal at init, so assigning the same value keeps them equal --
+                # i.e. ONE scale factor on the group.
+                for _c in th_old['shared']:
+                    _c.value = float(th_new)
 
             elif isinstance(th_old, dict) and 'parable_dict' in th_old:
                 # parable inlet amplitude: mutate 'U' in place; the actual
@@ -3271,6 +3350,16 @@ class Solver(LoggerBase):
             for bc, dict_ in self.bc_dict['d']['dbc_functions'].items():
                 func = dict_['function']
                 self.transfer_displacement(self.d_s, func) # in -> out
+                if __import__('os').environ.get('ALE_BC_DIAG'):
+                    import numpy as _np
+                    _a = func.x.array.reshape(-1, self.ndim)
+                    _n = _np.linalg.norm(_a, axis=1)
+                    _src = _np.linalg.norm(self.d_s.x.array.reshape(-1, self.ndim), axis=1)
+                    print('[ale-bc-diag] tag=%s  target dofs %d, exactly zero %d (%.1f %%); '
+                          'source |d_s| median %.5f, zero %d of %d'
+                          % (dict_.get('id', '?'), len(_n), int((_n == 0).sum()),
+                             100.0 * (_n == 0).mean(), float(_np.median(_src)),
+                             int((_src == 0).sum()), len(_src)), flush=True)
 
     def _update_0d_inlet(self, bid, dict_):
         """ Amplitude of a 0D-coupled parabolic inlet.
@@ -3811,21 +3900,41 @@ class Solver(LoggerBase):
         inout.read_HDF5_data(comm, path + '/v.h5', self.v_s, '/u')
 
     @staticmethod
-    def _make_interp_data(V_to, V_from):
-        ''' Build DOLFINx 0.10 non-matching mesh interpolation data. '''
+    def _make_interp_data(V_to, V_from, padding=1e-14):
+        ''' Build DOLFINx 0.10 non-matching mesh interpolation data.
+
+        `padding` is the geometric tolerance of the point location. A target point
+        that no source cell claims within it gets **exactly zero**, silently and for
+        the whole run -- it is not an error and nothing warns.
+
+        The default 1e-14 is a knife edge on an FSI interface, where the two meshes
+        describe the SAME surface with different triangulations and so differ by the
+        chord error. Measured on the CoAo phantom (fluid wall vs solid interface):
+        the frozen nodes sit a median 8.4e-4 cm from the solid surface and the ones
+        that transfer sit at 7.5e-4 cm -- the same distribution -- so which nodes
+        freeze is arbitrary. 4.1-7.2 % of the fluid wall froze, and a frozen node
+        beside moving ones inverted the ALE mesh through the flat cell between them.
+
+        Set it from the config (`ale: interp_padding:`) to a fraction of the cell
+        size. Default unchanged so existing runs stay bit-identical.
+        '''
         import numpy as np
         from dolfinx.fem import create_interpolation_data
         cells = np.arange(
             V_to.mesh.topology.index_map(V_to.mesh.topology.dim).size_local,
             dtype=np.int32)
-        return cells, create_interpolation_data(V_to, V_from, cells, padding=1e-14)
+        return cells, create_interpolation_data(V_to, V_from, cells, padding=padding)
+
+    def _interp_padding(self):
+        ''' Point-location tolerance for the interface transfers [length units]. '''
+        return float(getattr(self, 'ale', {}).get('interp_padding', 1e-14))
 
     def transfer_displacement(self, d_in, d_out):
         ''' Transfer displacement between FE spaces via DOLFINx interpolation. '''
         self.logger.debug('Transfer d between FE spaces.')
         if not hasattr(self, '_interp_data_d'):
             self._interp_cells_d, self._interp_data_d = self._make_interp_data(
-                d_out.function_space, d_in.function_space)
+                d_out.function_space, d_in.function_space, self._interp_padding())
         d_out.interpolate_nonmatching(d_in, self._interp_cells_d, self._interp_data_d)
         d_out.x.scatter_forward()
 
@@ -3834,7 +3943,7 @@ class Solver(LoggerBase):
         self.logger.debug('Transfer u between FE spaces.')
         if not hasattr(self, '_interp_data_u'):
             self._interp_cells_u, self._interp_data_u = self._make_interp_data(
-                u_out.function_space, u_in.function_space)
+                u_out.function_space, u_in.function_space, self._interp_padding())
         u_out.interpolate_nonmatching(u_in, self._interp_cells_u, self._interp_data_u)
         u_out.x.scatter_forward()
 
