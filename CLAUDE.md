@@ -86,3 +86,14 @@ This residual is **irreducible** — it is not a bug.
 - `DirichletBC.dof_indices()[0]` returns the local DOF indices array
 - `fem.Expression(ufl_expr, points)` — `points` is `V.element.interpolation_points` (property, not method)
 - `mat.zeroRowsLocal(dofs, diag)` — zeros rows, sets diagonal; `mat.zeroRowsColumnsLocal(dofs, diag)` — also zeros columns
+
+## Windkessel distal pressure `P_d` (added 2026-10-28, portalvein D0)
+Optional BC parameter `P_d` (default 0): a constant pressure at the far end of R_d,
+C dπ/dt = Q − (π − P_d)/R_d, steady state π = R_d·Q + P_d (e.g. hepatic-vein pressure).
+π, p0 and Pl stay ABSOLUTE. Backward-Euler step: π ← απ + βQ + (1−α)P_d. Implicit operator:
+Pl = γQ + απ + (1−α)P_d, i.e. `rhs_p` gains `delta_d*P_d` with delta_d = (1−α)/γ
+(`_wk_update_deltas`: 0 on a restart step with C>0, where Pl = R_p·Q + π already holds
+P_d; 1/γ when C=0). Initial seed Pl(0) = α·p0 + (1−α)P_d. With P_d = 0 every added term
+is zero. Verified: D0 rigid run with P_d = 4 mmHg equals the P_d = 0 run shifted by P_d
+(to 1e-12 mmHg). Files: `fractionalstep/problem.py::_windkessel`,
+`fractionalstep/solver.py::solve_windkessel`, `::_wk_update_deltas`.

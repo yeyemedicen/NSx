@@ -2335,6 +2335,11 @@ class BoundaryConditions(LoggerBase):
         R_d = bc['parameters']['R_d']
         C = bc['parameters']['C']
         eps = bc['parameters']['eps'] if 'eps' in bc['parameters'] else 0
+        # Distal pressure P_d (e.g. hepatic-vein pressure): a constant source
+        # at the far end of R_d,  C dpi/dt = Q - (pi - P_d)/R_d,  so the steady
+        # state is pi = R_d*Q + P_d. pi (and p0) stay ABSOLUTE. Default 0
+        # reproduces the grounded Windkessel exactly.
+        P_d = float(bc['parameters'].get('P_d', 0.0))
 
         alpha = R_d*C/(R_d*C + dt)
         beta = R_d*(1 - alpha)
@@ -2365,7 +2370,7 @@ class BoundaryConditions(LoggerBase):
         #    logged below so the run record is unambiguous.
         # ---------------------------------------------------------------
         pi0 = bc['parameters']['p0']
-        P0 = alpha*pi0
+        P0 = alpha*pi0 + (1 - alpha)*P_d
         pi = pi0 if self.wk.get('implicit') else P0
         
         self.bc_dict['p']['windkessel']['params'][bid] = {
@@ -2379,6 +2384,8 @@ class BoundaryConditions(LoggerBase):
             'Pl': self._C(P0),
             'delta_l': self._C(delta_l),
             'delta_r': self._C(delta_r),
+            'P_d': self._C(P_d),
+            'delta_d': self._C((1 - alpha)/gamma),
             'area': self._C(area),
             'alpha': self._C(alpha),
             'beta': self._C(beta),
@@ -2389,10 +2396,10 @@ class BoundaryConditions(LoggerBase):
 
         self.logger.info(
             'Windkessel bid %d (%s): R_p=%.6g R_d=%.6g C=%.6g  '
-            'tau=R_d*C=%.4g s  alpha=%.8f  |  yaml p0=%.6g -> pi(0)=%.6g, '
+            'tau=R_d*C=%.4g s  alpha=%.8f  P_d=%.6g  |  yaml p0=%.6g -> pi(0)=%.6g, '
             'Pl(0)=%.6g [dyn/cm2]',
             bid, 'implicit' if self.wk.get('implicit') else 'explicit',
-            R_p, R_d, C, R_d*C, alpha, pi0, float(prm['pi'].value),
+            R_p, R_d, C, R_d*C, alpha, P_d, pi0, float(prm['pi'].value),
             float(prm['Pl'].value))
 
         if self.wk['explicit']:
@@ -2408,7 +2415,9 @@ class BoundaryConditions(LoggerBase):
             # prm['pi'] was already initialised to p0 in the block above (see
             # the note there).  The scheme-dependent overwrite that used to sit
             # here is gone -- pi(0) is now decided in exactly one place.
-            prm['rhs_p'] = prm['Q'] + prm['delta_r']*prm['pi']
+            # Pl = gamma*Q + alpha*pi + (1-alpha)*P_d  (delta_d = (1-alpha)/gamma)
+            prm['rhs_p'] = (prm['Q'] + prm['delta_r']*prm['pi']
+                            + prm['delta_d']*prm['P_d'])
 
     # =========================================================================
     # Robin BCs (Navier-slip and transpiration)

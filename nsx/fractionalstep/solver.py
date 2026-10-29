@@ -105,6 +105,51 @@ def _orig_node_index(fn):
     return None if (orig < 0).any() else orig
 
 
+# Observation meshes below this many cells are kept WHOLE on rank 0 instead of
+# being partitioned. A sensor set of a few DG0 "pixels" (one disjoint triangle
+# per sensor) has an EMPTY dual graph -- no two cells share a facet -- and
+# ParMETIS aborts on it at any rank count > 1 (`PARMETIS ERROR adjncy is NULL`,
+# measured 2026-09-28 on 5 velocity pixels at n=8). Partitioning a handful of
+# cells gains nothing anyway; imaging meshes (thousands of face-sharing voxels)
+# stay on the normal partitioned path.
+_OBS_MESH_RANK0_CELLS = 1024
+
+
+def _read_observation_mesh(meshfile):
+    ''' Read a measurement mesh; under MPI a SMALL one is placed entirely on
+    rank 0 (see `_OBS_MESH_RANK0_CELLS`). Serial and large meshes take the
+    unchanged `inout.read_mesh` path. Only the mesh is returned: observation
+    meshes carry no tags that the observation operator uses. '''
+    comm = MPI.COMM_WORLD
+    if comm.size > 1:
+        import basix.ufl
+        from dolfinx.mesh import create_mesh
+        from dolfinx.graph import adjacencylist
+        for name in ('Grid', 'mesh', 'Mesh'):
+            try:
+                with XDMFFile(comm, meshfile, 'r') as xf:
+                    ctype, cdeg = xf.read_cell_type(name)
+                    cells = xf.read_topology_data(name)
+                    x = xf.read_geometry_data(name)
+                break
+            except Exception:
+                continue
+        else:
+            raise RuntimeError('Could not read mesh from {}'.format(meshfile))
+        n_glob = comm.allreduce(cells.shape[0], op=MPI.SUM)
+        if n_glob < _OBS_MESH_RANK0_CELLS:
+            def _all_to_rank0(_comm, _nparts, _ctypes, _cells):
+                nv = cells.shape[1]
+                return adjacencylist(
+                    np.zeros(np.asarray(_cells[0]).size // nv,
+                             dtype=np.int32))._cpp_object
+            el = basix.ufl.element('Lagrange', ctype.name, cdeg,
+                                   shape=(x.shape[1],))
+            return create_mesh(comm, cells, el, x, partitioner=_all_to_rank0)
+    mesh, _, _ = inout.read_mesh(meshfile)
+    return mesh
+
+
 def _mat_vec(A, x):
     ''' Compute y = A * x, returning a new PETSc.Vec.
 
@@ -1206,7 +1251,7 @@ class Solver(LoggerBase):
         fun_aux_lst = []
         V_aux = None
         for meshfile, kind in zip(mesh_lst, self._observation_kinds):
-            mesh, _, _ = inout.read_mesh(meshfile)
+            mesh = _read_observation_mesh(meshfile)
             family = "Lagrange" if element_family == 'P' else "DG"
             if kind == 'vorticity':
                 # curl u: scalar in 2D, vector in 3D. velocity_direction does
@@ -3660,9 +3705,11 @@ class Solver(LoggerBase):
             pi = float(prm['pi'])
             pi_upd = pi
 
+            P_d = float(prm['P_d'])
+
             if self.wk['explicit']:
                 if not restart:
-                    pi_upd = alpha*pi + beta*Q
+                    pi_upd = alpha*pi + beta*Q + (1 - alpha)*P_d
 
                 Pl_upd = R_p*Q + float(pi_upd)
 
@@ -3681,7 +3728,8 @@ class Solver(LoggerBase):
                         assemble_scalar(fem_form(elem*ds(bid))), op=MPI.SUM)
                     Pl = comm.allreduce(
                         assemble_scalar(fem_form(self.p*ds(bid))), op=MPI.SUM) / area_new
-                    pi_upd = float((1 - beta/gamma)*alpha*pi + beta/gamma*Pl)
+                    pi_upd = float((1 - beta/gamma)*(alpha*pi + (1 - alpha)*P_d)
+                                   + beta/gamma*Pl)
 
                     self.pi_functions[bid].append(pi)
                     prm['area'].value = area_new
@@ -3726,20 +3774,26 @@ class Solver(LoggerBase):
             beta = R_d*(1 - alpha)
             gamma = R_p + beta
 
+            # delta_d multiplies the distal pressure P_d in rhs_p. On a restart
+            # step Pl = R_p*Q + pi with pi absolute, so P_d is already in pi.
             if restart:
                 if abs(float(prm['C'])) > 1e-14:
                     delta_l = 1/gamma + beta/gamma/(gamma - beta)
                     delta_r = 1/(gamma - beta)
+                    delta_d = 0.0
                 else:
                     delta_l = 1/gamma
                     delta_r = 0.0
+                    delta_d = 1/gamma
 
             else:
                 delta_l = 1/gamma
                 delta_r = alpha/gamma
+                delta_d = (1 - alpha)/gamma
 
             prm['delta_l'].value = delta_l
             prm['delta_r'].value = delta_r
+            prm['delta_d'].value = delta_d
 
             fac_l.append(delta_l)
 
