@@ -3705,6 +3705,22 @@ class Solver(LoggerBase):
             pi = float(prm['pi'])
             pi_upd = pi
 
+            # time-dependent distal pressure P_d(t) (problem._windkessel):
+            # evaluate at the new time; rhs_p holds the same Constant.
+            _pd_f = self.bc_dict['p']['windkessel'].get('P_d_func', {}).get(bid)
+            if _pd_f is not None:
+                prm['P_d'].value = _pd_f(float(self.t))
+
+            # compliance referenced to P_ext(t) (problem._windkessel):
+            # C d(pi - P_ext)/dt  ==  grounded C with P_d + R_d*C*dP_ext/dt.
+            # Built from the un-shifted P_d (P_d_func or the constant
+            # P_d_base) so the two calls per step do not accumulate.
+            _pe_f = self.bc_dict['p']['windkessel'].get('P_ext_func', {}).get(bid)
+            if _pe_f is not None:
+                _t1 = float(self.t)
+                _pd0 = (_pd_f(_t1) if _pd_f is not None else prm['P_d_base'])
+                prm['P_d'].value = _pd0 + R_d*C*(_pe_f(_t1) - _pe_f(_t1 - dt))/dt
+
             P_d = float(prm['P_d'])
 
             if self.wk['explicit']:

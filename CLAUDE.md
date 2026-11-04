@@ -97,3 +97,24 @@ P_d; 1/γ when C=0). Initial seed Pl(0) = α·p0 + (1−α)P_d. With P_d = 0 eve
 is zero. Verified: D0 rigid run with P_d = 4 mmHg equals the P_d = 0 run shifted by P_d
 (to 1e-12 mmHg). Files: `fractionalstep/problem.py::_windkessel`,
 `fractionalstep/solver.py::solve_windkessel`, `::_wk_update_deltas`.
+
+**Time-dependent `P_d(t)`** (added 2026-10-29): `P_d` may be a waveform string in `t`, with named
+constants in `P_d_parameters`, e.g.
+`P_d: "Pd0 + dPd*min(max(t - t0, 0.0)/Tr, 1.0)"`, `P_d_parameters: {Pd0: 5332.88, dPd: 5332.88, t0: 1, Tr: 2}`.
+It is compiled with `_make_time_expression` and stored in `bc_dict['p']['windkessel']['P_d_func'][bid]`.
+`solve_windkessel` sets `prm['P_d'].value = f(self.t)` at the new time before each update (backward
+Euler; `rhs_p` holds the same Constant). p0/Pl(0) use P_d(0). A numeric `P_d` takes the old path
+unchanged. Verified on the D0 rigid mesh (2 ranks): `"Pd0"` vs numeric equal to 5e-11 dyn/cm²; a +4 mmHg
+ramp over 50 ms (τ = 0.02 s) follows the analytic first-order lag (2.540 vs 2.531 mmHg mid-ramp,
+3.988 at 5τ), with outlet flows unchanged. Cases in `portalvein/D0/windkessel/results/tPd_*`.
+
+**Compliance reference `P_ext(t)`** (added 2026-10-31, portalvein D0 breathing): optional BC parameter
+`P_ext` (string in `t`, constants in `P_ext_parameters`; absent = grounded capacitor, unchanged). The
+capacitor sees the pressure outside it, e.g. the abdominal pressure on the hepatic bed:
+C d(π − P_ext)/dt = Q − (π − P_d)/R_d. This is exactly the grounded form with
+P_d_eff = P_d + R_d·C·dP_ext/dt, which `solve_windkessel` applies (backward difference over one step,
+built from the un-shifted P_d: `P_d_func` or `prm['P_d_base']`, so the two calls per step do not
+accumulate). Only dP_ext/dt enters, so a constant offset has no effect. Example:
+`P_ext: "-dPa*0.5*(1 - cos(2*pi*max(t - t0, 0.0)/Tr))"`, `P_ext_parameters: {dPa: 3999.66, t0: 2.5, Tr: 4}`.
+Verified on the D0 rigid mesh (8 ranks): with P_d following the same swing (f = 1), π − P_ext is constant
+to 0.01 mmHg for a 8 mmHg swing (grounded C: 6.4 mmHg lagging 0.5 s). Case `D0/windkessel/results/resp_UE`.

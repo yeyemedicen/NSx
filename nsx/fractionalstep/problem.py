@@ -2339,7 +2339,39 @@ class BoundaryConditions(LoggerBase):
         # at the far end of R_d,  C dpi/dt = Q - (pi - P_d)/R_d,  so the steady
         # state is pi = R_d*Q + P_d. pi (and p0) stay ABSOLUTE. Default 0
         # reproduces the grounded Windkessel exactly.
-        P_d = float(bc['parameters'].get('P_d', 0.0))
+        # P_d may also be a waveform string in `t` (e.g. a Valsalva rise of the
+        # hepatic-vein pressure), with named constants in `P_d_parameters`. The
+        # solver re-evaluates it at t^{n+1} before every Windkessel update
+        # (backward Euler); p0 remains the steady reservoir at P_d(0).
+        P_d = bc['parameters'].get('P_d', 0.0)
+        if isinstance(P_d, str):
+            _pd_prm = bc['parameters'].get('P_d_parameters') or {}
+            self.bc_dict['p']['windkessel'].setdefault('P_d_func', {})[bid] = \
+                _make_time_expression(P_d, {k: float(v) for k, v in _pd_prm.items()})
+            self.logger.info('Windkessel bid %d: P_d(t) = "%s", params=%s',
+                             bid, P_d, _pd_prm)
+            P_d = self.bc_dict['p']['windkessel']['P_d_func'][bid](0.0)
+        P_d = float(P_d)
+        # Compliance reference pressure P_ext (optional): the pressure OUTSIDE
+        # the capacitor, e.g. the abdominal pressure acting on the hepatic
+        # vascular bed,
+        #     C d(pi - P_ext)/dt = Q - (pi - P_d)/R_d .
+        # Default (absent / 0): grounded capacitor, C dpi/dt (unchanged).
+        # Exactly equivalent to the grounded form with the distal pressure
+        #     P_d_eff = P_d + R_d*C*dP_ext/dt
+        # (backward difference over one step), which is how the solver applies
+        # it (solve_windkessel); every other Windkessel term is untouched.
+        # A string in `t` with constants in `P_ext_parameters`, like P_d.
+        P_ext = bc['parameters'].get('P_ext', None)
+        if isinstance(P_ext, str):
+            _pe_prm = bc['parameters'].get('P_ext_parameters') or {}
+            self.bc_dict['p']['windkessel'].setdefault('P_ext_func', {})[bid] = \
+                _make_time_expression(P_ext, {k: float(v) for k, v in _pe_prm.items()})
+            self.logger.info('Windkessel bid %d: compliance referenced to '
+                             'P_ext(t) = "%s", params=%s', bid, P_ext, _pe_prm)
+        elif P_ext not in (None, 0, 0.0):
+            self.logger.info('Windkessel bid %d: constant P_ext = %g has no '
+                             'effect (only dP_ext/dt enters)', bid, float(P_ext))
 
         alpha = R_d*C/(R_d*C + dt)
         beta = R_d*(1 - alpha)
@@ -2385,6 +2417,7 @@ class BoundaryConditions(LoggerBase):
             'delta_l': self._C(delta_l),
             'delta_r': self._C(delta_r),
             'P_d': self._C(P_d),
+            'P_d_base': P_d,   # un-shifted P_d (P_ext reference, solver)
             'delta_d': self._C((1 - alpha)/gamma),
             'area': self._C(area),
             'alpha': self._C(alpha),
