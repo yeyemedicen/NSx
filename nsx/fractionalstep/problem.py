@@ -140,6 +140,15 @@ def rank0(func):
     return inner
 
 
+
+def _heart_coupling(bc):
+    ''' 'condensed' (default, mass-conserving) or 'dirichlet' (legacy). '''
+    c = bc.get('parameters', {}).get('coupling', 'condensed')
+    if c not in ('condensed', 'dirichlet'):
+        raise ValueError("heart coupling must be 'condensed' or 'dirichlet', "
+                         "got {!r}".format(c))
+    return c
+
 class Problem(LoggerBase):
     ''' NavierStokes Problem base class '''
 
@@ -1023,6 +1032,8 @@ class Problem(LoggerBase):
         self._using_wk = BC._using_wk
         self._using_mapdd = BC._using_mapdd
         self.wk = BC.wk
+        self._using_heart = BC._using_heart
+        self._using_coronary = BC._using_coronary
 
 class BoundaryConditions(LoggerBase):
     ''' Boundary conditions class.
@@ -1088,7 +1099,10 @@ class BoundaryConditions(LoggerBase):
                 }
 
         for bc in self.bcs:
-            if bc['type'] == 'windkessel':
+            # a condensed heart inlet IS an implicit condensed Windkessel
+            # (a pure capacitor, see _heart), so it switches the same machinery on
+            if bc['type'] in ('windkessel', 'coronary') or (
+                    bc['type'] == 'heart' and _heart_coupling(bc) == 'condensed'):
                 self._using_wk = True
                 self.wk['implicit'] = self.options['windkessel']['implicit']
                 self.wk['condensed'] = self.options['windkessel'].get('condensed', False)
@@ -1096,6 +1110,10 @@ class BoundaryConditions(LoggerBase):
                     self.wk['explicit'] = True
 
                 break
+
+        # 0D heart at an inlet (see _heart, Solver.solve_heart)
+        self._using_heart = any(bc.get('type') == 'heart' for bc in self.bcs)
+        self._using_coronary = any(bc.get('type') == 'coronary' for bc in self.bcs)
             
         self.bc_dict = {
             'u': {
@@ -1135,6 +1153,10 @@ class BoundaryConditions(LoggerBase):
                 'windkessel': {
                     'dirichlet': [],
                     'dbc_params': {},
+                    'params': {},
+                },
+                # 0D heart inlets, {bid: {name: Constant}} (see _heart)
+                'heart': {
                     'params': {},
                 },
                 # list entrys of Robin BCs are forms_p, forms_u dictionaries
@@ -1252,6 +1274,10 @@ class BoundaryConditions(LoggerBase):
                     self._dirichlet_pressure(bc)
             elif bc['type'] == 'windkessel':
                 self._windkessel(bc)
+            elif bc['type'] == 'heart':
+                self._heart(bc)
+            elif bc['type'] == 'coronary':
+                self._coronary(bc)
             elif bc['type'] == 'inflow':
                 self._inflow_profile(bc)
             elif bc['type'] == 'inflow_pinns':
@@ -2451,6 +2477,230 @@ class BoundaryConditions(LoggerBase):
             # Pl = gamma*Q + alpha*pi + (1-alpha)*P_d  (delta_d = (1-alpha)/gamma)
             prm['rhs_p'] = (prm['Q'] + prm['delta_r']*prm['pi']
                             + prm['delta_d']*prm['P_d'])
+
+    def _heart(self, bc):
+        ''' Create the 0D left-heart pressure BC on an inlet.
+
+        LA (constant P_LA) -> mitral diode -> LV elastance E(t) -> aortic
+        diode -> node of compliance C_ao, from which the 3D draws Q_3D. The
+        ODEs live in heart.py; Solver.solve_heart advances them once per step.
+
+        coupling 'condensed' (default): the node is a condensed implicit
+        Windkessel with R_p = 0, R_d -> infinity (a pure capacitor); the
+        projection solves P_ao and Q_3D together and mass is conserved.
+        Needs windkessel: {implicit: True, condensed: True}.
+        coupling 'dirichlet' (legacy): P_ao imposed as a pressure Dirichlet,
+        explicit in Q_3D, like the explicit Windkessel. Does NOT conserve mass.
+
+        YAML (all CGS: dyn/cm2, cm3, s):
+
+            type: 'heart'
+            parameters:
+                T, t_max            cardiac period, time to peak elastance
+                E_max, E_min, V_0   LV elastance [dyn/cm5], unstressed volume
+                P_LA                left-atrial pressure (constant)
+                R_MV, L_MV          mitral valve R [dyn s/cm5], L [dyn s2/cm5]
+                R_AV, L_AV          aortic valve
+                C_ao                compliance of the inlet node [cm5/dyn]
+                V0, P_ao0           initial LV volume and node pressure
+                Q_MV0, Q_AV0        initial valve flows (default 0)
+                substeps            0D substeps per time step (default 20)
+                coupling            'condensed' (default) | 'dirichlet'
+
+        Args:
+            bc (dict):  dict describing one boundary condition
+        '''
+        if 'parameters' not in bc:
+            raise KeyError('heart BCs require parameters')
+        if not self._ct_scheme():
+            raise NotImplementedError(
+                'heart BC prescribes a pressure: CT only (see '
+                '_check_pressure_bc_scheme)')
+
+        from .heart import hill_normalisation, stability_timescale
+
+        bid = bc['id']
+        par = bc['parameters']
+        dt = self.options['timemarching']['dt']
+
+        required = ('T', 't_max', 'E_max', 'E_min', 'V_0', 'P_LA', 'R_MV',
+                    'R_AV', 'C_ao', 'V0', 'P_ao0')
+        missing = [k for k in required if k not in par]
+        if missing:
+            raise KeyError('heart BC id={}: missing parameters {}'
+                           .format(bid, missing))
+
+        fixed = {k: float(par[k]) for k in required
+                 if k not in ('V0', 'P_ao0')}
+        fixed['L_MV'] = float(par.get('L_MV', 0.0))
+        fixed['L_AV'] = float(par.get('L_AV', 0.0))
+        fixed['k_hill'] = hill_normalisation()
+        nsub = int(par.get('substeps', 20))
+
+        # parameters AND state as Constants, like the Windkessel, so restart
+        # bundles / checkpoints carry them by enumeration (_roukf_scalars)
+        prm = {k: self._C(v) for k, v in fixed.items()}
+        prm.update({
+            'V': self._C(float(par['V0'])),
+            'Q_MV': self._C(float(par.get('Q_MV0', 0.0))),
+            'Q_AV': self._C(float(par.get('Q_AV0', 0.0))),
+            'P_ao': self._C(float(par['P_ao0'])),
+            'Q': self._C(0.0),          # flow into the 3D, last step
+            'P_LV': self._C(0.0),
+            'E': self._C(0.0),
+        })
+        prm['substeps'] = nsub          # int, not state
+        self.bc_dict['p']['heart']['params'][bid] = prm
+
+        tau = stability_timescale(fixed)
+        h = dt/nsub
+        self.logger.info(
+            'heart bid %d: T=%.4g t_max=%.4g E_max=%.6g E_min=%.6g V_0=%.4g '
+            'P_LA=%.6g R_MV=%.4g L_MV=%.4g R_AV=%.4g L_AV=%.4g C_ao=%.4g | '
+            'V(0)=%.4g P_ao(0)=%.6g | %d substeps, h=%.3g s, shortest 0D '
+            'time scale %.3g s', bid, fixed['T'], fixed['t_max'],
+            fixed['E_max'], fixed['E_min'], fixed['V_0'], fixed['P_LA'],
+            fixed['R_MV'], fixed['L_MV'], fixed['R_AV'], fixed['L_AV'],
+            fixed['C_ao'], float(par['V0']), float(par['P_ao0']), nsub, h, tau)
+        if h > 0.5*tau:
+            raise ValueError(
+                'heart bid {}: substep {:.3g} s exceeds half the shortest 0D '
+                'time scale {:.3g} s; raise `substeps`'.format(bid, h, tau))
+
+        coupling = _heart_coupling(bc)
+        prm['coupling'] = coupling      # str, not state
+        self.logger.info('heart bid %d: coupling %s', bid, coupling)
+        if coupling == 'dirichlet':
+            # P_ao as a pressure Dirichlet, explicit in Q_3D. Mass is NOT
+            # conserved: the projection never tests div u against a q that is
+            # nonzero on this inlet (measured 2026-11-03, angio heart_wk: +35 %
+            # outflow per cycle, ~98 % of int div u in the first 3 inlet layers)
+            facets = self.facet_tags.find(bid)
+            dofs = locate_dofs_topological(self.Q, self.mesh.topology.dim - 1, facets)
+            self.bc_dict['p']['dirichlet'].append(
+                dirichletbc(prm['P_ao'], dofs, self.Q))
+            return
+
+        # condensed: the node C_ao is an implicit condensed Windkessel with
+        # R_p = 0 and R_d -> infinity, i.e. a pure capacitor,
+        #   P^{n+1} = pi + (dt/C_ao)*Q_out^{n+1},   pi = P^n + V_AV/C_ao,
+        # with V_AV the valve volume of the step (Solver.solve_heart sets pi
+        # before the projection). Q_out < 0 is inflow. One reduced pressure DOF
+        # on the inlet, so q = const there is a test function and the inlet
+        # flux enters mass conservation like every condensed outlet.
+        if not (self.wk.get('implicit') and self.wk.get('condensed')):
+            raise ValueError(
+                'heart bid {}: coupling condensed needs windkessel: '
+                '{{implicit: True, condensed: True}}'.format(bid))
+        n = FacetNormal(self.mesh)
+        F, J = self.F, self.J
+        area = self.mesh.comm.allreduce(assemble_scalar(fem_form(
+            J*dot(inv(F).T*n, inv(F).T*n)*self.ds(bid))), op=MPI.SUM)
+        C_ao = fixed['C_ao']
+        g = dt/C_ao
+        P0 = float(par['P_ao0'])
+        wk = {
+            'eps': self._C(0.0), 'R_p': self._C(0.0), 'C': self._C(C_ao),
+            'pi0': self._C(P0), 'pi': self._C(P0), 'Q': self._C(0.0),
+            'Pl': self._C(P0), 'delta_l': self._C(1/g), 'delta_r': self._C(1/g),
+            'P_d': self._C(0.0), 'delta_d': self._C(0.0), 'area': self._C(area),
+            'alpha': self._C(1.0), 'beta': self._C(g), 'gamma': self._C(g),
+            'kind': 'capacitor',        # str, not state
+        }
+        wk['rhs_p'] = wk['Q'] + wk['delta_r']*wk['pi'] + wk['delta_d']*wk['P_d']
+        self.bc_dict['p']['windkessel']['params'][bid] = wk
+
+    def _coronary(self, bc):
+        ''' Create the lumped coronary bed of Kim et al. 2010 on an outlet.
+
+            p --R_a-- P1 --R_am-- P2 --R_v-- P_v
+                      C_a to ground, C_im to P_im(t) = lambda*P_LV(t)
+
+        Discretised by backward Euler (coronary.py) into p = gamma*Q + b and
+        condensed into the projection exactly like an implicit Windkessel (the
+        entry joins bc_dict['p']['windkessel']['params'] with kind 'coronary').
+        P_LV is read every step from the 'heart' BC `heart_id` (default: the
+        only one), AFTER the heart has been advanced, so P_im^{n+1} is
+        lambda*P_LV(t^{n+1}). Solver.solve_coronary sets b before the
+        projection, Solver.sync_coronary updates P1, P2 after it.
+
+        YAML (CGS):
+
+            type: 'coronary'
+            parameters:
+                R_a, R_am, R_v      arterial, microvascular, venous R [dyn s/cm5]
+                C_a, C_im           arterial, intramyocardial C [cm5/dyn]
+                lambda              P_im = lambda*P_LV (0: no intramyocardial
+                                    pressure, no heart needed)
+                P_v                 venous pressure (default 0)
+                heart_id            heart BC supplying P_LV (default: the only one)
+                P1_0, P2_0          initial node pressures
+
+        Args:
+            bc (dict):  dict describing one boundary condition
+        '''
+        from .coronary import gamma_only
+
+        if 'parameters' not in bc:
+            raise KeyError('coronary BCs require parameters')
+        if not (self.wk.get('implicit') and self.wk.get('condensed')):
+            raise ValueError('coronary BC id={} needs windkessel: '
+                             '{{implicit: True, condensed: True}}'.format(bc['id']))
+        bid = bc['id']
+        par = bc['parameters']
+        required = ('R_a', 'R_am', 'R_v', 'C_a', 'C_im', 'lambda', 'P1_0', 'P2_0')
+        missing = [k for k in required if k not in par]
+        if missing:
+            raise KeyError('coronary BC id={}: missing parameters {}'
+                           .format(bid, missing))
+        dt = self.options['timemarching']['dt']
+        fixed = {k: float(par[k]) for k in ('R_a', 'R_am', 'R_v', 'C_a', 'C_im')}
+        fixed['P_v'] = float(par.get('P_v', 0.0))
+        lam = float(par['lambda'])
+
+        heart_id = par.get('heart_id')
+        if lam != 0.0:
+            hearts = [b['id'] for b in self.bcs if b.get('type') == 'heart']
+            if heart_id is None:
+                if len(hearts) != 1:
+                    raise ValueError('coronary BC id={}: lambda != 0 needs '
+                                     'heart_id (heart BCs: {})'.format(bid, hearts))
+                heart_id = hearts[0]
+            elif heart_id not in hearts:
+                raise ValueError('coronary BC id={}: no heart BC with id {}'
+                                 .format(bid, heart_id))
+
+        g = gamma_only(fixed, dt)
+        n = FacetNormal(self.mesh)
+        F, J = self.F, self.J
+        area = self.mesh.comm.allreduce(assemble_scalar(fem_form(
+            J*dot(inv(F).T*n, inv(F).T*n)*self.ds(bid))), op=MPI.SUM)
+        P1 = float(par['P1_0'])
+        wk = {k: self._C(v) for k, v in fixed.items()}
+        wk.update({
+            'eps': self._C(0.0), 'R_p': self._C(fixed['R_a']),
+            # 'C' only flags "has a reservoir" to the ROUKF state helpers
+            'C': self._C(fixed['C_a'] + fixed['C_im']),
+            'lambda': self._C(lam),
+            'P1': self._C(P1), 'P2': self._C(float(par['P2_0'])),
+            'P_im': self._C(0.0),       # set from P_LV at the first step
+            'Q_bed': self._C(0.0),      # outward flux implied by the solve
+            'pi0': self._C(P1), 'pi': self._C(P1), 'Q': self._C(0.0),
+            'Pl': self._C(P1), 'delta_l': self._C(1/g), 'delta_r': self._C(1/g),
+            'P_d': self._C(0.0), 'delta_d': self._C(0.0), 'area': self._C(area),
+            'alpha': self._C(1.0), 'beta': self._C(g), 'gamma': self._C(g),
+        })
+        wk['rhs_p'] = wk['Q'] + wk['delta_r']*wk['pi'] + wk['delta_d']*wk['P_d']
+        wk['kind'] = 'coronary'         # str, not state
+        wk['heart_id'] = heart_id       # int or None, not state
+        wk['b'] = P1                    # float, set by solve_coronary
+        self.bc_dict['p']['windkessel']['params'][bid] = wk
+        self.logger.info(
+            'coronary bid %d: R_a=%.5g R_am=%.5g R_v=%.5g C_a=%.5g C_im=%.5g '
+            'P_v=%.5g lambda=%.4g heart_id=%s | P1(0)=%.6g P2(0)=%.6g | '
+            'gamma=%.6g [dyn s/cm5]', bid, fixed['R_a'], fixed['R_am'],
+            fixed['R_v'], fixed['C_a'], fixed['C_im'], fixed['P_v'], lam,
+            heart_id, P1, float(par['P2_0']), g)
 
     # =========================================================================
     # Robin BCs (Navier-slip and transpiration)

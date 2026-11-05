@@ -224,6 +224,25 @@ def _zero_mat_rows(mat, bcs):
         mat.zeroRowsLocal(dofs)
 
 
+
+def _wk_coefficients(prm, dt):
+    ''' (alpha, beta, gamma) of the backward-Euler Windkessel update
+    pi <- alpha*pi + beta*Q, Pl = gamma*Q + alpha*pi. A 'capacitor' entry (a
+    condensed heart inlet, problem._heart) is the limit R_d -> infinity,
+    R_p = 0, written out because R_d*(1 - alpha) cancels catastrophically; a
+    'coronary' entry (problem._coronary) has its own constant gamma. For both,
+    alpha = 1 and beta = gamma make pi the affine offset b and the post-solve
+    update pi <- Pl, which sync_heart/sync_coronary then read. '''
+    if prm.get('kind') in ('capacitor', 'coronary'):
+        # p = gamma*Q + b with b set from outside (solve_heart/solve_coronary)
+        g = float(prm['gamma'])
+        return 1.0, g, g
+    C = float(prm['C'])
+    R_d = float(prm['R_d'])
+    alpha = R_d*C/(R_d*C + dt)
+    beta = R_d*(1 - alpha)
+    return alpha, beta, float(prm['R_p']) + beta
+
 class Solver(LoggerBase):
     # =========================================================================
     # Initialization
@@ -271,6 +290,11 @@ class Solver(LoggerBase):
         self._using_ale = problem._using_ale
         self.wk = problem.wk
         self._using_wk = problem._using_wk
+        self._using_heart = getattr(problem, '_using_heart', False)
+        self._using_coronary = getattr(problem, '_using_coronary', False)
+        self._heart_csv_open = set()    # heart_<bid>.csv files started this run
+        self._restarted_run = bool(
+            self.options['io'].get('restart', {}).get('path'))
         self._using_mapdd = problem._using_mapdd
 
         # Variational forms (assembled in init_assembly)
@@ -662,7 +686,8 @@ class Solver(LoggerBase):
                 # every wk_* attribute, so _restore_roukf_scalars can put back
                 # Pl/Q/area as well as pi (see write_checkpoint).
                 wk_pi = ({k: float(v) for k, v in f.attrs.items()
-                          if k.startswith('wk_')} if self._using_wk else {})
+                          if k.startswith(('wk_', 'heart_'))}
+                         if (self._using_wk or self._using_heart) else {})
         else:
             u0_full, upd_full, wk_pi = None, None, None
         u0_full = comm.bcast(u0_full, root=0)
@@ -685,6 +710,12 @@ class Solver(LoggerBase):
                 self.logger.warning('Checkpoint missing upd_lst (CT+ALE convection);'
                                     ' first restart tentative velocity WRONG -> spike.'
                                     ' Re-run with the blocksize+upd_lst checkpoint fix.')
+        if self._using_heart:
+            self._restore_roukf_scalars(wk_pi)   # restores wk_* too
+            self.logger.info('Restored heart state: %s' % ', '.join(
+                '%s=%.6g' % (k, v) for k, v in sorted(wk_pi.items())
+                if k.startswith('heart_') and k.split('_')[1] in
+                ('V', 'P', 'Q')))
         if self._using_wk:
             self._restore_roukf_scalars(wk_pi)
             for _bid, _prm in self.bc_dict['p']['windkessel']['params'].items():
@@ -823,6 +854,12 @@ class Solver(LoggerBase):
         if self._using_wk:
             self.solve_windkessel()
 
+        if self._using_heart:
+            self.solve_heart()
+
+        if self._using_coronary:
+            self.solve_coronary()
+
         if (state and (self.options['timemarching']['fractionalstep']
                        ['scheme'] == 'CT')):
             if (self.state_velocity == 'tentative' and (
@@ -847,6 +884,12 @@ class Solver(LoggerBase):
 
         if self._using_wk and self.wk['implicit']:
             self.solve_windkessel(flow=False)
+
+        if self._using_heart:
+            self.sync_heart()
+
+        if self._using_coronary:
+            self.sync_coronary()
 
         if (state and (self.options['timemarching']['fractionalstep']
                        ['scheme'] == 'CT')):
@@ -886,6 +929,12 @@ class Solver(LoggerBase):
             state (list of Function): list of state functions
             parameters (numpy.ndarray):    array of parameters
         '''
+        if self._using_heart:
+            # the heart state would advance once per sigma point; not built
+            raise NotImplementedError('heart BC under ROUKF restart steps')
+        if self._using_coronary:
+            raise NotImplementedError('coronary BC under ROUKF restart steps')
+
         t0 = self.t
         self.t -= self.options['timemarching']['dt']
         scheme = self.options['timemarching']['fractionalstep']['scheme']
@@ -976,36 +1025,42 @@ class Solver(LoggerBase):
         R/C are captured too; harmless, since `assign_parameters` rewrites them
         per particle before every solve.
         '''
-        if not self._using_wk:
-            return {}
-
         out = {}
-        for bid, prm in self.bc_dict['p']['windkessel']['params'].items():
-            for key, val in sorted(prm.items()):
-                if not hasattr(val, 'value'):
-                    continue                     # config float, never mutated
-                try:
-                    out['wk_%s_%d' % (key, bid)] = float(val.value)
-                except (TypeError, ValueError):
-                    continue                     # non-scalar Constant
+        for pre, prm_all in self._scalar_state_groups():
+            for bid, prm in prm_all.items():
+                for key, val in sorted(prm.items()):
+                    if not hasattr(val, 'value'):
+                        continue                 # config float, never mutated
+                    try:
+                        out['%s_%s_%d' % (pre, key, bid)] = float(val.value)
+                    except (TypeError, ValueError):
+                        continue                 # non-scalar Constant
         return out
+
+    def _scalar_state_groups(self):
+        ''' (attribute prefix, {bid: params}) of every 0D boundary model
+        whose Constants are solver state: Windkessel ('wk') and heart. '''
+        groups = []
+        if self._using_wk:
+            groups.append(('wk', self.bc_dict['p']['windkessel']['params']))
+        if self._using_heart:
+            groups.append(('heart', self.bc_dict['p']['heart']['params']))
+        return groups
 
     def _restore_roukf_scalars(self, attrs):
         ''' Inverse of `_roukf_scalars`. '''
-        if not self._using_wk:
-            return
-
-        for bid, prm in self.bc_dict['p']['windkessel']['params'].items():
-            seen = False
-            for key, val in prm.items():
-                k = 'wk_%s_%d' % (key, bid)
-                if k in attrs and hasattr(val, 'value'):
-                    val.value = float(attrs[k])
-                    seen = True
-            if not seen:
-                self.logger.warning(
-                    'restart bundle carries no Windkessel state for boundary '
-                    '%d; it keeps its initial value', bid)
+        for pre, prm_all in self._scalar_state_groups():
+            for bid, prm in prm_all.items():
+                seen = False
+                for key, val in prm.items():
+                    k = '%s_%s_%d' % (pre, key, bid)
+                    if k in attrs and hasattr(val, 'value'):
+                        val.value = float(attrs[k])
+                        seen = True
+                if not seen:
+                    self.logger.warning(
+                        'restart bundle carries no %s state for boundary '
+                        '%d; it keeps its initial value', pre, bid)
 
     def write_restart(self, path):
         ''' ROUKF restart hook (see roukf.core.ROUKF.write_checkpoint).
@@ -3322,8 +3377,11 @@ class Solver(LoggerBase):
                     _apply_dbc_to_mat(Aupd, self.bc_dict['u']['dirichlet'][i])
                     self.solver_u_upd.set_operator(Aupd)
 
-                set_bc(bu_i, self.bc_dict['u']['dirichlet'][i])
-            
+                # du is an INCREMENT on u_tent, which already holds the
+                # Dirichlet value g: impose du = 0 (alpha=0), not du = g,
+                # or every nonzero Dirichlet dof (an inlet) ends at 2g.
+                set_bc(bu_i, self.bc_dict['u']['dirichlet'][i], alpha=0.0)
+
             self.solver_u_upd.solve(self.du[i].x.petsc_vec, bu_i)
 
             if not self._using_ale:
@@ -3688,13 +3746,8 @@ class Solver(LoggerBase):
 
         for bid, prm in self.bc_dict['p']['windkessel']['params'].items():
             dt = float(self.options['timemarching']['dt'])
-            R_d = float(prm['R_d'])
             R_p = float(prm['R_p'])
-            C = float(prm['C'])
-
-            alpha = R_d*C/(R_d*C + dt)
-            beta = R_d*(1 - alpha)
-            gamma = R_p + beta
+            alpha, beta, gamma = _wk_coefficients(prm, dt)
 
             if flow:
                 Q = self.p.function_space.mesh.comm.allreduce(
@@ -3717,6 +3770,7 @@ class Solver(LoggerBase):
             # P_d_base) so the two calls per step do not accumulate.
             _pe_f = self.bc_dict['p']['windkessel'].get('P_ext_func', {}).get(bid)
             if _pe_f is not None:
+                R_d, C = float(prm['R_d']), float(prm['C'])
                 _t1 = float(self.t)
                 _pd0 = (_pd_f(_t1) if _pd_f is not None else prm['P_d_base'])
                 prm['P_d'].value = _pd0 + R_d*C*(_pe_f(_t1) - _pe_f(_t1 - dt))/dt
@@ -3768,6 +3822,136 @@ class Solver(LoggerBase):
                 else:
                     self.update_windkessel_LRC(restart=True)
 
+    def solve_heart(self):
+        ''' Advance the 0D heart of every 'heart' inlet over one time step,
+        BEFORE the projection.
+
+        The ODEs of heart.py are integrated in `substeps` substeps with the
+        flow into the 3D, Q_3D, held at the value of the previous step.
+
+        coupling 'condensed' (default): the inlet is a condensed capacitor
+        outlet (problem._heart); its reservoir is set to
+        pi = P_ao^n + V_AV/C_ao, the projection then solves for P_ao^{n+1}
+        and Q_3D^{n+1} implicitly, and sync_heart copies them back.
+        coupling 'dirichlet' (legacy, does not conserve mass): Q_3D is the
+        tentative inlet flux of THIS step and the substepped P_ao is imposed
+        as the inlet pressure Dirichlet.
+        '''
+        from .heart import advance
+
+        F, J = self.F, self.J
+        ds = Measure('ds', domain=self.p.function_space.mesh,
+                     subdomain_data=self.bnds)
+        n = FacetNormal(self.p.function_space.mesh)
+        comm = self.p.function_space.mesh.comm
+        dt = float(self.options['timemarching']['dt'])
+
+        for bid, prm in self.bc_dict['p']['heart']['params'].items():
+            if prm['coupling'] == 'dirichlet':
+                Q3d = -comm.allreduce(
+                    assemble_scalar(fem_form(dot(self.u, J*ufl.inv(F).T*n)*ds(bid))),
+                    op=MPI.SUM)
+            else:
+                Q3d = float(prm['Q'])
+
+            par = {k: float(v) for k, v in prm.items() if hasattr(v, 'value')}
+            st = {k: par[k] for k in ('V', 'Q_MV', 'Q_AV', 'P_ao')}
+            st = advance(st, par, self.t - dt, dt, Q3d, prm['substeps'])
+
+            if prm['coupling'] == 'condensed':
+                wk = self.bc_dict['p']['windkessel']['params'][bid]
+                prm['pi_pre'] = par['P_ao'] + st['V_AV']/par['C_ao']  # float
+                wk['pi'].value = prm['pi_pre']
+            for k in ('V', 'Q_MV', 'Q_AV', 'P_ao', 'P_LV', 'E'):
+                prm[k].value = st[k]
+            prm['Q'].value = Q3d
+            if prm['coupling'] == 'dirichlet':
+                self._heart_record(bid, prm)
+
+    def sync_heart(self):
+        ''' After the projection (and solve_windkessel(flow=False)), copy the
+        implicitly solved node pressure of every condensed heart inlet back
+        into the heart, P_ao = Pl, with the flow it implies,
+        Q_3D = C_ao*(pi_pre - P_ao^{n+1})/dt, pi_pre = P_ao^n + V_AV/C_ao
+        (exactly the flow through the inlet of the condensed solve). '''
+        dt = float(self.options['timemarching']['dt'])
+        for bid, prm in self.bc_dict['p']['heart']['params'].items():
+            if prm['coupling'] != 'condensed':
+                continue
+            wk = self.bc_dict['p']['windkessel']['params'][bid]
+            P_new = float(wk['pi'])         # == Pl for a capacitor
+            # pi_pre = P_ao^n + V_AV/C_ao, so the inflow is C_ao*(pi_pre - Pl)/dt
+            prm['Q'].value = float(prm['C_ao'])*(prm['pi_pre'] - P_new)/dt
+            prm['P_ao'].value = P_new
+            self._heart_record(bid, prm)
+
+    def _coronary_beds(self):
+        return [(bid, prm) for bid, prm in
+                self.bc_dict['p']['windkessel']['params'].items()
+                if prm.get('kind') == 'coronary']
+
+    def solve_coronary(self):
+        ''' Before the projection: P_im^{n+1} = lambda*P_LV(t^{n+1}) from the
+        heart (already advanced this step), and the offset b of
+        p = gamma*Q + b of every coronary bed (coronary.py), stored as the
+        entry's reservoir pi so the condensed projection picks it up. '''
+        from .coronary import condensed
+        dt = float(self.options['timemarching']['dt'])
+        hearts = self.bc_dict['p']['heart']['params']
+        for bid, prm in self._coronary_beds():
+            par = {k: float(prm[k]) for k in
+                   ('R_a', 'R_am', 'R_v', 'C_a', 'C_im', 'P_v')}
+            lam = float(prm['lambda'])
+            P_im_new = lam*float(hearts[prm['heart_id']]['P_LV']) if lam else 0.0
+            if not (getattr(self, '_coronary_started', False)
+                    or self._restarted_run):   # a restart restores P_im
+                # first step: no history of P_im, start it at its current value
+                prm['P_im'].value = P_im_new
+            dP = P_im_new - float(prm['P_im'])
+            prm['dP_im'] = dP                       # float, for sync_coronary
+            prm['P_im_new'] = P_im_new
+            g, b = condensed(par, dt, float(prm['P1']), float(prm['P2']), dP)
+            prm['b'] = b
+            prm['pi'].value = b
+        self._coronary_started = True
+
+    def sync_coronary(self):
+        ''' After the projection and solve_windkessel(flow=False) (which left
+        pi = Pl, the face pressure): the bed's outward flux
+        Q = (Pl - b)/gamma, then P1, P2 at t^{n+1}. '''
+        from .coronary import update
+        dt = float(self.options['timemarching']['dt'])
+        for bid, prm in self._coronary_beds():
+            par = {k: float(prm[k]) for k in
+                   ('R_a', 'R_am', 'R_v', 'C_a', 'C_im', 'P_v')}
+            Pl = float(prm['pi'])
+            Q = (Pl - prm['b'])/float(prm['gamma'])
+            P1, P2 = update(par, dt, float(prm['P1']), float(prm['P2']),
+                            prm['dP_im'], Q)
+            prm['P1'].value, prm['P2'].value = P1, P2
+            prm['P_im'].value = prm['P_im_new']
+            prm['Q_bed'].value = Q
+
+    def _heart_record(self, bid, prm):
+        ''' Log one line and append it to <write_path>/heart_<bid>.csv. '''
+        comm = self.p.function_space.mesh.comm
+        st = {k: float(prm[k]) for k in ('P_ao', 'P_LV', 'V', 'Q_AV', 'Q_MV', 'E')}
+        Q3d = float(prm['Q'])
+        self.logger.info(
+            'heart bid %d: t=%.5f P_ao=%.6g P_LV=%.6g V=%.5g Q_AV=%.5g '
+            'Q_MV=%.5g Q_3D=%.5g', bid, self.t, st['P_ao'], st['P_LV'],
+            st['V'], st['Q_AV'], st['Q_MV'], Q3d)
+        if comm.rank == 0:
+            fn = Path(self.options['io']['write_path']) / ('heart_%d.csv' % bid)
+            new = bid not in self._heart_csv_open
+            with open(fn, 'w' if new and not self._restarted_run else 'a') as f:
+                if new and not self._restarted_run:
+                    f.write('t,P_ao,P_LV,V,Q_AV,Q_MV,Q_3D,E\n')
+                f.write('%.6f,%.8e,%.8e,%.8e,%.8e,%.8e,%.8e,%.8e\n' % (
+                    self.t, st['P_ao'], st['P_LV'], st['V'], st['Q_AV'],
+                    st['Q_MV'], Q3d, st['E']))
+            self._heart_csv_open.add(bid)
+
     def _wk_update_deltas(self, restart=False):
         ''' Recompute the Windkessel impedance coefficients delta_l/delta_r
         from the CURRENT R_p/R_d/C Constants (which ROUKF may have perturbed
@@ -3782,13 +3966,8 @@ class Solver(LoggerBase):
         fac_l = []
         for bid, prm in self.bc_dict['p']['windkessel']['params'].items():
             dt = float(self.options['timemarching']['dt'])
-            R_d = float(prm['R_d'])
             R_p = float(prm['R_p'])
-            C = float(prm['C'])
-
-            alpha = R_d*C/(R_d*C + dt)
-            beta = R_d*(1 - alpha)
-            gamma = R_p + beta
+            alpha, beta, gamma = _wk_coefficients(prm, dt)
 
             # delta_d multiplies the distal pressure P_d in rhs_p. On a restart
             # step Pl = R_p*Q + pi with pi absolute, so P_d is already in pi.
@@ -4280,8 +4459,9 @@ class Solver(LoggerBase):
                     f.create_dataset('upd_%d' % _i, data=_arr)
                 # Windkessel reservoir state (pi integrates flow over time; Pl
                 # is the outlet pressure). Without these a restart resets pi to
-                # p0 -> systolic pressure discontinuity -> blow-up.
-                if self._using_wk:
+                # p0 -> systolic pressure discontinuity -> blow-up. The heart
+                # state (V, valve flows, P_ao) rides along the same way.
+                if self._using_wk or self._using_heart:
                     # EVERY Windkessel scalar, not just pi. The previous comment
                     # here claimed "Pl is the outlet-mean of p, recomputed from
                     # the restored pressure on restart -> not stored". That is

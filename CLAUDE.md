@@ -118,3 +118,29 @@ accumulate). Only dP_ext/dt enters, so a constant offset has no effect. Example:
 `P_ext: "-dPa*0.5*(1 - cos(2*pi*max(t - t0, 0.0)/Tr))"`, `P_ext_parameters: {dPa: 3999.66, t0: 2.5, Tr: 4}`.
 Verified on the D0 rigid mesh (8 ranks): with P_d following the same swing (f = 1), π − P_ext is constant
 to 0.01 mmHg for a 8 mmHg swing (grounded C: 6.4 mmHg lagging 0.5 s). Case `D0/windkessel/results/resp_UE`.
+## `coronary` outlet BC — Kim et al. 2010 bed (added 2026-11-03, angio)
+
+`type: 'coronary'`: p --R_a-- P1 (C_a to ground) --R_am-- P2 (C_im to P_im) --R_v-- P_v, with
+P_im = `lambda`*P_LV read every step from the `heart` BC (`heart_id`, default the only one; `lambda: 0`
+needs no heart). Algebra in `nsx/fractionalstep/coronary.py` (pure python, shared with the angio 0D
+pre-flight): backward Euler gives p = gamma*Q + b, condensed into the projection as a WK entry with
+`kind: 'coronary'` (alpha = 1, beta = gamma; `_wk_coefficients`). `solve_coronary` sets b (as `pi`)
+after `solve_heart`; `sync_coronary` reads Pl and updates P1, P2. Needs windkessel implicit+condensed.
+Verified: steady state p = P_v + Q(R_a+R_am+R_v) exactly; condensed form = update to round-off.
+State (P1, P2, P_im) rides in checkpoints via the `wk` scalar group; ROUKF restart steps refused.
+
+## `heart` inlet BC — 0D left heart (added 2026-11-03, angio)
+
+> **`coupling: 'condensed'` is the default and the only mass-conserving one (2026-11-03).**
+> The node `C_ao` is registered as a condensed implicit Windkessel with R_p = 0, R_d -> inf
+> (a pure capacitor, `_wk_coefficients` in solver.py): `solve_heart` sets its reservoir to
+> `P_ao^n + V_AV/C_ao` before the projection, `sync_heart` copies back `P_ao = Pl` and
+> `Q_3D = C_ao (pi_pre - Pl)/dt`. Needs `windkessel: {implicit: True, condensed: True}`.
+> `coupling: 'dirichlet'` (the first version) imposes P_ao as a pressure Dirichlet; the
+> projection then never tests div u against a q nonzero on the inlet and the outlets
+> received **+35 % more volume per cycle than the heart ejected** (angio heart_wk,
+> MEASURED), peak P_ao +14 mmHg above the 0D. Condensed: heart Q_3D volume 58.59 mL vs
+> outlet volume 58.58 mL over 0-0.25 s, peak P_ao 113.8 vs 112.1 mmHg in the 0D.
+> OPEN: the SAVED velocity's inlet-face flux still reads ~12 % below the outflow in
+> systole, with the compensating div u in the first inlet cell layer; zeroing of the rim
+> nodes by `DC_in_update` explains at most ~40 % of it (measured). Cause unknown.
