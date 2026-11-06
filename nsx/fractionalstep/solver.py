@@ -3386,6 +3386,13 @@ class Solver(LoggerBase):
 
             if not self._using_ale:
                 u_i.x.petsc_vec.axpy(1.0, self.du[i].x.petsc_vec)
+                # The axpy updates OWNED dofs only: without this the ghosts keep
+                # the tentative u*, the next step convects with u* there and
+                # u0_lst copies it into the BDF history. A restart scatters the
+                # ghosts, so continuous and restarted runs then differ (MEASURED
+                # 2026-11-06, angio heart/coronary, 4 ranks: Q_3D 9e-7, u 5e-4
+                # after 10 restarted steps; every differing dof was a ghost).
+                u_i.x.scatter_forward()
             else:
                 self.upd_lst[i].x.array[:] = u_i.x.array
                 self.upd_lst[i].x.petsc_vec.axpy(1.0, self.du[i].x.petsc_vec)
