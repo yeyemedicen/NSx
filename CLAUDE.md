@@ -144,3 +144,25 @@ State (P1, P2, P_im) rides in checkpoints via the `wk` scalar group; ROUKF resta
 > OPEN: the SAVED velocity's inlet-face flux still reads ~12 % below the outflow in
 > systole, with the compensating div u in the first inlet cell layer; zeroing of the rim
 > nodes by `DC_in_update` explains at most ~40 % of it (measured). Cause unknown.
+
+## Restart contract: heart + coronary (MEASURED 2026-11-06, angio, 4 ranks)
+- A checkpoint carries the full 0D state: `heart_*` attrs (V, Q_AV, Q_MV, P_ao, P_LV, E, Q) and
+  `wk_*` for each bed (P1, P2, P_im, ...). The plain floats NOT saved (`b`, `dP_im`, `P_im_new`,
+  heart `pi_pre`) are rewritten in `solve_coronary`/`solve_heart` before they are read.
+- Test: a continuous run from t = 0.4 vs a restart from its own 0.41 checkpoint, 20 steps.
+  heart CSV identical, u 8e-13, p 8e-14.
+- **FIXED, NON-ALE CT: stale velocity ghosts (`solver.py`, velocity update).**
+  - Defect: `u_i.x.petsc_vec.axpy(1, du)` updates OWNED dofs only, with no `scatter_forward`. The
+    ghosts kept u*, the next step convected with it, and u0_lst copied it into the history.
+  - A restart scatters the ghosts, so before the fix restart and continuous runs differed
+    (Q_3D 9e-7, u 5e-4). Every differing dof was a ghost (found by snapshotting all Functions).
+  - Effect of the fix on the continuous run, 20 steps: u L2 9e-4, max 1.3e-2 at 6 nodes
+    (partition interfaces in fast flow), p 5e-5, Q_3D 5e-6, P_ao 4e-8.
+  - So every multi-rank rigid (non-ALE) run before 2026-11-06 carries this partition-dependent
+    LOCAL velocity error; global flows and pressures are unaffected at the 1e-5 level.
+  - The ALE branch already scattered.
+- Minor:
+  - a restart into a NEW write_path appends `heart_<id>.csv` without a header;
+  - checkpoint dirs are numbered from the restart step (0, 20, ...), not globally;
+  - the "Restored Windkessel state bid 3: rt_..." log line is the heart matched by suffix
+    (cosmetic).
