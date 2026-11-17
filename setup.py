@@ -1,30 +1,31 @@
-import os
-from setuptools import setup
+'''NSx: fractional-step incompressible Navier-Stokes (ALE, Windkessel outlets) on DOLFINx.
 
-from nsx import __version__
+    pip install git+https://github.com/yeyemedicen/NSx.git      # or, from a clone:  pip install -e .
+DOLFINx, mpi4py and petsc4py come from the conda environment, never from pip.
+'''
+import os
+from setuptools import setup, find_packages
 
 here = os.path.abspath(os.path.dirname(__file__))
-
-readme_path = os.path.join(here, 'README.rst')
-long_description = open(readme_path, encoding='utf-8').read() if os.path.exists(readme_path) else ''
+about = {}
+exec(open(os.path.join(here, 'nsx', '__init__.py')).read(), about)
+readme = os.path.join(here, 'README.rst')
 
 setup(
     name='nsx',
-    packages=['nsx'],
-    version=__version__,
+    version=about['__version__'],
+    packages=find_packages(include=['nsx', 'nsx.*']),
     description='Navier-Stokes FEM solver',
-    long_description=long_description,
+    long_description=open(readme, encoding='utf-8').read() if os.path.exists(readme) else '',
     author='Jeremias Garay',
     author_email='jeremias.garay@usm.cl',
-    url='asd',
-    # requires=['numpy (>=1.7)', 'scipy (>=0.13)'],
+    url='https://github.com/yeyemedicen/NSx',
     license='MIT',
-    classifiers=[
-        'Development Status :: 3 - Alpha',
-        'Intended Audience :: Science/Research',
-        'License :: OSI Approved :: MIT License',
-        'Operating System :: OS Independent',
-        'Programming Language :: Python',
-        'Topic :: Scientific/Engineering :: Mathematics'
+    python_requires='>=3.9',
+    install_requires=[
+        'common @ git+https://github.com/yeyemedicen/Common.git',
+        'numpy', 'scipy', 'h5py', 'tqdm', 'packaging',
     ],
+    extras_require={'vis': ['pyvista']},
+
 )
