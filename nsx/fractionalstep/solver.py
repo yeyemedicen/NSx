@@ -304,6 +304,10 @@ class Solver(LoggerBase):
         # loop that the viscous matrix is velocity-dependent and has to be
         # refreshed (see assemble_tentative_velocity).
         self._turb_active = getattr(problem, '_turb_active', False)
+        # contrast transport inside the run (nsx.transport.inline): c for the mixture
+        # properties (problem forms, lagged) and the body-force forms; driver built in init()
+        self.contrast_c = getattr(problem, 'contrast_c', None)
+        self._contrast = None
 
         # IPCS uses a separate correction pressure phi; CT reuses p
         if self.options['timemarching']['fractionalstep']['scheme'] == 'IPCS':
@@ -453,6 +457,10 @@ class Solver(LoggerBase):
         self._initialized = True
         self.init_windkessel_pressure()
         self.read_checkpoint()
+        from nsx.transport.inline import contrast_options
+        if contrast_options(self.options):
+            from nsx.transport.inline import InlineContrast
+            self._contrast = InlineContrast(self)
         self.backup_restart()
 
         self.write_initial_condition()
@@ -899,6 +907,7 @@ class Solver(LoggerBase):
 
         self.solve_velocity_update()
         self.pressure_increment()
+        self.solve_contrast()
         self._norm_u_upd = np.sqrt(self.u.function_space.mesh.comm.allreduce(
             fem.assemble_scalar(fem.form(ufl.inner(self.u, self.u) * ufl.dx)),
             op=MPI.SUM))
@@ -2835,15 +2844,41 @@ class Solver(LoggerBase):
             # adding one arbitrary LHS of the fnv matrices
             A.axpy(1., self.mat['u']['fnv'][0])
 
-        # assemble time/RHS SUPG matrices if present, add mass matrix
-        # mat['u']['rhs'] was initialized to 'mass' and won't be changed
-        # whenever ALE is not used
-        if 'supg_time' in self.forms['u'] and self.forms['u']['supg_time']:
-            assert True, 'supg_time should not be useable!!'
-            _assemble_mat(self.forms['u']['supg_time'],
-                          mat=self.mat['u']['rhs'])
-            A.axpy(1., self.mat['u']['rhs'])
-            self.mat['u']['rhs'].axpy(1., self.mat['u']['mass'])
+        # Consistent SUPG, time part (Problem.streamline_diffusion):
+        # S = tau (u.grad v) rho/dt u. LHS gets cf*S (cf = BDF coefficient of
+        # u^{n+1}); the RHS matrix that multiplies the old-velocity vector x_i
+        # becomes mass + S, so the SUPG-weighted time residual is
+        # rho (cf u^{n+1} - x_i)/dt, exactly like the Galerkin mass term. S
+        # changes every step (tau and u_conv do), so it is assembled fresh
+        # (own sparsity, see the conv-matrix note above) and mat['u']['rhs'] is
+        # rebuilt from the mass matrix each step.
+        # MEMORY: S, its compiled form and the rhs matrix are PERSISTENT and
+        # re-assembled in place. The first version allocated a new S and a new
+        # rhs every step and leaked ~7 MB/step/rank on angio coronary_v2 (4 ranks;
+        # kim5 crashed an 8 GB Mac at step ~1400, 2026-11-13).
+        if self.forms['u'].get('supg_time'):
+            if getattr(self, '_supg_S', None) is None:
+                self._supg_time_c = fem_form(self.forms['u']['supg_time'])
+                self._supg_S = assemble_matrix(self._supg_time_c)
+                self._supg_S.assemble()
+                self._supg_rhs = self.mat['u']['mass'].copy()
+                self._supg_rhs.axpy(
+                    1., self._supg_S,
+                    structure=PETSc.Mat.Structure.DIFFERENT_NONZERO_PATTERN)
+            else:
+                S = self._supg_S
+                S.zeroEntries()
+                assemble_matrix(S, self._supg_time_c)
+                S.assemble()
+                # rhs = mass + S in place; its pattern is the union from step 1
+                self.mat['u']['mass'].copy(
+                    self._supg_rhs,
+                    structure=PETSc.Mat.Structure.SUBSET_NONZERO_PATTERN)
+                self._supg_rhs.axpy(
+                    1., S, structure=PETSc.Mat.Structure.SUBSET_NONZERO_PATTERN)
+            A.axpy(cf, self._supg_S,
+                   structure=PETSc.Mat.Structure.DIFFERENT_NONZERO_PATTERN)
+            self.mat['u']['rhs'] = self._supg_rhs
 
         if self.bc_dict['u']['same_dbc_boundaries'] and not self._using_fnv_semi_implicit:
             _apply_dbc_rows_to_mat(A, self.bc_dict['u']['dirichlet'][0])
@@ -2874,6 +2909,21 @@ class Solver(LoggerBase):
                 x_i = self.u_lst[i].x.petsc_vec
 
         bu_i = _mat_vec(self.mat['u']['rhs'], x_i)
+
+        if self.forms['u'].get('supg_gradp'):
+            # consistent SUPG, pressure part: -tau (u.grad v) dp^n/dx_i with the
+            # current pressure (p^n: the tentative step runs before the
+            # projection). Compiled once; tau/u_conv/p are coefficients.
+            if getattr(self, '_supg_gradp_c', None) is None:
+                self._supg_gradp_c = [fem_form(f) for f in
+                                      self.forms['u']['supg_gradp']]
+                self._supg_gradp_vec = assemble_vector(self._supg_gradp_c[0])
+            g = self._supg_gradp_vec   # persistent, re-assembled in place
+            with g.localForm() as g_loc:
+                g_loc.set(0.0)
+            assemble_vector(g, self._supg_gradp_c[i])
+            g.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+            bu_i.axpy(1.0, g)
 
         if self.mat['u']['pdiv']:
             if self._using_ale:
@@ -2906,6 +2956,23 @@ class Solver(LoggerBase):
             # FSI Nitsche interface data (-mu(grad v.F^-1).nans + gamma mu/h v)*v_rb:
             # v_rb updated by the coupler each sub-iteration; ALE-dependent -> reassemble.
             bu_i.axpy(1.0, _assemble_vec(self.forms['u']['fsi_nitsche_rhs'][i]))
+
+        if self._contrast is not None:
+            # catheter jet: rho s_v (u_inj - u^n) (nsx.transport.inline)
+            _jm = self._contrast.momentum_source(i)
+            if _jm is not None:
+                bu_i.axpy(1.0, _jm)
+                _jm.destroy()
+
+        if self.forms['u'].get('contrast_body'):
+            # contrast mixture, Boussinesq: (rho(c^n) - rho_b) g_i v_i (problem.py)
+            if getattr(self, '_contrast_body_c', None) is None:
+                self._contrast_body_c = [fem_form(f) if f is not None else None
+                                         for f in self.forms['u']['contrast_body']]
+            if self._contrast_body_c[i] is not None:
+                _bf = _assemble_vec(self._contrast_body_c[i])
+                bu_i.axpy(1.0, _bf)
+                _bf.destroy()
 
         return bu_i
 
@@ -3117,6 +3184,13 @@ class Solver(LoggerBase):
             self.vec['p']['windkessel_rhs'] = _assemble_vec(self.forms['p']['windkessel_rhs'])
             bp.axpy(1.0, self.vec['p']['windkessel_rhs'])
 
+
+        if self._contrast is not None:
+            # injection volume (two-way mass): div u = s_v -> + rho/dt (s_v, q)
+            _ps = self._contrast.pressure_source()
+            if _ps is not None:
+                bp.axpy(1.0, _ps)
+                _ps.destroy()
 
         apply_lifting(bp, [fem_form(self.forms['p']['laplacian'])],
                       [self.bc_dict['p']['dirichlet']])
@@ -4372,7 +4446,18 @@ class Solver(LoggerBase):
         self._hdf5_ts_u.store(self.u.x.petsc_vec, float(self.t))
         self._hdf5_ts_p.store(self.p.x.petsc_vec, float(self.t))
 
+    def solve_contrast(self):
+        ''' Contrast sub-step (nsx.transport.inline), after the velocity update. '''
+        if self._contrast is not None:
+            self._contrast.step()
+
     def write_checkpoint(self, i, update=False):
+        self._write_checkpoint_flow(i, update=update)
+        if self._contrast is not None and self.options['io']['write_checkpoints']:
+            path = self.options['io']['write_path'] + '/checkpoint/{i}/'.format(i=i)
+            self._contrast.write_checkpoint(path)
+
+    def _write_checkpoint_flow(self, i, update=False):
         ''' Write checkpoint of u, p to <write_path>/checkpoint/<i>/w.h5.
 
         Both fields are stored together in a single HDF5 file as raw DOF

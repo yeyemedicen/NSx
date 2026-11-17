@@ -464,6 +464,12 @@ class Problem(LoggerBase):
             self.forms.update({'d': {}})
             self.form_lifting()
 
+        # contrast transported inside the run (nsx.transport.inline): its c (P1, set by the
+        # driver after every step, so lagged one step here) enters the mixture properties
+        _ctr = self.options.get('contrast') or {}
+        self.contrast_c = (Function(self.Q, name='c_mixture')
+                           if _ctr.get('enabled', False) else None)
+
         self.form_velocity_tentative()
         self.form_pressure()
         self.form_velocity_update()
@@ -599,6 +605,34 @@ class Problem(LoggerBase):
                 # inert. This flag makes the solver refresh it every step.
                 self._turb_active = True
 
+        # --- contrast mixture (two-way through the properties) -----------
+        # Boussinesq: rho_b everywhere except the body force (rho(c) - rho_b) g, which goes to
+        # the RHS (forms['u']['contrast_body']); mu(c) by log mixing. c (lagged) clipped to [0,1].
+        _cc_f = getattr(self, 'contrast_c', None)
+        _mix = (((self.options.get('contrast') or {}).get('mixture') or {})
+                if _cc_f is not None else {})
+        self._contrast_body = None
+        if _mix:
+            _cc = ufl.min_value(ufl.max_value(_cc_f, 0.0), 1.0)
+            _mu_b = float(self.mu.value)
+            _mu_c = float(_mix.get('viscosity', _mu_b))
+            if _mu_c != _mu_b:
+                if _mix.get('viscosity_mixing', 'log') != 'log':
+                    raise ValueError('contrast mixture: viscosity_mixing must be log')
+                mu = mu*ufl.exp(_cc*float(np.log(_mu_c/_mu_b)))
+                self._turb_active = True      # refresh the viscous matrix every step
+                self.logger.info('contrast mixture: mu(c) log mixing, mu_c = %g' % _mu_c)
+            _rho_b = float(rho.value)
+            _rho_c = float(_mix.get('density', _rho_b))
+            _g = _mix.get('gravity', [0.0]*self.ndim)
+            if _rho_c != _rho_b and any(float(x) != 0 for x in _g):
+                # None for a zero g component (ufl would reduce the form to Zero, no arguments)
+                self._contrast_body = [((_rho_c - _rho_b)*float(_g[i])*_cc*J0*vi*dx)
+                                       if float(_g[i]) != 0.0 else None
+                                       for i in range(self.ndim)]
+                self.logger.info('contrast mixture: Boussinesq body force, rho_c = %g, g = %s'
+                                 % (_rho_c, _g))
+
         a_mass = rho*J0*k*dot(ui, vi)*dx
         a_diff = diff(ui)
         a_conv = conv(ui, u_conv)
@@ -618,7 +652,8 @@ class Problem(LoggerBase):
 
         self.forms['u'].update({'mass': a_mass,
                                 'diff': a_diff,
-                                'conv': a_conv})
+                                'conv': a_conv,
+                                'contrast_body': getattr(self, '_contrast_body', None)})
 
         if self.options['timemarching']['fractionalstep']['scheme'] == 'CT':
             self.forms['u'].update({'pres': None})
@@ -664,8 +699,8 @@ class Problem(LoggerBase):
             self.forms['u']['conv'] += forms_stab['supg_convdiff']
         if 'supg_time' in forms_stab:
             self.forms['u'].update({'supg_time': forms_stab['supg_time']})
-        # if 'supg_gradp' in forms_stab:
-        #     self.forms['u'].update({'supg_gradp': forms_stab['supg_gradp']})
+        if forms_stab.get('supg_gradp'):
+            self.forms['u'].update({'supg_gradp': forms_stab['supg_gradp']})
 
     def form_pressure(self):
         ''' Definition of forms of pressure projection step. '''
@@ -945,6 +980,28 @@ class Problem(LoggerBase):
         else:
             a_bfs = sum([-0.5*rho*abs_n(J*dot(inv(F)*u_conv, n))*ui*vi*ds(i) for i in ind])
 
+        # Tangential regularization of the backflow term (Bertoglio & Caiazzo,
+        # JCP 2014): on the INFLOW part of an open boundary add
+        #   gamma * rho/2 * |u.n|_- * (grad_G u_i, grad_G v_i)_Gamma,
+        # grad_G = surface (tangential) gradient. It diffuses u ALONG the face,
+        # where only inflow occurs, so it damps node-to-node noise of every
+        # component (incl. u.n) that a traction/condensed inflow face cannot
+        # control. gamma has units of LENGTH^2 (cm^2). Fixed mesh only.
+        # Input: fem: stabilization: backflow_tangential: {gamma: G,
+        #        boundaries: [ids]}   (boundaries default: backflow_boundaries)
+        _bt = self.options['fem']['stabilization'].get('backflow_tangential')
+        if _bt and float(_bt.get('gamma', 0.0)) > 0.0:
+            if self._using_ale:
+                raise NotImplementedError('backflow_tangential: fixed mesh only')
+            g_t = self._C(float(_bt['gamma']))
+            bt_ids = _bt.get('boundaries') or ind
+            gradG = lambda f: grad(f) - dot(grad(f), n)*n
+            un_neg = abs_n(dot(u_conv, n))          # <= 0 on inflow, 0 on outflow
+            a_bfs = a_bfs + sum([-0.5*rho*g_t*un_neg*inner(gradG(ui), gradG(vi))*ds(i)
+                                 for i in bt_ids])
+            self.logger.info('backflow tangential regularization gamma={} on {}'
+                             .format(_bt['gamma'], bt_ids))
+
         return {'bfs': a_bfs}
 
     def streamline_diffusion(self, u_conv):
@@ -990,30 +1047,54 @@ class Problem(LoggerBase):
         else:
             residual_convdiff = rho*dot(u_conv, grad(ui))
 
-        if 'consistent' in opt and opt['consistent']:
-            raise Exception('Consistent SUPG not implemented because dp/dxi'
-                            ' needs to be reassembled for each component.')
-            res_str = 'consistent (w/o pressure)'
-            residual_time = k*rho*ui
-            # residual_gradp = [self.p.dx(i) for i in range(self.ndim)]
-            if self.V.ufl_element.degree > 1:
+        if self._using_ale:
+            # cap quadrature: the ALE SUPG integrand has inv(F)/J (rational) →
+            # UFL auto-degree explodes when summed into the conv form (FFCx hang).
+            _dx_supg = dx(metadata={'quadrature_degree': 6})
+            _w = lambda f: tau*dot(_c, _gx(vi))*f*self.J*_dx_supg
+        else:
+            _w = lambda f: tau*dot(u_conv, grad(vi))*f*dx
+
+        a_supg_gradp = None
+        if opt.get('consistent', False):
+            # CONSISTENT SUPG: the streamline test function tau (u.grad v) weights
+            # the FULL momentum residual of component i,
+            #   rho (u_i - u_i^n)/dt + rho u.grad u_i - mu lap u_i + dp^n/dx_i,
+            # so an exact Navier-Stokes solution makes it vanish (up to the
+            # lagged pressure, i.e. the splitting error O(dt)). Pieces:
+            #  - time:  LHS tau(u.grad v) rho/dt u_i  (supg_time; the solver also
+            #           adds it to the RHS matrix that multiplies u^n);
+            #  - convection (+ viscous for P2+): supg_convdiff as for minimal SD;
+            #  - pressure: RHS -tau(u.grad v) dp^n/dx_i, one linear form per
+            #           component (supg_gradp), assembled each step with the
+            #           current pressure (= p^n when the tentative step runs).
+            # tau must carry the time scale (parameter: shakib) or tau/dt can
+            # be >> 1 where |u| is small; a warning is logged otherwise.
+            res_str = 'consistent (time + convection + lagged grad p)'
+            try:
+                deg = self.Vi.element.basix_element.degree
+            except Exception:
+                deg = 1
+            if deg > 1 and not self._using_ale:
                 residual_convdiff += -mu*div(grad(ui))
-            a_supg_time = tau*dot(u_conv, grad(vi))*residual_time*dx
+            a_supg_time = _w(k*rho*ui)
+            gp = _gx(self.p) if self._using_ale else grad(self.p)
+            a_supg_gradp = [-_w(gp[i]) for i in range(self.ndim)]
+            if opt.get('parameter') not in ('shakib', 'codina', 'klr'):
+                self.logger.warning(
+                    'consistent SUPG with tau "{}" has no time scale: tau/dt '
+                    'may be >> 1 at low speed; use parameter: shakib'
+                    .format(opt.get('parameter')))
         else:
             res_str = 'minimal'
             a_supg_time = None
 
         self.logger.info('SD/SUPG residual: {r}'.format(r=res_str))
 
-        if self._using_ale:
-            # cap quadrature: the ALE SUPG integrand has inv(F)/J (rational) →
-            # UFL auto-degree explodes when summed into the conv form (FFCx hang).
-            _dx_supg = dx(metadata={'quadrature_degree': 6})
-            a_supg_convdiff = tau*dot(_c, _gx(vi))*residual_convdiff*self.J*_dx_supg
-        else:
-            a_supg_convdiff = tau*dot(u_conv, grad(vi))*residual_convdiff*dx
+        a_supg_convdiff = _w(residual_convdiff)
 
-        return {'supg_convdiff': a_supg_convdiff, 'supg_time': a_supg_time}
+        return {'supg_convdiff': a_supg_convdiff, 'supg_time': a_supg_time,
+                'supg_gradp': a_supg_gradp}
 
 
     # =========================================================================
@@ -3426,8 +3507,8 @@ class ProblemCoupled(Problem):
             self.forms['u']['conv'] += forms_stab['supg_convdiff']
         if 'supg_time' in forms_stab:
             self.forms['u'].update({'supg_time': forms_stab['supg_time']})
-        # if 'supg_gradp' in forms_stab:
-        #     self.forms['u'].update({'supg_gradp': forms_stab['supg_gradp']})
+        if forms_stab.get('supg_gradp'):
+            self.forms['u'].update({'supg_gradp': forms_stab['supg_gradp']})
             
     def form_velocity_update(self):
         ''' Definition of forms of velocity update. '''

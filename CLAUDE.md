@@ -38,6 +38,35 @@ DOLFINx port: when `parameter_element_constant: True`, `tau_standard`/`tau_shaki
 
 Note: `V_dg0.element.interpolation_points` is a **property** (no parentheses) in this DOLFINx version.
 
+## Consistent SUPG (added 2026-11-13, angio kim5; LOCAL, uncommitted)
+
+Input: `fem: stabilization: streamline_diffusion: {enabled: true, consistent: true, parameter: shakib, ...}`.
+Without `consistent` (default) the term is the MINIMAL residual `tau (u.grad v)(rho u.grad u)` = streamline
+diffusion, as before (kim3 smoke over 20 steps reproduces results_kim3/heart_3.csv BIT-FOR-BIT after this change).
+With `consistent: true` (split solver `Problem`/`Solver` only; `ProblemCoupled` still raises) the weight
+`tau (u.grad v)` multiplies the FULL momentum residual of component i:
+- time: `supg_time = tau (u.grad v) rho/dt u_i` -> LHS `cf*S`, and the RHS matrix that multiplies the
+  old-velocity vector becomes `mass + S` (rebuilt from mass each step; S assembled fresh, own sparsity);
+- convection (+ `-mu lap u` for P2+): `supg_convdiff`, unchanged;
+- pressure: `supg_gradp[i] = -tau (u.grad v) dp/dx_i` with the CURRENT `self.p` (= p^n when the tentative step
+  runs; under CT `phi is p`, ghosts updated by the pressure KSP), linear forms compiled once
+  (`Solver._supg_gradp_c`) and assembled per component per step in `build_rhs_tentative_velocity`.
+  Consistent up to the lagged pressure, i.e. the splitting error O(dt). P1: the viscous part of the residual is 0
+  elementwise (standard P1 SUPG caveat).
+- tau should carry the time scale: `parameter: shakib` (1/sqrt((2/dt)^2 + u.G.u + Cinv (nu)^2 G:G)); a warning is
+  logged for `standard` (no dt term, tau/dt can be >> 1 at low speed).
+- The old `assert True, 'supg_time should not be useable!!'` block (which assembled S INTO the rhs matrix and
+  added only S, not cf*S, to A) is replaced in the split solver; the coupled one is unreachable (raises first).
+Smoke (angio coronary_v2, heart + 23 Kim beds, 4 ranks, 20 steps): runs, ~20 % slower per step than kim3; u at
+t = 0.01 differs 4.1 % rel L2 from kim3 (max |u| 22.7 vs 21.8 cm/s), P_ao/P_LV identical to 1e-5.
+**MEMORY LEAK, FIXED 2026-11-13 (MEASURED).** The first version allocated a NEW S (`_assemble_mat` with no mat), a
+NEW rhs (`mass.copy()`) and a NEW gradp vector every step: +7 MB/step/rank footprint on coronary_v2 (4 ranks,
+`top` MEM; RSS hides it, macOS compresses). kim5 reached ~9 GB/rank at step 1400 and panicked an 8 GB Mac (watchdog,
+compressor full). Each allocation alone does NOT leak in a unit-cube test (1 and 2 ranks), so which one leaked is not
+known. Fix: `_supg_time_c`/`_supg_S`/`_supg_rhs`/`_supg_gradp_vec` are persistent, re-assembled in place (rhs =
+mass copied with SUBSET pattern + S). Footprint flat over 60 steps (~450 MB/rank, kim3 ~430); heart CSV
+byte-identical to the leaking version. Rule: never allocate a PETSc Mat/Vec per step; keep it and assemble in place.
+
 ## RHS BC application pattern (`solve_tentative_velocity`)
 
 The BC application block must be a single `if/elif/elif/else` chain:
@@ -166,3 +195,64 @@ State (P1, P2, P_im) rides in checkpoints via the `wk` scalar group; ROUKF resta
   - checkpoint dirs are numbered from the restart step (0, 20, ...), not globally;
   - the "Restored Windkessel state bid 3: rt_..." log line is the heart matched by suffix
     (cosmetic).
+
+## `nsx/transport` — passive scalar (contrast) transport (added 2026-11-11, angio; LOCAL, uncommitted)
+- `ScalarTransport(mesh, facet_tags, options)` (`scalar.py`): dc/dt + u.grad c - div(D grad c) = s
+  (`form: advective`, default) or the conservative form; P1, theta scheme, SUPG. It owns NO velocity:
+  the caller sets `self.u` (P1 vector, t^{n+theta}) before `step(dt)`, so the same class serves the
+  OFFLINE driver and, later, an in-solver sub-step.
+- Inflow imposed WEAKLY and UPWIND on open ids (acts only where u.n < 0, so a closed valve imports
+  nothing); outlets natural or `backflow: zero`; wall zero-flux. `sources`: Gaussian (or ball)
+  catheter tip, solute without volume.
+- `balance()` + the driver's `balance.csv`: M, solute flux per tag (as the scheme exchanges it),
+  int c div u, int s, residual. The residual is ~1e-10: the bookkeeping is exact, so any mass
+  change from a non-solenoidal u shows up in `c_div_u`, not hidden.
+- `StoredVelocity` (`velocity.py`): a run's u.h5, nodes matched by coordinates (KD-tree, any rank
+  count), LINEAR interpolation in time (default whatever dt), `replay: {t0, T}` replays one stored cycle.
+- Offline: `python -m nsx.transport.offline config.yaml` (doc in the module). Writes c.xdmf, balance.csv.
+- **CT velocity (2026-11-14, angio)**: `velocity: ct_correction: {pressure: p.h5, dt, rho, dirichlet: [1]}`
+  advects with w = u* - (dt/rho) grad p (P1 + P0), the field CT makes weakly divergence-free.
+  `CTVelocity` (`velocity.py`) rebuilds u* from the SAVED UPDATE u and p with no flow re-run:
+  M_D du = -(dt/rho)(grad p, v) (consistent P1 mass, du = 0 on velocity-Dirichlet facets = what
+  `solve_velocity_update` does with `DC_in_update: true`), u* = u - du (CG/jacobi, 27 its).
+  MEASURED vs a run that saved u* (angio kim4, 4 ranks): max err 1.1e-11. The saved u is the
+  L2 projection of w on nodal P1: at a pressure-driven (condensed) inlet the inflow lives in the
+  P0 grad p of the first cell layer, which nodal u cannot hold (inlet flux ~40 % low, alternating
+  div u in the first layers). `ScalarTransport` option `pressure_correction: k` (set by the driver)
+  uses `self.vel = self.u - k grad(self.p)`; advective form only. Its `balance()` books the
+  boundary exchange NODALLY (d_j = int w.grad phi_j; flux of tag t = sum_{j in t} c_j d_j + the weak
+  inflow term), c_div_u = creation on non-open nodes. MEASURED angio kim4 LCA, 0.4 s: creation
+  1e-14 (saved u: +0.27 % of the injection), residual 2e-9. The generic c_div_u is now written
+  int_dOmega c u.n - int u.grad c (identical for continuous u; channel verification unchanged).
+- **Inline / two-way contrast (2026-11-15, angio; `nsx/transport/inline.py`)**: options block `contrast:`
+  (JellyFSI: under `fluid:`; doc in the module). `Solver.init` builds `InlineContrast` after
+  read_checkpoint; `Solver.timestep` calls `solve_contrast()` after the velocity update (JellyFSI FSI
+  paths do NOT call it yet; fixed mesh + CT + DC_in_update only). Advects with w^{n+1/2} = mean of
+  u* - (dt/rho) grad p of the two steps (u* = u - du in memory). Two-way: `injection: volume: true` ->
+  `build_rhs_pressure` adds rho/dt (s_v, q) (div w = s_v weakly) and the transport gets the dilution
+  -c s_v with the SAME s_v (`ScalarTransport` sources `volume`/`c`; source rate = mean of the two
+  projections' rates, first step = the new rate). `mixture:` (problem.py form_velocity_tentative):
+  mu(c) log mixing (viscous matrix refreshed every step via `_turb_active`), Boussinesq body force
+  (rho_c - rho_b) c g in `build_rhs_tentative_velocity` (forms['u']['contrast_body'], None per zero
+  g component); c lagged one step (`problem.contrast_c`), clipped to [0, 1]. Output
+  <write_path>/contrast/{c.xdmf,balance.csv}; checkpoint <ckpt>/c.h5 (by coordinates; a flow-only
+  checkpoint starts c = 0; `t0` defaults to the first step's flow time minus dt).
+  Catheter jet (2026-11-16): `injection: momentum: {enabled, direction, catheter_diameter}` adds
+  rho s_v (u_inj - c_u u^n) to the tentative RHS (`InlineContrast.momentum_source`, hook in
+  build_rhs_tentative_velocity), u_inj = q(t)/A along `direction`, c_u = 1/2 with skew convection
+  (cancels the +rho/2 (div u) u* the skew form adds when div u = s_v), 1 otherwise; rate at t^{n+1}.
+  MEASURED (angio kim4 restarted at 1.6 s, 4 ranks, `cfd/heart_wk/inj_smoke/`): one-way inline =
+  offline at the same dt (c_max 0.07110 vs 0.07108 at 5 ms; u* in memory = rebuilt to 3e-12);
+  creation 1e-15 per step; volume on: sum of weak open-boundary fluxes 0.9998 vs Q_inj 1 (0.0002
+  without); restart from a mid-run checkpoint bit-identical (contrast + heart); 2.1-2.5 s/step.
+- Verification `python -m nsx.transport.verify_channel` (offline path end to end; box, u = U0(1+a t)
+  written to u.h5 every 0.05 s, read back): MEASURED 2026-11-11, h 0.025, dt 5 ms, D 1e-3:
+  front 1.2492 vs 1.2500, RMS vs erfc 7.0e-3, c in [-0.032, 1.035], mass exact, residual 3e-11;
+  advective = conservative (div u = 0). With `shock_capturing: 0.2`: monotone [0, 1], front +4.9e-3,
+  RMS 4.4e-2. C = 0.7 smears the front to ~0.5 (unusable); default is 0 (off).
+- Lessons (MEASURED on coronary_v2): (1) cap the quadrature (`quadrature_degree: 2` default) --
+  UFL's estimate for tau's sqrt/powers made it 7.3 s/step, 0.69 with the cap, identical results;
+  (2) the flux forms must use the GLOBAL tag set (a rank may miss a tag; mismatched reductions);
+  (3) the shock-capturing residual must include the (lagged) time derivative, or it diffuses every
+  moving front; (4) a step c = 1 at the valve-plane inlet in diastole overshoots (c 1.6 / -0.2) --
+  inject at a catheter tip instead.
