@@ -13,6 +13,10 @@ transport.yaml:
         dt: 5.0e-4                         #   the FLOW run's dt and rho
         rho: 1.06
         dirichlet: [1]                     #   the flow run's velocity-Dirichlet tags (no-slip wall)
+      scale: 1.0                           # optional (2026-11-21): advect with k x the stored field
+      time_scale: 1.0                      # optional: play the stored flow s times faster: transport
+                                           #   time t reads stored (replay) time s*t. scale = time_scale
+                                           #   = k is the exactly self-similar flow (Q x k, period T/k).
     time: {T: 4.0, dt: 0.001, write_dt: 0.01}
     transport:                             # nsx.transport.ScalarTransport options
       D: 2.03e-5                           # cm2/s
@@ -61,6 +65,19 @@ def run(cfg, comm=MPI.COMM_WORLD):
     else:
         sv = StoredVelocity(vcfg['file'], tr.W, name=vcfg.get('name', 'u'), replay=vcfg.get('replay'))
         assign = lambda t: sv.assign(tr.u, t)
+    kv, sv_ = float(vcfg.get('scale', 1.0)), float(vcfg.get('time_scale', 1.0))
+    if kv != 1.0 or sv_ != 1.0:
+        # w = u* - (dt/rho) grad p is linear in (u*, p): scaling both scales the advecting field exactly
+        base = assign
+
+        def assign(t):
+            base(sv_*t)
+            fs = [tr.u] + ([tr.p] if ctc else [])
+            for f in fs:
+                f.x.array[:] *= kv
+                f.x.scatter_forward()
+        if comm.rank == 0:
+            print('velocity: scale %g, time_scale %g' % (kv, sv_), flush=True)
     T, dt = float(cfg['time']['T']), float(cfg['time']['dt'])
     wdt = float(cfg['time'].get('write_dt', dt))
     th = float(tr.o['theta'])
